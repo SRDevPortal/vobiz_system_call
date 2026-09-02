@@ -33,6 +33,14 @@ class TestVobizSystemCallPatchApp(unittest.TestCase):
         self.assertIn("client_context: 'agent_console'", console_js)
         self.assertIn("browser_softphone_live_html", console_js)
         self.assertIn("workdesk_phone_surface_html", console_js)
+        self.assertIn("auto_connect_browser_softphone", console_js)
+        self.assertIn("sync_browser_softphone_event('hangup'", console_js)
+        self.assertIn("answer_browser_softphone", console_js)
+        self.assertIn("softphone_incoming_matches_row", console_js)
+        self.assertIn("vobiz-callback-highlight", console_js)
+        self.assertIn("run_softphone_diagnostics", console_js)
+        self.assertIn("Test Mic", console_js)
+        self.assertIn("Test Audio", console_js)
 
     def test_no_standalone_workspace_or_console_is_shipped(self):
         self.assertFalse((APP_ROOT / "vobiz_system_call/vobiz_system_call/workspace").exists())
