@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 import unittest
 
@@ -57,6 +58,18 @@ class TestVobizSystemCallPatchApp(unittest.TestCase):
         self.assertIn('"vobiz_click_to_call.api.webrtc.answer": "vobiz_system_call.api.webrtc.answer"', hooks_py)
         self.assertIn("<Number>{escape(provider_phone_number(destination))}</Number>", webrtc_py)
         self.assertIn("Vobiz User Mapping", webrtc_py)
+
+    def test_frappe_crm_compatibility_shim_is_packaged(self):
+        pyproject = self.read_text("pyproject.toml")
+        manifest = self.read_text("MANIFEST.in")
+
+        self.assertTrue((APP_ROOT / "frappe_crm/__init__.py").exists())
+        self.assertTrue((APP_ROOT / "frappe_crm/hooks.py").exists())
+        self.assertTrue((APP_ROOT / "frappe_crm/commands.py").exists())
+        self.assertIn('"frappe_crm*"', pyproject)
+        self.assertIn("recursive-include frappe_crm *.py", manifest)
+        self.assertIsNotNone(importlib.import_module("frappe_crm"))
+        self.assertEqual(importlib.import_module("frappe_crm.commands").commands, [])
 
 
 if __name__ == "__main__":

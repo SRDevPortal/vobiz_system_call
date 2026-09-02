@@ -1,0 +1,6 @@
+app_name = "frappe_crm"
+app_title = "Frappe CRM Compatibility"
+app_publisher = "SRIAAS"
+app_description = "Compatibility shim for benches that reference frappe_crm instead of crm"
+app_email = "webdevelopersriaas@gmail.com"
+app_license = "MIT"

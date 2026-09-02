@@ -18,7 +18,8 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vobiz_system_call*"]
+include = ["vobiz_system_call*", "frappe_crm*"]
+namespaces = false
 
 [tool.bench.frappe-dependencies]
 frappe = ">=15.0.0,<16.0.0"
