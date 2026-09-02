@@ -205,14 +205,8 @@ class VobizAgentConsole {
 						<button class="btn btn-default btn-sm" data-action="softphone-test-audio">
 							<i class="fa fa-volume-up"></i> ${__('Test Audio')}
 						</button>
-						<button class="btn btn-default btn-sm" data-action="softphone-test-network">
-							<i class="fa fa-wifi"></i> ${__('Network')}
-						</button>
 						<button class="btn btn-success btn-sm hidden" data-action="softphone-answer">
 							<i class="fa fa-phone"></i> ${__('Pick Call')}
-						</button>
-						<button class="btn btn-default btn-sm hidden" data-action="softphone-disconnect">
-							<i class="fa fa-power-off"></i> ${__('Disconnect')}
 						</button>
 						<button class="btn btn-default btn-sm hidden" data-action="softphone-mute">
 							<i class="fa fa-microphone-slash"></i> <span>${__('Mute')}</span>
@@ -571,13 +565,11 @@ class VobizAgentConsole {
 		$main.on('click', '[data-action="open-analytics"]', () => frappe.set_route('vobiz-agent-analytics'));
 		$main.on('click', '[data-action="end-active-call"]', () => this.end_header_active_call());
 		$main.on('click', '[data-action="softphone-connect"]', () => this.connect_browser_softphone());
-		$main.on('click', '[data-action="softphone-disconnect"]', () => this.disconnect_browser_softphone());
 		$main.on('click', '[data-action="softphone-mute"]', () => this.toggle_browser_softphone_mute());
 		$main.on('click', '[data-action="softphone-hangup"]', () => this.hangup_browser_softphone());
 		$main.on('click', '[data-action="softphone-answer"]', () => this.answer_browser_softphone());
 		$main.on('click', '[data-action="softphone-test-mic"]', () => this.check_browser_microphone(true));
 		$main.on('click', '[data-action="softphone-test-audio"]', () => this.test_browser_audio());
-		$main.on('click', '[data-action="softphone-test-network"]', () => this.measure_browser_network(true));
 		$main.on('click', '[data-action="toggle-auto"]', () => this.toggle_auto_dial());
 		$main.on('click', '[data-action="auto-report"]', () => this.open_auto_dial_report());
 		$main.on('click', '[data-action="open-filters"]', () => this.open_filter_popover());
@@ -719,7 +711,6 @@ class VobizAgentConsole {
 		this.page.main.find('[data-role="softphone-live"]')
 			.toggleClass('hidden', !showLive)
 			.html(showLive ? this.browser_softphone_live_html() : '');
-		this.page.main.find('[data-action="softphone-disconnect"]').toggleClass('hidden', !softphone.registered);
 		this.page.main.find('[data-action="softphone-mute"]').toggleClass('hidden', !softphone.in_call);
 		this.page.main.find('[data-action="softphone-mute"] span').text(softphone.muted ? __('Unmute') : __('Mute'));
 		this.page.main.find('[data-action="softphone-hangup"]').toggleClass('hidden', !softphone.in_call);
