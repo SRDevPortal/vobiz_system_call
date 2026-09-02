@@ -211,9 +211,6 @@ class VobizAgentConsole {
 						<button class="btn btn-default btn-sm hidden" data-action="softphone-mute">
 							<i class="fa fa-microphone-slash"></i> <span>${__('Mute')}</span>
 						</button>
-						<button class="btn btn-danger btn-sm hidden" data-action="softphone-hangup">
-							<i class="fa fa-phone"></i> ${__('Hangup')}
-						</button>
 					</div>
 					<audio data-role="softphone-audio" autoplay playsinline></audio>
 				</section>
@@ -566,7 +563,6 @@ class VobizAgentConsole {
 		$main.on('click', '[data-action="end-active-call"]', () => this.end_header_active_call());
 		$main.on('click', '[data-action="softphone-connect"]', () => this.connect_browser_softphone());
 		$main.on('click', '[data-action="softphone-mute"]', () => this.toggle_browser_softphone_mute());
-		$main.on('click', '[data-action="softphone-hangup"]', () => this.hangup_browser_softphone());
 		$main.on('click', '[data-action="softphone-answer"]', () => this.answer_browser_softphone());
 		$main.on('click', '[data-action="softphone-test-mic"]', () => this.check_browser_microphone(true));
 		$main.on('click', '[data-action="softphone-test-audio"]', () => this.test_browser_audio());
@@ -713,7 +709,6 @@ class VobizAgentConsole {
 			.html(showLive ? this.browser_softphone_live_html() : '');
 		this.page.main.find('[data-action="softphone-mute"]').toggleClass('hidden', !softphone.in_call);
 		this.page.main.find('[data-action="softphone-mute"] span').text(softphone.muted ? __('Unmute') : __('Mute'));
-		this.page.main.find('[data-action="softphone-hangup"]').toggleClass('hidden', !softphone.in_call);
 		const incomingWaiting = Boolean(softphone.incoming_call_uuid || softphone.incoming_caller) && softphone.status === __('Incoming Call');
 		this.page.main.find('[data-action="softphone-answer"]').toggleClass('hidden', !incomingWaiting);
 	}
