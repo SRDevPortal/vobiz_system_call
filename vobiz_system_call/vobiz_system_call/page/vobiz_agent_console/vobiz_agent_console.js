@@ -1153,12 +1153,14 @@ class VobizAgentConsole {
 			try {
 				softphone.client.client.hangup();
 			} catch (err) {
-				// The backend sync below is still the source of truth for clearing Busy.
+				// Continue through the same Stop Call flow even if the SDK already ended.
 			}
 		}
-		const request = this.sync_browser_softphone_event('hangup', { reason: 'Agent hangup' }, callLog);
+		if (callLog) {
+			return this.cancel_call_log(callLog, this.state.active_workdesk_row);
+		}
 		this.reset_browser_softphone_call_state(softphone.registered ? __('Registered') : __('Disconnected'), callLog, __('Cancelled'));
-		Promise.resolve(request).finally(() => this.load());
+		return Promise.resolve();
 	}
 
 	reset_browser_softphone_call_state(status, callLog, terminalStatus) {
