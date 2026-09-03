@@ -66,8 +66,10 @@ class TestVobizSystemCallPatchApp(unittest.TestCase):
         self.assertTrue((APP_ROOT / "frappe_crm/__init__.py").exists())
         self.assertTrue((APP_ROOT / "frappe_crm/hooks.py").exists())
         self.assertTrue((APP_ROOT / "frappe_crm/commands.py").exists())
+        self.assertTrue((APP_ROOT / "frappe_crm/modules.txt").exists())
         self.assertIn('"frappe_crm*"', pyproject)
         self.assertIn("recursive-include frappe_crm *.py", manifest)
+        self.assertIn("recursive-include frappe_crm *.txt", manifest)
         self.assertIsNotNone(importlib.import_module("frappe_crm"))
         self.assertEqual(importlib.import_module("frappe_crm.commands").commands, [])
 

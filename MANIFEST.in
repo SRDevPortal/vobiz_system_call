@@ -3,4 +3,5 @@ recursive-include vobiz_system_call *.js
 recursive-include vobiz_system_call *.css
 recursive-include vobiz_system_call *.py
 recursive-include frappe_crm *.py
+recursive-include frappe_crm *.txt
 include README.md
