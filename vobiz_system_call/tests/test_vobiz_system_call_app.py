@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 APP_ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +64,7 @@ class TestVobizSystemCallPatchApp(unittest.TestCase):
     def test_frappe_crm_compatibility_shim_is_packaged(self):
         pyproject = self.read_text("pyproject.toml")
         manifest = self.read_text("MANIFEST.in")
+        commands_py = self.read_text("vobiz_system_call/commands.py")
 
         self.assertTrue((APP_ROOT / "frappe_crm/__init__.py").exists())
         self.assertTrue((APP_ROOT / "frappe_crm/hooks.py").exists())
@@ -72,6 +75,25 @@ class TestVobizSystemCallPatchApp(unittest.TestCase):
         self.assertIn("recursive-include frappe_crm *.txt", manifest)
         self.assertIsNotNone(importlib.import_module("frappe_crm"))
         self.assertEqual(importlib.import_module("frappe_crm.commands").commands, [])
+        self.assertIn("fix-frappe-crm-app-name", commands_py)
+
+    def test_fix_frappe_crm_app_name_command_updates_apps_txt(self):
+        commands = importlib.import_module("vobiz_system_call.commands")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = Path(tmp)
+            sites = bench / "sites"
+            sites.mkdir()
+            apps_txt = sites / "apps.txt"
+            apps_txt.write_text("frappe\nfrappe_crm\nvobiz_system_call\n", encoding="utf-8")
+
+            with patch.object(commands.Path, "cwd", return_value=bench):
+                commands.fix_frappe_crm_app_name.callback()
+
+            self.assertEqual(
+                apps_txt.read_text(encoding="utf-8"),
+                "frappe\ncrm\nvobiz_system_call\n",
+            )
 
 
 if __name__ == "__main__":
