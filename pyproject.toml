@@ -18,7 +18,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vobiz_system_call*", "frappe_crm*"]
+include = ["vobiz_system_call*"]
 namespaces = false
 
 [tool.bench.frappe-dependencies]

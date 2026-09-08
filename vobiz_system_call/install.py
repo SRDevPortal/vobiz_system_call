@@ -186,7 +186,8 @@ def ensure_indexes():
             ("tab" + doctype, index),
         ):
             columns = ", ".join("`" + field + "`" for field in fields)
-            frappe.db.sql(
+            # Frappe commits pending setup writes before MariaDB schema changes.
+            frappe.db.sql_ddl(
                 f"ALTER TABLE `tab{doctype}` ADD INDEX `{index}` ({columns}), "
                 "ALGORITHM=INPLACE, LOCK=NONE"
             )

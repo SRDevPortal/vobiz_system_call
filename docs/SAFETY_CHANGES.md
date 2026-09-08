@@ -169,3 +169,12 @@ The dialog now uses its CRM context options even when empty, rather than retaini
 
 ### Strict status-related Lead Disposition
 Workdesk status changes immediately clear prior choices and ignore stale responses. Blank status leaves the modal/workdesk choices empty. Core manual options no longer fall back to generic dispositions for CRM Leads with no configured choices, and CRM save validation rejects nonempty choices outside the selected status even when its option list is empty. Deploy the core settings.py and disposition.py changes together with the console.
+
+### Frappe 15 dependency repository resolution
+Qualified required_apps with SRDevPortal so the installer resolves private/custom app names without searching the frappe and erpnext GitHub organizations. Both dependencies remain required.
+
+### Installation index transaction boundary
+ensure_indexes uses frappe.db.sql_ddl for ALTER TABLE, committing preceding setup writes through the Frappe schema API before MariaDB implicit-commit DDL. Existing-index checks and ALGORITHM=INPLACE, LOCK=NONE are retained. Regression covers pending writes and repeat execution without duplicate DDL.
+
+### Removed obsolete frappe_crm compatibility package
+Verified sites/apps.txt and sriaas.local installed apps use crm. Removed the frappe_crm shim, packaging inclusions, obsolete name-repair command/script, and their tests. The real apps/crm package and site data are unchanged.

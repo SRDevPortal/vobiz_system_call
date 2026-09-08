@@ -5,7 +5,7 @@ app_description = "Browser softphone extension for Vobiz Click To Call"
 app_email = "webdevelopersriaas@gmail.com"
 app_license = "MIT"
 
-required_apps = ["vobiz_click_to_call", "vobiz_ai"]
+required_apps = ["SRDevPortal/vobiz_click_to_call", "SRDevPortal/vobiz_ai"]
 
 after_install = "vobiz_system_call.install.after_install"
 after_migrate = "vobiz_system_call.install.after_migrate"
