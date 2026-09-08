@@ -24,6 +24,7 @@ namespaces = false
 [tool.bench.frappe-dependencies]
 frappe = ">=15.0.0,<16.0.0"
 vobiz_click_to_call = ">=0.0.1"
+vobiz_ai = ">=0.0.1"
 
 [tool.ruff]
 line-length = 110

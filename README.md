@@ -9,3 +9,5 @@ it works inside the same Vobiz Click To Call UI:
 - adds browser softphone fields to `Vobiz User Mapping`
 - overrides the existing `vobiz-agent-console` page with the browser softphone UI
 - exposes the WebRTC answer URL at `vobiz_system_call.api.webrtc.answer`
+
+See [SAFETY_CHANGES.md](SAFETY_CHANGES.md) for browser-call prerequisites, recovery behavior, deployment requirements and validation results.

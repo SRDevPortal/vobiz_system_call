@@ -13,7 +13,7 @@ CALL_DEVICE_MOBILE_BRIDGE = "Mobile Bridge"
 CALL_DEVICE_BROWSER_SOFTPHONE = "Browser Softphone"
 CALL_DEVICE_SYSTEM_DIALER = "System Dialer"
 DEFAULT_BROWSER_SOFTPHONE_REGISTRAR = "registrar.vobiz.ai"
-DEFAULT_BROWSER_SOFTPHONE_SDK_URL = "https://unpkg.com/vobiz-webrtc-sdk@1.0.3/dist/vobiz-webrtc-sdk.min.js"
+DEFAULT_BROWSER_SOFTPHONE_SDK_URL = "/assets/vobiz_system_call/vendor/vobiz-webrtc-sdk-1.0.3/vobiz-webrtc-sdk.min.js"
 DEFAULT_SYSTEM_DIALER_URL_TEMPLATE = "sip:{number}@{sip_domain}"
 SYSTEM_DIALER_ALLOWED_SCHEMES = {"tel", "sip", "sips", "callto"}
 
@@ -51,7 +51,7 @@ def get_inbound_callback_token(settings=None) -> str:
         try:
             token = settings.get_password("inbound_callback_token") or ""
         except Exception:
-            token = settings.get("inbound_callback_token") or ""
+            token = ""
     return (token or frappe.conf.get("vobiz_system_call_inbound_token") or "").strip()
 
 

@@ -10,14 +10,16 @@ from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 def after_install():
     ensure_dependencies()
     ensure_patch_fields()
-    cleanup_standalone_ui()
+    ensure_console()
+    ensure_indexes()
     ensure_defaults()
 
 
 def after_migrate():
     ensure_dependencies()
     ensure_patch_fields()
-    cleanup_standalone_ui()
+    ensure_console()
+    ensure_indexes()
     ensure_defaults()
 
 
@@ -62,7 +64,7 @@ def ensure_patch_fields():
                     "fieldname": "browser_softphone_sdk_url",
                     "label": "Browser Softphone SDK URL",
                     "fieldtype": "Data",
-                    "default": "https://unpkg.com/vobiz-webrtc-sdk@1.0.3/dist/vobiz-webrtc-sdk.min.js",
+                    "default": "/assets/vobiz_system_call/vendor/vobiz-webrtc-sdk-1.0.3/vobiz-webrtc-sdk.min.js",
                     "insert_after": "browser_softphone_registrar",
                     "depends_on": "eval:doc.agent_call_device=='Browser Softphone'",
                 },
@@ -135,7 +137,7 @@ def ensure_defaults():
     defaults = {
         "agent_call_device": "Mobile Bridge",
         "browser_softphone_registrar": "registrar.vobiz.ai",
-        "browser_softphone_sdk_url": "https://unpkg.com/vobiz-webrtc-sdk@1.0.3/dist/vobiz-webrtc-sdk.min.js",
+        "browser_softphone_sdk_url": "/assets/vobiz_system_call/vendor/vobiz-webrtc-sdk-1.0.3/vobiz-webrtc-sdk.min.js",
         "system_dialer_url_template": "sip:{number}@{sip_domain}",
     }
     for fieldname, value in defaults.items():
@@ -147,17 +149,47 @@ def ensure_defaults():
 
 
 def cleanup_standalone_ui():
-    for doctype, name in (
-        ("Workspace", "Vobiz System Call"),
-        ("Page", "vobiz-system-call-console"),
-        ("DocType", "Vobiz System Call User"),
-        ("DocType", "Vobiz System Call Settings"),
-    ):
-        try:
-            if frappe.db.exists(doctype, name):
-                frappe.delete_doc(doctype, name, ignore_permissions=True, force=True)
-        except Exception:
-            frappe.log_error(frappe.get_traceback(), "Vobiz System Call standalone cleanup failed")
+    """Compatibility entry point: legacy data is intentionally retained."""
+    return
+
+
+def ensure_console():
+    from frappe.modules.import_file import import_file_by_path
+    path = frappe.get_app_path(
+        "vobiz_system_call", "vobiz_system_call", "page",
+        "vobiz_agent_console", "vobiz_agent_console.json",
+    )
+    import_file_by_path(path, force=True)
+
+
+def before_uninstall():
+    # Return ownership before Frappe deletes this app's modules/pages.
+    from frappe.modules.import_file import import_file_by_path
+    path = frappe.get_app_path(
+        "vobiz_click_to_call", "vobiz_click_to_call", "page",
+        "vobiz_agent_console", "vobiz_agent_console.json",
+    )
+    import_file_by_path(path, force=True)
+    frappe.clear_cache()
+
+
+def ensure_indexes():
+    # Fixed identifiers only. No blocking COPY fallback on production tables.
+    indexes = [
+        ("Vobiz User Mapping", "vsc_endpoint", ("browser_softphone_username", "enabled")),
+        ("Vobiz User Mapping", "vsc_did", ("caller_id", "enabled", "browser_softphone_enabled")),
+    ]
+    for doctype, index, fields in indexes:
+        if not frappe.db.sql(
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s LIMIT 1",
+            ("tab" + doctype, index),
+        ):
+            columns = ", ".join("`" + field + "`" for field in fields)
+            frappe.db.sql(
+                f"ALTER TABLE `tab{doctype}` ADD INDEX `{index}` ({columns}), "
+                "ALGORITHM=INPLACE, LOCK=NONE"
+            )
 
 
 def configure_profile_from_core_mapping(
@@ -180,7 +212,7 @@ def configure_profile_from_core_mapping(
     if settings.meta.has_field("browser_softphone_sdk_url"):
         settings.browser_softphone_sdk_url = (
             settings.browser_softphone_sdk_url
-            or "https://unpkg.com/vobiz-webrtc-sdk@1.0.3/dist/vobiz-webrtc-sdk.min.js"
+            or "/assets/vobiz_system_call/vendor/vobiz-webrtc-sdk-1.0.3/vobiz-webrtc-sdk.min.js"
         )
     settings.save(ignore_permissions=True)
 
@@ -194,7 +226,7 @@ def configure_profile_from_core_mapping(
     mapping.browser_softphone_endpoint_uri = endpoint_uri
     if caller_id:
         mapping.caller_id = caller_id
-    password = mapping.get_password("browser_softphone_password") or ""
+    password = mapping.get_password("browser_softphone_password", raise_exception=False) or ""
     if not password and os.environ.get("VOBIZ_SYSTEM_CALL_SIP_PASSWORD"):
         mapping.browser_softphone_password = os.environ["VOBIZ_SYSTEM_CALL_SIP_PASSWORD"]
     mapping.save(ignore_permissions=True)

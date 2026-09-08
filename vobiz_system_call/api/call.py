@@ -7,6 +7,7 @@ import frappe
 from frappe import _
 
 from vobiz_ai.api.call_log import sync_linked_summaries
+from vobiz_system_call.api import lifecycle
 from vobiz_click_to_call.api import call as core_call
 from vobiz_click_to_call.services.call_log_update import save_doc_latest, snapshot_doc
 from vobiz_click_to_call.services.debug_log import log_vobiz_event
@@ -19,6 +20,7 @@ from vobiz_system_call.api.settings import (
     CALL_DEVICE_SYSTEM_DIALER,
     build_system_dialer_url,
     get_call_device,
+    get_inbound_callback_token,
     get_caller_id,
     get_profile_endpoint_uri,
     get_profile_password,
@@ -36,6 +38,7 @@ def start_call(
     phone_number: str | None = None,
     patient_phone_selected: int | str = 0,
     client_context: str | None = None,
+    tab_id: str | None = None,
 ) -> dict[str, Any]:
     if frappe.session.user == "Guest":
         frappe.throw(_("Login required."))
@@ -71,9 +74,16 @@ def start_call(
     mapping = core_call.get_user_mapping(frappe.session.user)
     if not mapping:
         frappe.throw(_("No active Vobiz user mapping found for your user."))
-    unavailable_reason = core_call.get_mapping_unavailable_reason(mapping)
-    if unavailable_reason:
-        frappe.throw(unavailable_reason)
+    if call_device == CALL_DEVICE_BROWSER_SOFTPHONE:
+        if not get_inbound_callback_token(system_settings):
+            frappe.throw(_("Configure the provider callback token before browser calling."))
+        if not system_settings.get("enable_cdr_sync"):
+            frappe.throw(_("Enable Vobiz CDR Sync for browser call recovery."))
+        if not tab_id or lifecycle.presence(frappe.session.user) != tab_id:
+            frappe.throw(_("Connect this browser before starting a call."))
+    locked_mapping = lifecycle.lock_mapping(frappe.session.user)
+    lifecycle.assert_available(locked_mapping)
+    mapping = locked_mapping.as_dict()
 
     default_country_code = get_default_country_code(core_settings)
     raw_customer_number, resolved_phone_field = core_call.resolve_target_number(doc, phone_field, phone_number)
@@ -277,3 +287,13 @@ def start_browser_softphone_call(
         "agent_mobile_display": mask_phone(user_mobile) if user_mobile else endpoint_username,
         "message": _("Browser softphone call prepared."),
     }
+
+
+@frappe.whitelist(methods=["POST"])
+def cancel_call(call_log: str):
+    # Protect browser calls even when cancellation comes from another core UI.
+    row = frappe.db.get_value("Vobiz Call Log", call_log, ["request_json"], as_dict=True)
+    if row and lifecycle.is_browser_call(row):
+        from vobiz_system_call.api.webrtc import cancel_browser_call
+        return cancel_browser_call(call_log)
+    return core_call.cancel_call(call_log)
