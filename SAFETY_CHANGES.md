@@ -104,3 +104,68 @@ from silence using RMS input level (not speech recognition), without recording o
 connecting the microphone to speakers. Stop test, navigation and starting/answering
 a call release test tracks, nodes and context. Late permission results are released
 when a test was cancelled. Tests cover sound/silence and late-permission cleanup.
+
+## Inbound caller identity correction
+
+Inbound SIP Dial now presents the authenticated provider customer number as callerId,
+including retries. Previously it presented the business DID while browser association
+required the customer number, causing a legitimate incoming call to fail matching.
+The business DID remains on the log and controls agent routing. Matching was not
+relaxed. All 35 Python tests pass, including first/retry routing and SIP caller matching.
+
+## Inbound SIP identity follow-up
+
+Customer callerId routing subsequently failed before the SIP endpoint rang (provider
+DialStatus failed, ORIGINATOR_CANCEL). The exact provider reason is not established.
+Restored the business DID that previously reached the browser. Incoming association
+now requires the registered tab, owned incoming nonterminal log, current mapping
+reservation and matching DID in both mapping and log. The UI displays customer_number
+from the authenticated provider log. Failed browser association clears incoming_pending.
+This supersedes the customer-callerId change above. 35 Python tests and six browser
+lifecycle checks pass; real inbound callback verification remains pending.
+
+## Stop Call already-ended race
+
+The browser may hang up before the server DELETE arrives. Browser cancellation now
+opts into VobizClient.hangup_call(..., allow_missing=True). Only exact "call not found"
+responses with status 400/404/410 are handled as pending confirmation; credentials,
+server and unrelated errors still raise. Reservations remain until authenticated
+callbacks/CDR recovery confirms the outcome. No terminal status is inferred from 404.
+
+Deploy the additional core compatibility file vobiz_click_to_call/services/client.py
+together with vobiz_system_call/api/webrtc.py. Existing core callers retain their
+previous error behavior unless explicitly opting in. 37 Python tests and six browser
+lifecycle checks passed. No real calls were placed or cancelled for verification.
+
+## Consistent call ending and incoming disposition
+
+Header End Call and softphone Stop Call share confirmation, including rejecting
+a confirmation if its call has been replaced. Browser-ended calls poll their own
+log for provider-confirmed terminal state for up to two minutes before prompting;
+existing console refresh remains available afterward. Incoming calls without CRM
+references now use generic disposition options and no unrelated lead status fields
+or auto-save timer. Existing AI/auto-dial disposition policies remain in place.
+Tests cover confirmation rejection, stale calls, prompt deduplication, unlinked
+incoming calls and delayed provider completion. All browser regressions passed.
+
+## Incoming CRM disposition completion
+
+Core get_call_status now includes direction, required to recognize unlinked incoming
+calls. After terminal confirmation, the extension can attach one uniquely matched,
+readable CRM Lead using indexed Indian-number fields only. Multiple/no matches use
+an explicit lead picker; the server verifies the selected record's phone and access.
+No routing-time CRM scan or guess is introduced. The agent can instead save a call-only
+disposition. Linked calls use the existing Status/Lead Disposition/Notes/countdown
+form for either agent or customer hangup. Other-country numbers retain call-only
+disposition until an appropriate indexed matching strategy is available.
+39 Python tests and all browser regressions pass. Real modal interaction remains to
+be verified after refreshing the console. Include the core api/call.py change when deploying.
+
+### Incoming shared disposition form
+Removed the separate customer-selection popup. Unmatched incoming calls now open Complete Call Disposition with CRM Lead, Status, Lead Disposition and Notes. Selecting a validated matching lead loads CRM options inside the same dialog and preserves notes. Saving is blocked until the lead context is loaded; server matching and ownership checks remain. Already matched calls retain the existing countdown flow.
+
+### Disposition status consistency and Frappe 15 cleanup
+The dialog now uses its CRM context options even when empty, rather than retaining another status's dispositions. Status changes clear old selections and ignore out-of-order responses. Timeout saves no longer carry a disposition from a different status. Incoming preparation wraps the Frappe jQuery thenable in a native Promise before finally cleanup. Verified on site: Fresh has no configured dispositions; Want Discount belongs to Financial Issue.
+
+### Strict status-related Lead Disposition
+Workdesk status changes immediately clear prior choices and ignore stale responses. Blank status leaves the modal/workdesk choices empty. Core manual options no longer fall back to generic dispositions for CRM Leads with no configured choices, and CRM save validation rejects nonempty choices outside the selected status even when its option list is empty. Deploy the core settings.py and disposition.py changes together with the console.

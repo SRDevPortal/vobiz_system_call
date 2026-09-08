@@ -13,7 +13,7 @@ function instance() {
     const obj = Object.create(ctx.ConsoleClass.prototype);
     obj.state = {softphone: {current_call_log: 'C1', registered: true}, auto_dial: {}};
     for (const name of ['render_browser_softphone', 'render_workdesk_live_call', 'update_workdesk_primary_action',
-        'maybe_prompt_workdesk_disposition', 'load', 'clear_tracked_live_call']) obj[name] = () => {};
+        'maybe_prompt_workdesk_disposition', 'watch_browser_call_disposition', 'load', 'clear_tracked_live_call']) obj[name] = () => {};
     obj.is_terminal_status = s => ['Completed', 'Cancelled', 'Failed'].includes(s);
     return obj;
 }

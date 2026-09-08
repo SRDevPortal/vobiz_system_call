@@ -43,5 +43,15 @@ vm.runInContext(fs.readFileSync(path.join(__dirname, '../vobiz_system_call/page/
  obj.enable_browser_softphone_audio();await new Promise(setImmediate);
  assert.equal(replayed,0,'Enable audio must not restart local outgoing ringback');
  obj.state.softphone.current_call_log='C2';tick();assert.equal(audio.srcObject,null);
+ const reports=new Map([
+ ['out',{id:'out',type:'outbound-rtp',kind:'audio',codecId:'codec',remoteId:'feedback'}],
+ ['codec',{mimeType:'audio/opus',clockRate:48000}],
+ ['feedback',{type:'remote-inbound-rtp',fractionLost:0.025,jitter:0.012}]
+ ]);
+ obj.update_browser_upload_diagnostics(reports,{});
+ assert.match(obj.state.softphone.diagnostics.upload_message,/opus 48 kHz/);
+ assert.match(obj.state.softphone.diagnostics.upload_message,/2.5%/);
+ reports.delete('feedback');obj.update_browser_upload_diagnostics(reports,{});
+ assert.match(obj.state.softphone.diagnostics.upload_message,/loss not reported/);
  console.log('Delayed track, autoplay rejection/retry, single output and stale-call cleanup checks passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});

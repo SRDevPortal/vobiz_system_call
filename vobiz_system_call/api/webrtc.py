@@ -110,8 +110,13 @@ def get_incoming_call(caller: str, tab_id: str):
     if not name:
         frappe.throw(_("No routed incoming call found."))
     mapping, row = lifecycle.lock_call(name)
+    # The SIP leg presents the business DID; customer identity comes from the
+    # authenticated provider's routed log, not the browser's displayed caller ID.
     if (row.user != frappe.session.user or row.direction != "Incoming"
-            or row.status in lifecycle.TERMINAL or _number(caller) != row.normalized_customer_number):
+            or row.status in lifecycle.TERMINAL
+            or mapping.current_call_log != row.name
+            or not row.did_number or _number(caller) != _number(row.did_number)
+            or _number(mapping.caller_id) != _number(row.did_number)):
         frappe.throw(_("Incoming call does not match the routed call."))
     frappe.db.commit()
     return {"call_log": row.name, "call_uuid": row.call_uuid, "customer_number": row.customer_number}
@@ -170,7 +175,7 @@ def cancel_browser_call(call_log: str):
     from vobiz_click_to_call.services.client import VobizClient
     # On a provider error keep the reservation. A queued reconciliation may still resolve it.
     try:
-        VobizClient(get_settings()).hangup_call(uuid)
+        VobizClient(get_settings()).hangup_call(uuid, allow_missing=True)
     finally:
         lifecycle.enqueue_reconcile(call_log)
         frappe.db.commit()
@@ -368,7 +373,11 @@ def _sip_username(value):
 
 
 def _number(value):
-    value = _sip_username(value) if str(value).startswith("sip:") else str(value or "")
+    value = str(value or "").strip()
+    # The SDK can omit the sip: scheme from incoming caller addresses.
+    address = re.fullmatch(r"(?:sips?:)?(\+?[0-9]{7,15})@[A-Za-z0-9.-]+(?::[0-9]{1,5})?", value)
+    if address:
+        value = address.group(1)
     if not re.fullmatch(r"\+?[0-9]{7,15}", value):
         return ""
     return normalize_phone_number(value, default_country_code=get_default_country_code())
@@ -430,3 +439,59 @@ def _xml_response(xml):
 
 def _plain_response(text, status=200):
     return Response(text, status=status, content_type="text/plain; charset=utf-8")
+
+
+def _unique_incoming_lead(customer_number, selected_name=None):
+    """Use indexed phone columns only, and never choose among ambiguous matches."""
+    number = _number(customer_number)
+    if not number or not number.startswith("+91") or len(number) != 13:
+        return None
+    if not frappe.db.exists("DocType", "CRM Lead"):
+        return None
+    fields = frappe.db.sql(
+        "SELECT DISTINCT COLUMN_NAME FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tabCRM Lead' AND SEQ_IN_INDEX=1 "
+        "AND COLUMN_NAME IN ('sr_mobile_norm','vobiz_mobile_last10','vobiz_phone_last10','vobiz_whatsapp_last10')",
+        pluck=True,
+    )
+    meta = frappe.get_meta("CRM Lead")
+    canonical = {field: 0 for field in ("sr_is_archived", "sr_is_duplicate") if meta.has_field(field)}
+    if selected_name:
+        canonical["name"] = selected_name
+    matches = set()
+    for field in fields:
+        # Get all candidate identities before checking access: hidden duplicates
+        # must not turn an ambiguous number into an apparent unique match.
+        matches.update(frappe.get_all("CRM Lead", filters={field: number[-10:], **canonical},
+                                      pluck="name", limit_page_length=2))
+        if len(matches) > 1:
+            return None
+    if len(matches) != 1:
+        return None
+    name = next(iter(matches))
+    if not frappe.has_permission("CRM Lead", "read", doc=name):
+        return None
+    return name
+
+
+@frappe.whitelist(methods=["POST"])
+def prepare_incoming_disposition(call_log: str, reference_name: str | None = None):
+    _login()
+    doc = frappe.get_doc("Vobiz Call Log", call_log)
+    if doc.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+        frappe.throw(_("Not permitted."))
+    if doc.direction != "Incoming" or doc.status not in lifecycle.TERMINAL:
+        frappe.throw(_("The incoming call has not ended yet."))
+    if not doc.reference_doctype and not doc.reference_name:
+        name = _unique_incoming_lead(doc.customer_number, reference_name)
+        if reference_name and not name:
+            frappe.throw(_("Select an accessible CRM Lead matching this caller?s phone number."))
+        if name:
+            # Recheck under lock in case another request attached a reference.
+            mapping, locked = lifecycle.lock_call(call_log)
+            if not locked.reference_doctype and not locked.reference_name:
+                frappe.db.set_value("Vobiz Call Log", call_log,
+                                    {"reference_doctype": "CRM Lead", "reference_name": name})
+            frappe.db.commit()
+    from vobiz_click_to_call.api.call import get_call_status
+    return get_call_status(call_log, sync_provider=0)

@@ -42,6 +42,90 @@ class BrowserSafetyTests(unittest.TestCase):
         self.addCleanup(p.stop)
         return value
 
+    def test_inbound_sip_leg_presents_business_did_on_first_route_and_retry(self):
+        caller, did = "+919876545966", "+911234565565"
+        mapping = row(name="MAP", current_call_log="", availability_status="Available",
+                      accept_calls=1, agent_mobile="+911234567890")
+        mapping.as_dict = lambda: dict(mapping)
+        incoming = row(name="INBOUND", direction="Incoming", status="Ringing", customer_number=caller,
+                       did_number=did, agent_number="sip:agent@registrar", call_status="provider-routed")
+        self.replace(webrtc, "_number", lambda value: value)
+        self.replace(frappe, "get_all", lambda *a, **kw: [mapping])
+        self.replace(lifecycle, "lock_mapping", lambda _: mapping)
+        self.replace(lifecycle, "presence", lambda _: "tab")
+        self.replace(lifecycle, "assert_available", lambda _: None)
+        self.replace(webrtc, "get_profile_endpoint_uri", lambda _: incoming.agent_number)
+        document = MagicMock()
+        document.insert.return_value = incoming
+        self.replace(frappe, "get_doc", lambda _: document)
+        from vobiz_click_to_call.api import call as core_call
+        self.replace(core_call, "mark_mapping_busy", MagicMock())
+        dial = self.replace(webrtc, "_dial_user_xml", MagicMock(return_value="<Response/>"))
+        self.db.exists.return_value = False
+        webrtc._answer_pstn_inbound(caller, did, {"CallUUID": "provider-inbound-uuid"})
+        dial.assert_called_once_with(incoming.agent_number, did, incoming)
+        dial.reset_mock()
+        self.db.exists.return_value = True
+        self.db.get_value.return_value = incoming.user
+        mapping.current_call_log = "VSC-IN-" + webrtc.hashlib.sha256(b"provider-inbound-uuid").hexdigest()[:40]
+        self.replace(lifecycle, "lock_call", lambda _: (mapping, incoming))
+        webrtc._answer_pstn_inbound(caller, did, {"CallUUID": "provider-inbound-uuid"})
+        dial.assert_called_once_with(incoming.agent_number, did, incoming)
+
+    def test_incoming_link_uses_reserved_did_and_returns_authenticated_customer(self):
+        self.replace(webrtc, "get_default_country_code", lambda: "+91")
+        self.replace(lifecycle, "presence", lambda _: "tab")
+        self.replace(webrtc, "get_system_call_profile", lambda: {"current_call_log": "INBOUND"})
+        incoming = row(name="INBOUND", direction="Incoming", status="Ringing", customer_number="+919876545966",
+                       normalized_customer_number="+919876545966", did_number="+911234565565")
+        mapping = row(current_call_log="INBOUND", caller_id=incoming.did_number)
+        self.replace(lifecycle, "lock_call", lambda _: (mapping, incoming))
+        result = webrtc.get_incoming_call("sip:911234565565@registrar.vobiz.ai", "tab")
+        self.assertEqual(result["call_log"], "INBOUND")
+        self.assertEqual(result["customer_number"], incoming.customer_number)
+        for address in ["+911234565565@registrar.vobiz.ai", "911234565565@registrar.vobiz.ai", "sips:+911234565565@registrar.vobiz.ai"]:
+            self.assertEqual(webrtc.get_incoming_call(address, "tab")["call_log"], "INBOUND")
+        for invalid in ["agent@registrar.vobiz.ai", "sip:+911234565565@", "+911234565565@registrar.vobiz.ai@evil", ""]:
+            self.assertEqual(webrtc._number(invalid), "")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            webrtc.get_incoming_call("sip:911111111111@registrar.vobiz.ai", "tab")
+        mapping.current_call_log = "OTHER"
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            webrtc.get_incoming_call("sip:911234565565@registrar.vobiz.ai", "tab")
+
+    def test_incoming_reference_matching_requires_unique_accessible_indexed_lead(self):
+        self.replace(webrtc, "_number", lambda value: value)
+        self.db.exists.return_value = True
+        self.db.sql.return_value = ["sr_mobile_norm", "vobiz_phone_last10"]
+        meta = MagicMock()
+        meta.has_field.return_value = False
+        self.replace(frappe, "get_meta", lambda _: meta)
+        lookup = self.replace(frappe, "get_all", MagicMock(return_value=["LEAD-1"]))
+        permission = self.replace(frappe, "has_permission", MagicMock(return_value=True))
+        self.assertEqual(webrtc._unique_incoming_lead("+919876545966"), "LEAD-1")
+        self.assertEqual(webrtc._unique_incoming_lead("+919876545966", "LEAD-1"), "LEAD-1")
+        self.assertEqual(lookup.call_args.kwargs["filters"]["name"], "LEAD-1")
+        permission.return_value = False
+        self.assertIsNone(webrtc._unique_incoming_lead("+919876545966"))
+        permission.return_value = True
+        lookup.return_value = ["LEAD-1", "LEAD-2"]
+        self.assertIsNone(webrtc._unique_incoming_lead("+919876545966"))
+        self.db.sql.return_value = []
+        lookup.reset_mock()
+        self.assertIsNone(webrtc._unique_incoming_lead("+919876545966"))
+        lookup.assert_not_called()
+        self.assertIsNone(webrtc._unique_incoming_lead("+14155550123"))
+
+    def test_incoming_disposition_preparation_rejects_active_or_foreign_calls(self):
+        doc = row(direction="Incoming", status="Connected")
+        self.replace(frappe, "get_doc", lambda *args: doc)
+        with self.assertRaisesRegex(ValueError, "not ended"):
+            webrtc.prepare_incoming_disposition("CALL-1")
+        doc.status = "Completed"
+        doc.user = "other@example.test"
+        with self.assertRaisesRegex(ValueError, "Not permitted"):
+            webrtc.prepare_incoming_disposition("CALL-1")
+
     def test_public_token_fails_closed_and_checks_exact_match(self):
         self.replace(webrtc, "get_inbound_callback_token", lambda *args: "")
         self.assertFalse(webrtc._valid_public_token(None))
@@ -221,11 +305,43 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(), row(call_uuid="provider-uuid")))
         self.replace(lifecycle, "enqueue_reconcile", MagicMock())
         provider = MagicMock()
-        provider.hangup_call.side_effect = lambda _: events.append("network")
+        provider.hangup_call.side_effect = lambda _, **kwargs: events.append("network")
         self.replace(client, "VobizClient", lambda _: provider)
         result = webrtc.cancel_browser_call("CALL-1")
         self.assertLess(events.index("commit"), events.index("network"))
         self.assertTrue(result["pending_provider"])
+
+    def test_missing_provider_call_is_pending_without_releasing_reservation(self):
+        from vobiz_click_to_call.services import client
+        self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(), row(call_uuid="provider-uuid")))
+        finish = self.replace(lifecycle, "finish_locked", MagicMock())
+        enqueue = self.replace(lifecycle, "enqueue_reconcile", MagicMock())
+        provider = MagicMock()
+        provider.hangup_call.return_value = {"call_missing": True, "status_code": 404}
+        self.replace(client, "VobizClient", lambda _: provider)
+        result = webrtc.cancel_browser_call("CALL-1")
+        self.assertTrue(result["pending_provider"])
+        provider.hangup_call.assert_called_once_with("provider-uuid", allow_missing=True)
+        finish.assert_not_called()
+        enqueue.assert_called_once_with("CALL-1")
+
+    def test_client_missing_call_opt_in_does_not_hide_other_failures(self):
+        from vobiz_click_to_call.services import client
+        self.replace(client, "_", lambda value: value)
+        provider = client.VobizClient.__new__(client.VobizClient)
+        provider.auth_id, provider.auth_token = "test", "test"
+        provider.base_url, provider.timeout = "https://provider.example", 1
+        response = MagicMock(status_code=404)
+        response.json.return_value = {"message": "call not found"}
+        self.replace(client.requests, "delete", MagicMock(return_value=response))
+        self.assertTrue(provider.hangup_call("uuid", allow_missing=True)["call_missing"])
+        with self.assertRaisesRegex(ValueError, "call not found"):
+            provider.hangup_call("uuid")
+        for code, message in [(401, "call not found"), (500, "call not found"), (404, "account not found")]:
+            response.status_code = code
+            response.json.return_value = {"message": message}
+            with self.assertRaises(ValueError):
+                provider.hangup_call("uuid", allow_missing=True)
 
     def test_provider_failure_keeps_mapping_and_queues_reconciliation(self):
         from vobiz_click_to_call.services import client

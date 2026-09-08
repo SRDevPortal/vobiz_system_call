@@ -771,6 +771,7 @@ class VobizAgentConsole {
 			${chip('fa-microphone', diagnostics.mic, diagnostics.mic_message || __('Mic status unknown'))}
 			${chip('fa-volume-up', diagnostics.audio, diagnostics.audio_message || __('Audio test ready'))}
 			${chip('fa-wifi', diagnostics.network, diagnostics.network_message || __('Connection status unknown'))}
+			${diagnostics.upload_message ? chip('fa-upload', diagnostics.upload_state, diagnostics.upload_message) : ''}
 		`;
 	}
 
@@ -1188,8 +1189,8 @@ class VobizAgentConsole {
 			softphone.current_call_log = call.call_log;
 			softphone.incoming_call_uuid = this.extract_call_uuid(info);
 			softphone.sdk_call_uuid = softphone.incoming_call_uuid;
-			softphone.incoming_caller = caller;
-			softphone.current_destination = caller;
+			softphone.incoming_caller = call.customer_number || caller;
+			softphone.current_destination = call.customer_number || caller;
 			softphone.current_customer = callerName || __('Customer');
 			softphone.direction = __('Incoming Call');
 			softphone.status = __('Incoming Call');
@@ -1200,6 +1201,7 @@ class VobizAgentConsole {
 			this.render_browser_softphone();
 			this.render_queue();
 		}).catch((err) => {
+			softphone.incoming_pending = false;
 			softphone.error = err.message || __('Incoming call could not be linked.');
 			try { softphone.client.client.hangup(); } catch (_) {}
 			this.render_browser_softphone();
@@ -1244,6 +1246,7 @@ class VobizAgentConsole {
 		const callLog = softphone.current_call_log;
 		if (!callLog) return;
 		this.sync_browser_softphone_event(event, callInfo, callLog).then(() => {
+			this.watch_browser_call_disposition(callLog);
 			if (softphone.current_call_log !== callLog) return;
 			this.reset_browser_softphone_call_state(
 				softphone.registered ? __('Registered') : __('Disconnected'), callLog, ''
@@ -1319,7 +1322,7 @@ class VobizAgentConsole {
 
 	hangup_browser_softphone() {
 		const callLog = this.state.softphone.current_call_log;
-		return callLog ? this.cancel_call_log(callLog, this.state.active_workdesk_row) : Promise.resolve();
+		return this.confirm_end_call(callLog, this.state.softphone.current_customer);
 	}
 
 	reset_browser_softphone_call_state(status, callLog, terminalStatus) {
@@ -1392,6 +1395,29 @@ class VobizAgentConsole {
 		this.render_browser_softphone();
 	}
 
+	update_browser_upload_diagnostics(reports, pc) {
+		const softphone = this.state.softphone;
+		const diagnostics = softphone.diagnostics || (softphone.diagnostics = {});
+		let outbound;
+		reports.forEach(report => {
+			if (report.type === 'outbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio') && !report.isRemote) outbound = report;
+		});
+		if (!outbound) return;
+		const codec = reports.get(outbound.codecId);
+		let feedback = outbound.remoteId && reports.get(outbound.remoteId);
+		if (!feedback) reports.forEach(report => {
+			if (report.type === 'remote-inbound-rtp' && report.localId === outbound.id) feedback = report;
+		});
+		const name = codec && codec.mimeType ? codec.mimeType.replace(/^audio\//i, '') : __('unknown codec');
+		const rate = codec && codec.clockRate ? ` ${codec.clockRate / 1000} kHz` : '';
+		const loss = feedback && Number.isFinite(feedback.fractionLost) ? Math.max(0, feedback.fractionLost * 100) : null;
+		const jitter = feedback && Number.isFinite(feedback.jitter) ? Math.round(feedback.jitter * 1000) : null;
+		diagnostics.upload_state = 'checking'; // Packet statistics cannot establish perceived voice clarity.
+		diagnostics.upload_message = __('Upload: ') + name + rate
+			+ (loss === null ? __('; loss not reported') : `; ${loss.toFixed(1)}% ` + __('loss'))
+			+ (jitter === null ? '' : `; ${jitter} ms ` + __('jitter'));
+	}
+
 	disable_browser_outgoing_tones() {
 		const sdk = this.state.softphone.client && this.state.softphone.client.client;
 		if (!sdk) return;
@@ -1419,6 +1445,7 @@ class VobizAgentConsole {
 		const audio = this.page.main.find('[data-role="softphone-audio"]').get(0);
 		if (audio) { audio.pause(); audio.srcObject = null; }
 		this.state.softphone.received_audio_packets = 0;
+		if (this.state.softphone.diagnostics) this.state.softphone.diagnostics.upload_message = '';
 		this.stop_browser_softphone_tones();
 	}
 
@@ -1452,6 +1479,7 @@ class VobizAgentConsole {
 				softphone.audio_stats_pending = true;
 				pc.getStats().then(reports => {
 					if (softphone.client !== owner || softphone.current_call_log !== callLog) return;
+					this.update_browser_upload_diagnostics(reports, pc);
 					let packets = 0;
 					reports.forEach(report => {
 						if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) packets += report.packetsReceived || 0;
@@ -2543,28 +2571,37 @@ class VobizAgentConsole {
 		if (patientFollowupOptions.length) {
 			this.state.patient_followup_status_options = patientFollowupOptions;
 		}
-		this.state.dispositions = options.length ? options : this.state.dispositions;
+		this.state.dispositions = options;
 		this.render_dispositions();
 	}
 
-	refresh_lead_disposition_options() {
+	async refresh_lead_disposition_options() {
 		const reference = this.active_disposition_reference();
-		if (!reference.reference_doctype || !reference.reference_name) return;
-
 		const leadStatus = this.page.main.find('[data-role="lead-status"]').val();
-		frappe.call({
-			method: 'vobiz_click_to_call.api.disposition.get_lead_disposition_context_api',
-			args: {
-				reference_doctype: reference.reference_doctype,
-				reference_name: reference.reference_name,
-				lead_status: leadStatus
-			}
-		}).then((r) => {
+		const request = this.disposition_refresh_request = (this.disposition_refresh_request || 0) + 1;
+		this.state.dispositions = [];
+		this.state.lead_disposition_context = Object.assign({}, this.state.lead_disposition_context, {
+			status: leadStatus || '', disposition: '', options: []
+		});
+		this.render_dispositions();
+		if (!reference.reference_doctype || !reference.reference_name || !leadStatus) return;
+		try {
+			const r = await frappe.call({
+				method: 'vobiz_click_to_call.api.disposition.get_lead_disposition_context_api',
+				args: Object.assign({}, reference, {lead_status: leadStatus})
+			});
+			const current = this.active_disposition_reference();
+			if (request !== this.disposition_refresh_request
+				|| current.reference_doctype !== reference.reference_doctype
+				|| current.reference_name !== reference.reference_name
+				|| this.page.main.find('[data-role="lead-status"]').val() !== leadStatus) return;
 			const context = r.message || {};
-			this.state.lead_disposition_context = context;
+			this.state.lead_disposition_context = Object.assign({}, context, {disposition: ''});
 			this.state.dispositions = (context.options || []).map(row => row.name).filter(Boolean);
 			this.render_dispositions();
-		});
+		} catch (error) {
+			// Leave choices empty on failure instead of restoring another status's options.
+		}
 	}
 
 	active_disposition_reference() {
@@ -2720,14 +2757,27 @@ class VobizAgentConsole {
 
 	end_header_active_call() {
 		const active = this.state.active_call || {};
-		if (!active.name || this.state.ending_active_call) return;
-		frappe.confirm(__('End the active call with {0}?', [active.reference_title || active.reference_name || __('this customer')]), () => {
-			this.state.ending_active_call = true;
-			this.render_header_active_call(active);
-			Promise.resolve(this.cancel_call_log(active.name)).finally(() => {
-				this.state.ending_active_call = false;
-				this.render_header_active_call(this.state.active_call || {});
-			});
+		return this.confirm_end_call(active.name, active.reference_title || active.reference_name);
+	}
+
+	confirm_end_call(callLog, title) {
+		if (!callLog || this.state.ending_active_call) return;
+		this.state.ending_active_call = true;
+		const release = () => {
+			this.state.ending_active_call = false;
+			this.render_header_active_call(this.state.active_call || {});
+		};
+		const dialog = frappe.confirm(__('End the active call with {0}?', [title || __('this customer')]), () => {
+			// A delayed confirmation must never stop a different/new call.
+			if (this.state.softphone.current_call_log !== callLog && (this.state.active_call || {}).name !== callLog) {
+				release();
+				return;
+			}
+			this.state.confirmed_end_call = true;
+			Promise.resolve(this.cancel_call_log(callLog)).finally(() => { this.state.confirmed_end_call = false; release(); });
+		}, release);
+		if (dialog && dialog.$wrapper) dialog.$wrapper.one('hidden.bs.modal', () => {
+			if (!this.state.confirmed_end_call) release();
 		});
 	}
 
@@ -4843,6 +4893,26 @@ class VobizAgentConsole {
 		this.cancel_call_log(active.name);
 	}
 
+	watch_browser_call_disposition(callLog) {
+		this.browser_disposition_watchers = this.browser_disposition_watchers || new Set();
+		if (this.browser_disposition_watchers.has(callLog)) return;
+		this.browser_disposition_watchers.add(callLog);
+		let attempts = 0;
+		const check = () => frappe.call({
+			method: 'vobiz_click_to_call.api.call.get_call_status', args: { call_log: callLog, sync_provider: 0 }
+		}).then(r => {
+			const call = r.message || {};
+			if (this.is_terminal_status(call.status)) {
+				this.browser_disposition_watchers.delete(callLog);
+				this.maybe_prompt_workdesk_disposition(call);
+				return;
+			}
+			if (++attempts < 60) setTimeout(check, 2000);
+			else this.browser_disposition_watchers.delete(callLog);
+		}).catch(() => { this.browser_disposition_watchers.delete(callLog); });
+		setTimeout(check, 500);
+	}
+
 	cancel_call_log(call_log, row) {
 		if (!call_log) return Promise.resolve();
 		const softphone = this.state.softphone;
@@ -4861,6 +4931,7 @@ class VobizAgentConsole {
 			const call = r.message || { name: call_log };
 			if (!this.is_terminal_status(call.status)) {
 				if (isBrowser) {
+					this.watch_browser_call_disposition(call_log);
 					softphone.status = __('Waiting for provider confirmation');
 					this.render_browser_softphone();
 				}
@@ -4888,7 +4959,17 @@ class VobizAgentConsole {
 
 	maybe_prompt_workdesk_disposition(call) {
 		if (!call || !call.name || !this.is_terminal_status(call.status)) return;
-		if (this.should_skip_post_call_disposition(call, this.state.active_workdesk_row || this.state.selected || {})) return;
+		if (call.direction === 'Incoming' && !call.reference_name && !call.incoming_reference_checked) {
+			this.incoming_disposition_pending = this.incoming_disposition_pending || new Set();
+			if (this.incoming_disposition_pending.has(call.name)) return;
+			this.incoming_disposition_pending.add(call.name);
+			Promise.resolve(frappe.call({method: 'vobiz_system_call.api.webrtc.prepare_incoming_disposition', args: {call_log: call.name}}))
+				.then(r => this.maybe_prompt_workdesk_disposition(Object.assign({}, call, r.message || {}, {incoming_reference_checked: true})))
+				.catch(() => this.maybe_prompt_workdesk_disposition(Object.assign({}, call, {incoming_reference_checked: true})))
+				.finally(() => this.incoming_disposition_pending.delete(call.name));
+			return;
+		}
+		if (this.should_skip_post_call_disposition(call, { doctype: call.reference_doctype })) return;
 		if (this.state.ai_disposition_enabled) return;
 		if (this.state.disposition_prompted_call_log === call.name) return;
 		if (this.state.active_disposition_call_log === call.name) return;
@@ -4907,7 +4988,7 @@ class VobizAgentConsole {
 			title: call.reference_title || call.reference_name,
 			phone: call.customer_number_display || ''
 		};
-		if (!row.doctype || !row.name) return;
+		if ((!row.doctype || !row.name) && call.direction !== 'Incoming') return;
 
 		this.state.disposition_prompted_call_log = call.name;
 		setTimeout(() => this.open_post_call_disposition_dialog(call, row, null, {
@@ -4925,6 +5006,12 @@ class VobizAgentConsole {
 			return;
 		}
 		if (this.state.active_disposition_call_log === call.name) return;
+		if (!call.reference_doctype && !call.reference_name && !options.generic_dispositions) {
+			frappe.call('vobiz_click_to_call.api.disposition.get_disposition_options_api').then(r => {
+				this.open_post_call_disposition_dialog(call, row, on_done, Object.assign({}, options, { generic_dispositions: r.message || [] }));
+			}).catch(() => { this.state.disposition_prompted_call_log = null; });
+			return;
+		}
 		if (!options.disposition_context_refreshed && (row.doctype || call.reference_doctype) && (row.name || call.reference_name)) {
 			frappe.call('vobiz_click_to_call.api.console.get_reference_context', {
 				reference_doctype: row.doctype || call.reference_doctype,
@@ -4963,7 +5050,10 @@ class VobizAgentConsole {
 			return;
 		}
 
-		const leadContext = this.state.lead_disposition_context || {};
+		let hasReference = Boolean(call.reference_doctype && call.reference_name);
+		const needsIncomingLead = call.direction === 'Incoming' && !hasReference;
+		let loadingIncomingLead = false;
+		const leadContext = hasReference ? (this.state.lead_disposition_context || {}) : {};
 		const isPatientDisposition = this.is_patient_disposition_reference(call, row);
 		const patientOptions = this.patient_followup_status_options();
 		const shouldRefreshPatientOptions = isPatientDisposition
@@ -4988,19 +5078,23 @@ class VobizAgentConsole {
 			return;
 		}
 		const autoDialDisposition = Boolean(options.auto_dial);
-		const timedDisposition = Boolean(options.auto_dial || options.force_timer);
+		const timedDisposition = hasReference && Boolean(options.auto_dial || options.force_timer);
 		const timeoutStatus = options.timeout_status || 'Agent Not Available';
 		const timeoutSeconds = parseInt(options.timeout_seconds, 10) || 60;
-		const statusOptions = (leadContext.status_options || []).slice();
+		let statusOptions = (leadContext.status_options || []).slice();
 		const patientTimeoutStatus = this.patient_followup_status_options().includes(timeoutStatus) ? timeoutStatus : '';
 		const leadTimeoutStatus = statusOptions.includes(timeoutStatus) ? timeoutStatus : '';
 		const timedAutoSave = timedDisposition && (isPatientDisposition ? Boolean(patientTimeoutStatus) : Boolean(leadTimeoutStatus));
 		const currentStatus = statusOptions.includes(leadContext.status || '') ? leadContext.status : '';
-		const dispositionOptions = this.state.dispositions || [];
+		const dispositionOptions = hasReference && !isPatientDisposition
+			? (leadContext.options || []).map(item => item.name).filter(Boolean)
+			: (options.generic_dispositions || this.state.dispositions || []);
 		const suggested = call.ai_disposition && dispositionOptions.includes(call.ai_disposition) ? call.ai_disposition : '';
 		const notes = [call.ai_summary, call.ai_next_action].filter(Boolean).join('\n\n');
 		let done = false;
 		let autoSubmitting = false;
+		let dispositionOptionsLoading = false;
+		let dispositionOptionsRequest = 0;
 		let countdownSeconds = timeoutSeconds;
 		let countdownTimer = null;
 		const finish = () => {
@@ -5013,7 +5107,11 @@ class VobizAgentConsole {
 			if (on_done) on_done();
 		};
 		const saveDisposition = (values, isAutoSave = false) => {
-			if (done || autoSubmitting) return;
+			if (done || autoSubmitting || loadingIncomingLead || dispositionOptionsLoading) return;
+			if (needsIncomingLead && !hasReference) {
+				frappe.msgprint(__('Select the matching CRM Lead before saving its status and disposition.'));
+				return;
+			}
 			if (isPatientDisposition && !values.sr_followup_status) {
 				frappe.msgprint(__('Select follow-up status.'));
 				return;
@@ -5055,13 +5153,19 @@ class VobizAgentConsole {
 					fieldtype: 'HTML',
 					options: `
 						<div class="vobiz-workdesk-card">
-							<div><strong>${frappe.utils.escape_html(row.title || row.name || call.reference_name || '')}</strong></div>
+							<div><strong>${frappe.utils.escape_html(row.title || row.name || call.reference_name || call.customer_number_display || call.customer_number || __('Customer'))}</strong></div>
 							<div class="text-muted">${frappe.utils.escape_html(call.status || '')}</div>
 							${call.ai_disposition ? `<hr><div><strong>${__('AI Suggestion')}</strong>: ${frappe.utils.escape_html(call.ai_disposition)}${call.ai_confidence ? ` (${frappe.utils.escape_html(String(call.ai_confidence))})` : ''}</div>` : ''}
 							${call.ai_summary ? `<div class="vobiz-related-meta">${frappe.utils.escape_html(call.ai_summary)}</div>` : ''}
 						</div>
 					`
 				},
+				...(needsIncomingLead ? [{
+					fieldname: 'incoming_lead', fieldtype: 'Link', options: 'CRM Lead',
+					label: __('CRM Lead'), reqd: 1,
+					description: __('Select the matching customer to load Status and Lead Disposition.'),
+					onchange: () => loadIncomingLead()
+				}] : []),
 				{
 					fieldname: 'auto_dial_timer',
 					fieldtype: 'HTML',
@@ -5092,14 +5196,15 @@ class VobizAgentConsole {
 					fieldname: 'lead_status',
 					fieldtype: 'Select',
 					label: __('Status'),
+					hidden: !needsIncomingLead && (!hasReference || !statusOptions.length),
 					options: [''].concat(statusOptions).join('\n'),
-					reqd: 1,
+					reqd: needsIncomingLead || Boolean(hasReference && statusOptions.length),
 					default: currentStatus
 				},
 				{
 					fieldname: 'disposition',
 					fieldtype: 'Select',
-					label: __('Lead Disposition'),
+					label: hasReference || needsIncomingLead ? __('Lead Disposition') : __('Call Disposition'),
 					options: [''].concat(dispositionOptions).join('\n'),
 					default: suggested
 				}]),
@@ -5115,6 +5220,42 @@ class VobizAgentConsole {
 					saveDisposition(values);
 			}
 		});
+		const loadIncomingLead = async () => {
+			const name = dialog.get_value('incoming_lead');
+			if (!name || loadingIncomingLead || hasReference) return;
+			loadingIncomingLead = true;
+			dialog.get_primary_btn().prop('disabled', true);
+			try {
+				const prepared = await frappe.call({
+					method: 'vobiz_system_call.api.webrtc.prepare_incoming_disposition',
+					args: {call_log: call.name, reference_name: name}
+				});
+				const linked = prepared.message || {};
+				if (!linked.reference_name) return;
+				// Once linked, keep the form on the server-confirmed customer.
+				dialog.set_df_property('incoming_lead', 'read_only', 1);
+				dialog.set_value('incoming_lead', linked.reference_name);
+				Object.assign(call, linked);
+				Object.assign(row, {doctype: linked.reference_doctype, name: linked.reference_name});
+				const response = await frappe.call({
+					method: 'vobiz_click_to_call.api.disposition.get_lead_disposition_context_api',
+					args: {reference_doctype: row.doctype, reference_name: row.name}
+				});
+				const context = response.message || {};
+				statusOptions = (context.status_options || []).slice();
+				dialog.set_df_property('lead_status', 'options', [''].concat(statusOptions).join('\n'));
+				dialog.set_value('lead_status', statusOptions.includes(context.status) ? context.status : '');
+				dialog.set_df_property('disposition', 'options', [''].concat((context.options || []).map(item => item.name).filter(Boolean)).join('\n'));
+				dialog.set_value('disposition', '');
+				hasReference = true;
+			} catch (error) {
+				// Frappe displays validation errors; keep Notes and permit a retry.
+				dialog.set_df_property('incoming_lead', 'read_only', 0);
+			} finally {
+				loadingIncomingLead = false;
+				dialog.get_primary_btn().prop('disabled', false);
+			}
+		};
 		dialog.$wrapper.on('hidden.bs.modal', finish);
 		dialog.show();
 		dialog.get_close_btn().hide();
@@ -5127,7 +5268,8 @@ class VobizAgentConsole {
 					if (timedAutoSave) {
 						saveDisposition({
 							lead_status: isPatientDisposition ? '' : leadTimeoutStatus,
-							disposition: isPatientDisposition ? '' : dialog.get_value('disposition'),
+							// The timeout status differs from the selected status; do not reuse its disposition.
+							disposition: '',
 							sr_followup_status: isPatientDisposition ? patientTimeoutStatus : '',
 							notes: dialog.get_value('notes')
 						}, true);
@@ -5137,28 +5279,42 @@ class VobizAgentConsole {
 				}
 			}, 1000);
 		}
-		if (!isPatientDisposition && statusOptions.length) {
-			dialog.fields_dict.lead_status.$input.on('change', () => {
+		if (!isPatientDisposition && (needsIncomingLead || statusOptions.length)) {
+			dialog.fields_dict.lead_status.$input.on('change', async () => {
 				const leadStatus = dialog.get_value('lead_status');
-				frappe.call({
-					method: 'vobiz_click_to_call.api.disposition.get_lead_disposition_context_api',
-					args: {
-						reference_doctype: row.doctype || call.reference_doctype,
-						reference_name: row.name || call.reference_name,
-						lead_status: leadStatus
-					}
-				}).then((r) => {
+				if (!hasReference || loadingIncomingLead) return;
+				const request = ++dispositionOptionsRequest;
+				dispositionOptionsLoading = true;
+				dialog.set_value('disposition', '');
+				dialog.set_df_property('disposition', 'options', '');
+				dialog.get_primary_btn().prop('disabled', true);
+				if (!leadStatus) {
+					dispositionOptionsLoading = false;
+					dialog.get_primary_btn().prop('disabled', false);
+					return;
+				}
+				try {
+					const r = await frappe.call({
+						method: 'vobiz_click_to_call.api.disposition.get_lead_disposition_context_api',
+						args: {reference_doctype: row.doctype || call.reference_doctype,
+							reference_name: row.name || call.reference_name, lead_status: leadStatus}
+					});
+					if (request !== dispositionOptionsRequest || done) return;
 					const context = r.message || {};
 					const refreshedOptions = (context.options || []).map(item => item.name).filter(Boolean);
-					const refreshedSuggestion = call.ai_disposition && refreshedOptions.includes(call.ai_disposition) ? call.ai_disposition : '';
-					this.state.lead_disposition_context = context;
-					this.state.dispositions = refreshedOptions;
 					dialog.set_df_property('disposition', 'options', [''].concat(refreshedOptions).join('\n'));
-					dialog.set_value('disposition', refreshedSuggestion);
-					this.render_dispositions();
-				});
+					dialog.set_value('disposition', call.ai_disposition && refreshedOptions.includes(call.ai_disposition) ? call.ai_disposition : '');
+				} catch (error) {
+					// Keep the old status's choices cleared when the request fails.
+				} finally {
+					if (request === dispositionOptionsRequest) {
+						dispositionOptionsLoading = false;
+						dialog.get_primary_btn().prop('disabled', false);
+					}
+				}
 			});
 		}
+
 	}
 
 	should_skip_post_call_disposition(call, row = {}) {
