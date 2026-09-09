@@ -302,6 +302,8 @@ def _select_inbound_agent(primary_user, patient=None, candidate_users=None, list
     from vobiz_click_to_call.services.safety import get_working_hours_block_reason
     from vobiz_click_to_call.services.patient_routing import patient_matches_mapping
     queue, seen = list(candidate_users) if candidate_users is not None else [primary_user], set(excluded_users or [])
+    # The super administrator is never an incoming-call agent, including fallbacks.
+    seen.add("Administrator")
     while queue and len(seen) < 16:
         user = queue.pop(0)
         if user in seen:

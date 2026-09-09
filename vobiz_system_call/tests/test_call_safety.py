@@ -61,6 +61,15 @@ class BrowserSafetyTests(unittest.TestCase):
         settings.agent_call_device = "System Dialer"
         self.assertEqual(devices.get_call_device(settings, {}), "System Dialer")
 
+    def test_administrator_is_skipped_before_agent_lookup_or_lock(self):
+        lock = self.replace(lifecycle, "lock_mapping", MagicMock())
+        profile = self.replace(webrtc, "get_system_call_profile", MagicMock(return_value=None))
+        self.assertIsNone(webrtc._select_inbound_agent("Administrator"))
+        self.assertIsNone(webrtc._select_inbound_agent(
+            "", candidate_users=["Administrator", "agent@example.test"], listed_only=True))
+        profile.assert_called_once_with("agent@example.test")
+        lock.assert_not_called()
+
     def test_mobile_incoming_routes_without_browser_presence_and_records_device(self):
         import json
         caller, did, mobile = "+919876545966", "+911234565565", "+911234567890"
