@@ -34,6 +34,12 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(lifecycle, "_", lambda value: value)
         self.replace(call, "_", lambda value: value)
         self.replace(frappe, "enqueue", MagicMock())
+        self.patient_lookup = webrtc._incoming_patient
+        self.replace(webrtc, "_incoming_patient", lambda number: (None, False))
+        from vobiz_click_to_call.api import inbound
+        self.replace(inbound, "find_incoming_mapping", lambda did: None)
+        self.replace(webrtc, "_incoming_lead", lambda number: row(name="LEAD", lead_owner=frappe.session.user))
+        self.replace(webrtc, "get_system_call_profile", lambda *args: {"name": "MAP"})
         self.replace(webrtc, "get_settings", lambda: frappe._dict(enabled=1, store_raw_payloads=0, agent_call_device="Browser Softphone"))
 
     def replace(self, obj, name, value):
@@ -97,6 +103,175 @@ class BrowserSafetyTests(unittest.TestCase):
         self.db.sql.return_value = [("ACTIVE",)]
         with self.assertRaisesRegex(ValueError, "End the active call"):
             device.validate_mapping(mapping)
+
+    def test_offline_primary_routes_to_fallback_and_cycles_terminate(self):
+        from vobiz_click_to_call.services import safety
+        self.replace(safety, "get_working_hours_block_reason", lambda _: "")
+        primary = row(user="primary", enabled=1, availability_status="Offline", fallback_user="backup", current_call_log="")
+        backup = row(user="backup", enabled=1, availability_status="Available", accept_calls=1,
+                     current_call_log="", browser_softphone_enabled=1, fallback_user="primary")
+        for mapping in (primary, backup):
+            mapping.as_dict = lambda m=mapping: dict(m)
+        mappings = {"primary": primary, "backup": backup}
+        locked = self.replace(lifecycle, "lock_mapping", MagicMock(side_effect=lambda user: mappings[user]))
+        self.replace(webrtc, "get_system_call_profile", lambda user: mappings.get(user))
+        self.replace(lifecycle, "presence", lambda user: "tab" if user == "backup" else None)
+        self.replace(lifecycle, "assert_available", lambda _: None)
+        self.replace(webrtc, "get_profile_endpoint_uri", lambda _: "sip:backup@registrar")
+        selected = webrtc._select_inbound_agent("primary")
+        self.assertEqual(selected[0].user, "backup")
+        self.assertEqual(selected[2], "sip:backup@registrar")
+        self.assertEqual(locked.call_count, 2)
+        locked.reset_mock()
+        backup.availability_status = "Offline"
+        self.assertIsNone(webrtc._select_inbound_agent("primary"))
+        self.assertEqual(locked.call_count, 2)
+
+    def test_fallback_browser_accepts_routed_did_not_its_own_caller_id(self):
+        self.replace(lifecycle, "presence", lambda _: "tab")
+        self.replace(webrtc, "get_system_call_profile", lambda: {"current_call_log": "IN"})
+        self.replace(webrtc, "_number", lambda value: value)
+        incoming = row(name="IN", direction="Incoming", status="Ringing", did_number="primary-did",
+                       customer_number="customer", request_json='{"source":"vobiz_system_call","call_device":"Browser Softphone","fallback_origin_user":"primary"}')
+        mapping = row(current_call_log="IN", caller_id="backup-did")
+        self.replace(lifecycle, "lock_call", lambda _: (mapping, incoming))
+        self.assertEqual(webrtc.get_incoming_call("primary-did", "tab")["call_log"], "IN")
+        with self.assertRaises(ValueError):
+            webrtc.get_incoming_call("unrelated-did", "tab")
+
+    def test_patient_route_requires_queue_department_and_followup(self):
+        from vobiz_click_to_call.services import safety
+        self.replace(safety, "get_working_hours_block_reason", lambda _: "")
+        patient = row(sr_medical_department="Kidney", sr_followup_id="7")
+        mapping = row(user="mis", enabled=1, availability_status="Available", accept_calls=1,
+                      current_call_log="", browser_softphone_enabled=1, queue_source="Patient",
+                      sr_medical_departments="Kidney", sr_followup_ids="7")
+        mapping.as_dict = lambda: dict(mapping)
+        self.replace(lifecycle, "lock_mapping", lambda _: mapping)
+        self.replace(webrtc, "get_system_call_profile", lambda _: mapping)
+        self.replace(lifecycle, "presence", lambda _: "tab")
+        self.replace(lifecycle, "assert_available", lambda _: None)
+        self.replace(webrtc, "get_profile_endpoint_uri", lambda _: "sip:mis@registrar")
+        self.assertEqual(webrtc._select_inbound_agent("primary", patient, ["mis"])[0].user, "mis")
+        for field, value in [("sr_followup_ids", "8"), ("sr_medical_departments", "Liver"), ("queue_source", "CRM Lead")]:
+            original = mapping[field]
+            mapping[field] = value
+            self.assertIsNone(webrtc._select_inbound_agent("primary", patient, ["mis"]))
+            mapping[field] = original
+        self.assertIsNone(webrtc._select_inbound_agent("mis"))
+
+    def test_patient_lookup_rejects_ambiguous_phone(self):
+        self.db.exists.return_value = True
+        self.db.sql.return_value = ["vobiz_mobile_last10", "vobiz_phone_last10"]
+        self.replace(frappe, "get_all", lambda *args, **kwargs: ["PAT-1", "PAT-2"])
+        self.assertEqual(self.patient_lookup("+919876543210"), (None, True))
+
+    def test_patient_lookup_returns_unique_match_from_indexes(self):
+        self.db.exists.return_value = True
+        self.db.sql.return_value = ["vobiz_mobile_last10", "vobiz_phone_last10"]
+        self.replace(frappe, "get_all", lambda *args, **kwargs: ["PAT-1"])
+        patient = row(name="PAT-1")
+        self.replace(frappe, "get_doc", lambda *args: patient)
+        self.assertEqual(self.patient_lookup("+919876543210"), (patient, False))
+
+    def test_unknown_mapping_rotates_enabled_agents(self):
+        incoming = frappe._dict(routing_strategy="Round Robin", last_assigned_agent="a", agents=[
+            frappe._dict(agent_user="a", enabled=1, priority=1, idx=1),
+            frappe._dict(agent_user="disabled", enabled=0, priority=1, idx=2),
+            frappe._dict(agent_user="b", enabled=1, priority=1, idx=3),
+        ])
+        self.assertEqual([r.agent_user for r in webrtc._unknown_incoming_candidates(incoming)], ["b", "a"])
+
+    def test_unknown_caller_uses_mapping_without_unique_did_user(self):
+        import json
+        from vobiz_click_to_call.api import inbound, call as core_call
+        self.replace(webrtc, "_number", lambda value: value)
+        self.replace(webrtc, "_incoming_lead", lambda _: None)
+        incoming = frappe._dict(name="DID", routing_strategy="Round Robin", agents=[
+            frappe._dict(name="ROW", agent_user="listed", enabled=1, priority=1, idx=1)])
+        self.replace(inbound, "find_incoming_mapping", lambda _: incoming)
+        self.replace(frappe, "get_all", lambda *args, **kwargs: [])
+        mapping = row(user="listed", agent_mobile="mobile")
+        selector = self.replace(webrtc, "_select_inbound_agent", MagicMock(return_value=(mapping,"Mobile Bridge","mobile")))
+        documents=[]
+        def make_doc(data):
+            doc=frappe._dict(data,name="IN")
+            doc.insert=lambda **kwargs: doc
+            documents.append(doc)
+            return doc
+        self.replace(frappe, "get_doc", make_doc)
+        self.replace(core_call, "mark_mapping_busy", MagicMock())
+        assignment=self.replace(inbound, "update_incoming_assignment", MagicMock())
+        creator=self.replace(inbound, "create_unknown_inbound_lead", MagicMock(return_value=row(name="NEW-LEAD")))
+        self.replace(webrtc, "_dial_agent_xml", lambda *args: "<Response/>")
+        self.db.exists.return_value=False
+        webrtc._answer_pstn_inbound("customer","did",{"CallUUID":"provider-uuid"})
+        selector.assert_called_once_with("",candidate_users=["listed"],listed_only=True)
+        self.assertEqual(json.loads(documents[0].request_json)["incoming_mapping"],"DID")
+        assignment.assert_called_once_with(incoming,{"user":"listed","agent_row":"ROW"})
+        creator.assert_called_once_with("customer", "did", incoming, {"user": "listed"})
+        self.assertEqual(documents[0].reference_doctype, "CRM Lead")
+        self.assertEqual(documents[0].reference_name, "NEW-LEAD")
+        self.assertEqual(documents[0].crm_lead, "NEW-LEAD")
+        self.db.exists.return_value=True
+        mapping.current_call_log="IN"
+        self.replace(lifecycle,"lock_call",lambda _: (mapping,documents[0]))
+        webrtc._answer_pstn_inbound("customer","did",{"CallUUID":"provider-uuid"})
+        self.assertEqual(creator.call_count,1)
+        self.assertEqual(assignment.call_count,1)
+
+    def test_listed_agents_do_not_escape_to_unlisted_fallback(self):
+        from vobiz_click_to_call.api import console
+        mapping=row(user="listed",enabled=1,availability_status="Offline",accept_calls=0,
+                    current_call_log="",fallback_user="unlisted")
+        mapping.as_dict=lambda: dict(mapping)
+        self.replace(lifecycle,"lock_mapping",MagicMock(return_value=mapping))
+        self.replace(console,"is_agent_console_online",lambda _:False)
+        self.assertIsNone(webrtc._select_inbound_agent("",candidate_users=["listed"],listed_only=True))
+        lifecycle.lock_mapping.assert_called_once_with("listed")
+
+    def test_incoming_action_does_not_retry_cancelled_or_answered_calls(self):
+        from contextlib import nullcontext
+        self.replace(frappe,"cache",lambda: SimpleNamespace(lock=lambda *args,**kwargs:nullcontext()))
+        self.replace(webrtc,"_provider_call_token",lambda _:"secret")
+        retry=self.replace(webrtc,"_retry_incoming_agent",MagicMock())
+        event=self.replace(webrtc,"provider_event",MagicMock())
+        self.db.get_value.side_effect=[row(),'{"agent_cancelled":true}']
+        inspect.unwrap(webrtc.incoming_action)("CALL-1","secret")
+        retry.assert_not_called()
+        event.assert_not_called()
+        self.db.get_value.side_effect=[row(),'{}']
+        self.replace(frappe,"get_doc",lambda *args:row(direction="Incoming",status="Completed"))
+        self.replace(webrtc,"_request_params",lambda:{"DialStatus":"no-answer"})
+        inspect.unwrap(webrtc.incoming_action)("CALL-1","secret")
+        retry.assert_not_called()
+
+    def test_unanswered_fallback_creates_separate_attempt(self):
+        import json
+        from vobiz_click_to_call.api import call as core_call
+        original=row(direction="Incoming",status="No Answer",answer_time=None,customer_number="caller",did_number="did",
+                     request_json='{"source":"vobiz_system_call","call_device":"Browser Softphone"}')
+        mapping=row(user="backup",agent_mobile="mobile")
+        self.replace(webrtc,"get_system_call_profile",lambda _: {"fallback_user":"backup"})
+        selector=self.replace(webrtc,"_select_inbound_agent",MagicMock(return_value=(mapping,"Mobile Bridge","mobile")))
+        created=[]
+        def make_doc(data):
+            child=frappe._dict(data,name="CHILD")
+            child.insert=lambda **kwargs:child
+            created.append(child)
+            return child
+        self.replace(frappe,"get_doc",make_doc)
+        self.replace(core_call,"mark_mapping_busy",MagicMock())
+        self.replace(webrtc,"_dial_agent_xml",lambda *args:"<Response/>")
+        webrtc._retry_incoming_agent(original)
+        self.assertEqual(created[0].user,"backup")
+        self.assertEqual(created[0].call_uuid,original.call_uuid)
+        child_context=json.loads(created[0].request_json)
+        self.assertEqual(child_context["previous_call_log"],original.name)
+        self.assertEqual(child_context["attempted_users"],[original.user,"backup"])
+        self.assertTrue(child_context["incoming_mobile_bridge"])
+        self.assertEqual(selector.call_args.kwargs["excluded_users"],[original.user])
+        core_call.mark_mapping_busy.assert_called_once_with(mapping.name,"CHILD")
 
     def test_inbound_sip_leg_presents_business_did_on_first_route_and_retry(self):
         caller, did = "+919876545966", "+911234565565"
@@ -214,6 +389,7 @@ class BrowserSafetyTests(unittest.TestCase):
         self.db.set_value.assert_not_called()
 
     def test_missing_or_ambiguous_inbound_did_does_not_route(self):
+        self.db.exists.return_value = False
         self.replace(webrtc, "_number", lambda value: value)
         self.replace(frappe, "get_all", lambda *a, **kw: [row(), row(name="OTHER")])
         result = webrtc._answer_pstn_inbound("+911234567890", "+919999999999", {"CallUUID": "uuid-12345678"})
@@ -275,8 +451,8 @@ class BrowserSafetyTests(unittest.TestCase):
         args = frappe.enqueue.call_args.kwargs
         self.assertNotIn("kwargs", args)
         self.assertNotIn("token", args["payload"])
-        from vobiz_ai.api.call_log import append_callback
-        inspect.signature(append_callback).bind(**{k: args[k] for k in ("call_log", "event", "payload")})
+        from vobiz_click_to_call.services.callback_logging import append_callback_job as append_callback
+        inspect.signature(append_callback).bind(**{k: args[k] for k in ("call_log", "event_type", "payload")})
         self.assertTrue(args["enqueue_after_commit"])
 
     def test_per_call_token_is_bound_to_id_and_not_stored_callback_token(self):

@@ -116,6 +116,7 @@ class VobizAgentConsole {
 		this.render();
 		this.bind();
 		this.bind_realtime();
+		$(document).trigger('vobiz_refresh_availability');
 		this.start_console_heartbeat();
 		this.load_browser_softphone_config();
 		this.load();
@@ -1615,6 +1616,7 @@ class VobizAgentConsole {
 	}
 
 	on_page_show() {
+		$(document).trigger('vobiz_refresh_availability');
 		this.state.restore_checked = false;
 		this.note_agent_activity();
 		this.start_console_heartbeat();
@@ -1737,11 +1739,21 @@ class VobizAgentConsole {
 	reset_idle_timer() {
 		clearTimeout(this.idle_timer);
 		if (!this.is_console_visible()) return;
-		this.idle_timer = setTimeout(() => this.mark_idle_offline(), VOBIZ_AGENT_IDLE_MS);
+		const availability = window.vobiz_click_to_call && window.vobiz_click_to_call.get_availability
+			? window.vobiz_click_to_call.get_availability() : null;
+		if (!availability || !availability.idle_auto_offline_enabled) return;
+		if (['Busy', 'Away'].includes(availability.availability_status)) return;
+		const seconds = Number(availability.idle_auto_offline_seconds) || 300;
+		this.idle_timer = setTimeout(() => this.mark_idle_offline(), Math.max(60, seconds) * 1000);
 	}
 
 	mark_idle_offline() {
 		if (!this.is_console_visible()) return;
+		const availability = window.vobiz_click_to_call && window.vobiz_click_to_call.get_availability
+			? window.vobiz_click_to_call.get_availability() : null;
+		if (!availability || !availability.idle_auto_offline_enabled
+			|| ['Busy', 'Away'].includes(availability.availability_status)
+			|| (this.state.softphone || {}).in_call) return;
 		this.is_idle_offline = true;
 		this.stop_console_heartbeat();
 		this.mark_console_offline();

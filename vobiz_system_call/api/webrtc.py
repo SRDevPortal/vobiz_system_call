@@ -118,7 +118,8 @@ def get_incoming_call(caller: str, tab_id: str):
             or row.status in lifecycle.TERMINAL
             or mapping.current_call_log != row.name
             or not row.did_number or _number(caller) != _number(row.did_number)
-            or _number(mapping.caller_id) != _number(row.did_number)):
+            or (not any(lifecycle.context(row).get(k) for k in ("fallback_origin_user", "incoming_mapping", "reference_route"))
+                and _number(mapping.caller_id) != _number(row.did_number))):
         frappe.throw(_("Incoming call does not match the routed call."))
     frappe.db.commit()
     return {"call_log": row.name, "call_uuid": row.call_uuid, "customer_number": row.customer_number}
@@ -174,6 +175,9 @@ def cancel_browser_call(call_log: str):
         frappe.db.commit()
         return {"status": result}
     uuid = row.call_uuid
+    context = lifecycle.context(row)
+    context["agent_cancelled"] = True
+    frappe.db.set_value("Vobiz Call Log", call_log, "request_json", json.dumps(context))
     frappe.db.set_value("Vobiz Call Log", call_log, "call_status", "cancellation-requested")
     frappe.db.commit()
     from vobiz_click_to_call.services.client import VobizClient
@@ -198,7 +202,12 @@ def answer(token=None):
     raw_to = str(payload.get("To") or payload.get("to") or "")
     if raw_from.startswith("sip:"):
         return _answer_sdk_outbound(raw_from, raw_to, payload)
-    return _answer_pstn_inbound(raw_from, raw_to, payload)
+    # Serialize DID assignment across provider retries and round-robin updates.
+    route_key = hashlib.sha256(str(_number(raw_to) or raw_to).encode()).hexdigest()
+    caller_key = hashlib.sha256(str(_number(raw_from) or raw_from).encode()).hexdigest()
+    with frappe.cache().lock("vsc:incoming-caller:" + caller_key, timeout=120, blocking_timeout=5):
+        with frappe.cache().lock("vsc:incoming-route:" + route_key, timeout=120, blocking_timeout=5):
+            return _answer_pstn_inbound(raw_from, raw_to, payload)
 
 
 def browser_softphone_answer_url(settings=None):
@@ -244,44 +253,164 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
     return _xml_response(xml)
 
 
+def _repeat_inbound(key, caller, did, depth=0):
+    if depth >= 8:
+        return _xml_response(_hangup_xml())
+    mapping, row = lifecycle.lock_call(key)
+    next_call = lifecycle.context(row).get("next_call_log")
+    if next_call:
+        frappe.db.commit()
+        return _repeat_inbound(next_call, caller, did, depth + 1)
+    valid = (row.status not in lifecycle.TERMINAL and mapping.current_call_log == key
+             and row.user == mapping.user and row.direction == "Incoming"
+             and row.customer_number == caller and row.did_number == did
+             and row.call_status not in ("cancellation-requested", "browser-ended-pending-provider"))
+    xml = _dial_agent_xml(row.agent_number, did, row) if valid else _hangup_xml()
+    frappe.db.commit()
+    return _xml_response(xml)
+
+
+def _incoming_patient(number):
+    """Return a unique Patient and ambiguity flag using existing phone indexes."""
+    if not frappe.db.exists("DocType", "Patient"):
+        return None, False
+    fields = frappe.db.sql(
+        "SELECT DISTINCT COLUMN_NAME FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tabPatient' AND SEQ_IN_INDEX=1 "
+        "AND COLUMN_NAME IN ('vobiz_mobile_last10','vobiz_phone_last10','vobiz_whatsapp_last10','vobiz_normalized_phone','mobile','phone')",
+        pluck=True,
+    )
+    matches = set()
+    for field in fields:
+        # Last-ten indexes are only unambiguous for the site's Indian numbering plan.
+        if field.endswith('_last10'):
+            if not number.startswith('+91') or len(number) != 13:
+                continue
+            values = [number[-10:]]
+        else:
+            values = [number, number.lstrip('+')]
+            if number.startswith('+91') and len(number) == 13:
+                values.append(number[-10:])
+        matches.update(frappe.get_all('Patient', filters={field: ['in', values]}, pluck='name', limit_page_length=2))
+        if len(matches) > 1:
+            return None, True
+    return (frappe.get_doc('Patient', next(iter(matches))) if matches else None), False
+
+
+def _select_inbound_agent(primary_user, patient=None, candidate_users=None, listed_only=False, excluded_users=None):
+    from vobiz_click_to_call.api.inbound import _fallback_users
+    from vobiz_click_to_call.services.safety import get_working_hours_block_reason
+    from vobiz_click_to_call.services.patient_routing import patient_matches_mapping
+    queue, seen = list(candidate_users) if candidate_users is not None else [primary_user], set(excluded_users or [])
+    while queue and len(seen) < 16:
+        user = queue.pop(0)
+        if user in seen:
+            continue
+        seen.add(user)
+        if user != primary_user and not get_system_call_profile(user):
+            continue
+        mapping = lifecycle.lock_mapping(user)
+        if not listed_only:
+            queue.extend(u for u in _fallback_users(mapping) if u not in seen)
+        settings = get_settings()
+        device = get_call_device(settings, mapping)
+        browser = device == CALL_DEVICE_BROWSER_SOFTPHONE
+        route_matches = (mapping.get("queue_source") in ("Patient", "CRM Lead and Patient")
+                         and patient_matches_mapping(patient, mapping)) if patient is not None else mapping.get("queue_source") != "Patient"
+        eligible = ((route_matches or listed_only) and device in (CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_MOBILE_BRIDGE)
+                    and device_enabled(device, settings) and mapping.get("enabled") != 0
+                    and not mapping.current_call_log and mapping.availability_status == "Available"
+                    and mapping.accept_calls
+                    and (not browser or (mapping.browser_softphone_enabled and lifecycle.presence(user))))
+        if eligible and listed_only:
+            from vobiz_click_to_call.api.console import is_agent_console_online
+            eligible = is_agent_console_online(user)
+        if eligible and not get_working_hours_block_reason(mapping.as_dict()):
+            endpoint = get_profile_endpoint_uri(mapping.as_dict()) if browser else _number(mapping.agent_mobile)
+            if endpoint:
+                lifecycle.assert_available(mapping)
+                return mapping, device, endpoint
+        # Do not hold multiple agent locks while following reciprocal fallback chains.
+        frappe.db.rollback()
+    return None
+
+
+def _incoming_lead(caller):
+    from vobiz_click_to_call.api.inbound import find_latest_crm_lead_by_phone
+    if not frappe.db.exists("DocType", "CRM Lead"):
+        return None
+    found = find_latest_crm_lead_by_phone(caller)
+    return frappe.get_doc("CRM Lead", found.name) if found else None
+
+
+def _unknown_incoming_candidates(incoming):
+    from vobiz_click_to_call.api.inbound import _round_robin_order
+    rows = [r for r in incoming.get("agents") or [] if frappe.utils.cint(r.get("enabled")) and r.get("agent_user")]
+    rows.sort(key=lambda r: (frappe.utils.cint(r.get("priority")), frappe.utils.cint(r.get("idx"))))
+    if incoming.get("routing_strategy") == "Load Balancing":
+        rows.sort(key=lambda r: (bool(r.get("last_assigned_at")), str(r.get("last_assigned_at") or ""),
+                                frappe.utils.cint(r.get("priority")), frappe.utils.cint(r.get("idx"))))
+    else:
+        rows = _round_robin_order(rows, incoming.get("last_assigned_agent"))
+    return rows
+
+
+def _reject_incoming(reason, uuid="", details=None):
+    from vobiz_click_to_call.services.debug_log import log_vobiz_event
+    log_vobiz_event("Incoming routing rejected: " + reason, severity="Warning",
+                   payload={"provider_uuid": uuid, "reason": reason, "details": details or []})
+    frappe.db.commit()
+    return _xml_response(_hangup_xml())
+
+
 def _answer_pstn_inbound(raw_from, raw_to, payload):
     caller, did, uuid = _number(raw_from), _number(raw_to), _provider_uuid(payload)
     if not caller or not did or not uuid:
-        return _xml_response(_hangup_xml())
+        return _reject_incoming("Invalid caller, DID or provider UUID", uuid)
+    key = "VSC-IN-" + hashlib.sha256(uuid.encode()).hexdigest()[:40]
+    if frappe.db.exists("Vobiz Call Log", key):
+        return _repeat_inbound(key, caller, did)
+    from vobiz_click_to_call.api.inbound import find_incoming_mapping
+    incoming = find_incoming_mapping(did)
     profiles = frappe.get_all(
         "Vobiz User Mapping", filters={"caller_id": did, "enabled": 1},
         fields=["name", "user"], limit_start=0, limit_page_length=2,
     )
-    # A shared DID needs an explicit routing policy; never pick the most recently edited agent.
-    if len(profiles) != 1:
-        return _xml_response(_hangup_xml())
-    mapping = lifecycle.lock_mapping(profiles[0].user)
-    key = "VSC-IN-" + hashlib.sha256(uuid.encode()).hexdigest()[:40]
+    if not incoming and len(profiles) != 1:
+        return _reject_incoming("No unambiguous enabled DID mapping", uuid)
+    origin = profiles[0].user if len(profiles) == 1 else ""
+    patient, ambiguous = _incoming_patient(caller)
+    lead, agent_rows, route = None, [], "patient"
+    if ambiguous:
+        return _reject_incoming("Ambiguous Patient phone match", uuid)
+    if patient:
+        from vobiz_click_to_call.api.inbound import patient_route_mappings
+        candidates = [m["user"] for m in patient_route_mappings(patient) if m.get("user")]
+        selected = _select_inbound_agent(origin, patient=patient, candidate_users=candidates)
+    else:
+        lead = _incoming_lead(caller)
+        if lead:
+            origin = str(lead.get("lead_owner") or "").strip()
+            route = "crm_lead"
+            selected = _select_inbound_agent(origin) if origin and get_system_call_profile(origin) else None
+        elif incoming:
+            route = "unknown"
+            agent_rows = _unknown_incoming_candidates(incoming)
+            selected = _select_inbound_agent("", candidate_users=[r.agent_user for r in agent_rows], listed_only=True)
+        else:
+            return _reject_incoming("Unknown caller has no Incoming Mapping", uuid)
+    if not selected:
+        return _reject_incoming("No eligible agent for " + route, uuid)
+    mapping, device, endpoint = selected
+    # Another request may have prepared this UUID while we waited for the agent.
     if frappe.db.exists("Vobiz Call Log", key):
-        if frappe.db.get_value("Vobiz Call Log", key, "user") != mapping.user:
-            frappe.db.rollback()
-            return _xml_response(_hangup_xml())
-        mapping, row = lifecycle.lock_call(key)
-        valid = (row.status not in lifecycle.TERMINAL and mapping.current_call_log == key
-                 and row.user == mapping.user and row.customer_number == caller and row.did_number == did
-                 and row.call_status not in ("cancellation-requested", "browser-ended-pending-provider"))
-        xml = _dial_agent_xml(row.agent_number, did, row) if valid else _hangup_xml()
-        frappe.db.commit()
-        return _xml_response(xml)
-    device = get_call_device(get_settings(), mapping)
-    if not device_enabled(device, get_settings()) or device not in (CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_MOBILE_BRIDGE):
         frappe.db.rollback()
-        return _xml_response(_hangup_xml())
+        return _repeat_inbound(key, caller, did)
+    if route == "unknown":
+        from vobiz_click_to_call.api.inbound import create_unknown_inbound_lead
+        # The caller lock covers lookup, creation and commit across all DIDs.
+        lead = create_unknown_inbound_lead(caller, did, incoming, {"user": mapping.user})
     browser = device == CALL_DEVICE_BROWSER_SOFTPHONE
-    if ((browser and (not mapping.browser_softphone_enabled or not lifecycle.presence(mapping.user))) or mapping.current_call_log
-            or mapping.availability_status != "Available" or not mapping.accept_calls):
-        frappe.db.rollback()
-        return _xml_response(_hangup_xml())
-    lifecycle.assert_available(mapping)
-    endpoint = get_profile_endpoint_uri(mapping.as_dict()) if browser else _number(mapping.agent_mobile)
-    if not endpoint:
-        frappe.db.rollback()
-        return _xml_response(_hangup_xml())
     data = {
         "doctype": "Vobiz Call Log", "call_key": key, "source_app": "vobiz_click_to_call",
         "user": mapping.user, "direction": "Incoming", "status": "Ringing",
@@ -290,13 +419,24 @@ def _answer_pstn_inbound(raw_from, raw_to, payload):
         "caller_id": did, "did_number": did, "normalized_did": did,
         "agent_number": endpoint, "user_mobile": mapping.agent_mobile,
         "from_number": caller, "to_number": did, "start_time": frappe.utils.now(),
-        "request_json": json.dumps({"source": "vobiz_system_call", "call_device": device, "incoming_mobile_bridge": not browser}),
+        "request_json": json.dumps({"source": "vobiz_system_call", "call_device": device, "incoming_mobile_bridge": not browser,
+                                    "fallback_origin_user": origin if mapping.user != origin else "",
+                                    "incoming_mapping": incoming.name if route == "unknown" else "",
+                                    "reference_route": route if route != "unknown" else ""}),
         "recording_status": "Not Started", "cdr_sync_status": "Not Synced",
     }
-    # Deliberately do not scan CRM/Patient phone fields to guess ownership.
+    if patient:
+        data.update(reference_doctype="Patient", reference_name=patient.name, patient=patient.name)
+    elif lead:
+        data.update(reference_doctype="CRM Lead", reference_name=lead.name, crm_lead=lead.name)
+    # The Patient identity is established from indexed phone matching before routing.
     row = frappe.get_doc(data).insert(ignore_permissions=True)
     from vobiz_click_to_call.api.call import mark_mapping_busy
     mark_mapping_busy(mapping.name, row.name)
+    if route == "unknown":
+        from vobiz_click_to_call.api.inbound import update_incoming_assignment
+        agent_row = next(r for r in agent_rows if r.agent_user == mapping.user)
+        update_incoming_assignment(incoming, {"user": mapping.user, "agent_row": agent_row.name})
     xml = _dial_agent_xml(endpoint, did, row)
     frappe.db.commit()
     return _xml_response(xml)
@@ -342,6 +482,85 @@ def provider_event(call_log: str, token: str, final: str = "0"):
     return _xml_response(_empty_xml())
 
 
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=600, seconds=60)
+def incoming_action(call_log: str, token: str):
+    auth = frappe.db.get_value("Vobiz Call Log", call_log, ["name", "call_uuid"], as_dict=True)
+    if not auth or not hmac.compare_digest(_provider_call_token(auth), str(token or "")) or not token:
+        return _plain_response("Not permitted.", 403)
+    with frappe.cache().lock("vsc:dial-action:" + call_log, timeout=120, blocking_timeout=5):
+        existing = frappe.db.get_value("Vobiz Call Log", call_log, "request_json")
+        context = lifecycle.context({"request_json": existing})
+        if context.get("next_call_log"):
+            child = frappe.get_doc("Vobiz Call Log", context["next_call_log"])
+            return _repeat_inbound(child.name, child.customer_number, child.did_number)
+        if context.get("fallback_processed") or context.get("agent_cancelled"):
+            return _xml_response(_empty_xml())
+        provider_event(call_log, token, final="1")
+        row = frappe.get_doc("Vobiz Call Log", call_log)
+        payload = _request_params()
+        state = str(payload.get("DialStatus") or payload.get("DialCallStatus") or "").lower()
+        if (lifecycle.context(row).get("agent_cancelled")
+                or row.direction != "Incoming" or row.answer_time or row.status == "Completed"
+                or state not in ("no-answer", "timeout", "busy")
+                or row.call_status == "cancellation-requested"):
+            return _xml_response(_empty_xml())
+        return _retry_incoming_agent(row)
+
+
+def _retry_incoming_agent(row):
+    from vobiz_click_to_call.api.inbound import _fallback_users, patient_route_mappings
+    context = lifecycle.context(row)
+    attempted = list(dict.fromkeys(context.get("attempted_users", []) + [row.user]))
+    if len(attempted) >= 8:
+        context["fallback_processed"] = True
+        frappe.db.set_value("Vobiz Call Log", row.name, "request_json", json.dumps(context))
+        return _reject_incoming("Unanswered fallback limit reached", row.call_uuid)
+    incoming = None
+    if context.get("incoming_mapping"):
+        incoming = frappe.get_doc("Vobiz Incoming Mapping", context["incoming_mapping"])
+        users = [r.agent_user for r in _unknown_incoming_candidates(incoming)] if incoming.enabled else []
+        selected = _select_inbound_agent("", candidate_users=users, listed_only=True, excluded_users=attempted)
+    elif row.reference_doctype == "Patient":
+        patient = frappe.get_doc("Patient", row.reference_name)
+        users = [m["user"] for m in patient_route_mappings(patient) if m.get("user")]
+        selected = _select_inbound_agent("", patient=patient, candidate_users=users, excluded_users=attempted)
+    else:
+        mapping = get_system_call_profile(row.user)
+        users = _fallback_users(mapping)
+        selected = _select_inbound_agent("", candidate_users=users, excluded_users=attempted)
+    if not selected:
+        context["fallback_processed"] = True
+        frappe.db.set_value("Vobiz Call Log", row.name, "request_json", json.dumps(context))
+        return _reject_incoming("No eligible agent after unanswered call", row.call_uuid)
+    mapping, device, endpoint = selected
+    key = "VSC-IN-" + hashlib.sha256((row.name + ":retry").encode()).hexdigest()[:40]
+    child_context = dict(context, call_device=device, incoming_mobile_bridge=device == CALL_DEVICE_MOBILE_BRIDGE,
+                         attempted_users=attempted + [mapping.user], previous_call_log=row.name,
+                         fallback_origin_user=context.get("fallback_origin_user") or row.user)
+    child_context.pop("next_call_log", None)
+    child_context.pop("fallback_processed", None)
+    data = {"doctype": "Vobiz Call Log", "call_key": key, "source_app": "vobiz_click_to_call",
+            "user": mapping.user, "direction": "Incoming", "status": "Ringing", "call_status": "provider-routed",
+            "callback_token": secrets.token_urlsafe(32), "agent_number": endpoint, "user_mobile": mapping.agent_mobile,
+            "request_json": json.dumps(child_context), "start_time": frappe.utils.now(),
+            "recording_status": "Not Started", "cdr_sync_status": "Not Synced"}
+    for field in ("call_uuid", "customer_number", "normalized_customer_number", "caller_id", "did_number",
+                  "normalized_did", "from_number", "to_number", "reference_doctype", "reference_name", "patient", "crm_lead"):
+        data[field] = row.get(field)
+    child = frappe.get_doc(data).insert(ignore_permissions=True)
+    from vobiz_click_to_call.api.call import mark_mapping_busy
+    mark_mapping_busy(mapping.name, child.name)
+    context.update(next_call_log=child.name, fallback_processed=True)
+    frappe.db.set_value("Vobiz Call Log", row.name, "request_json", json.dumps(context))
+    if incoming:
+        from vobiz_click_to_call.api.inbound import update_incoming_assignment
+        match = next(r for r in incoming.agents if r.agent_user == mapping.user and r.enabled)
+        update_incoming_assignment(incoming, {"user": mapping.user, "agent_row": match.name})
+    frappe.db.commit()
+    return _xml_response(_dial_agent_xml(endpoint, row.did_number, child))
+
+
 def _terminal_status(previous, event, reason):
     return lifecycle.terminal_status(previous, event, reason)
 
@@ -369,8 +588,8 @@ def _append_callback_if_enabled(call_log, event, payload):
         safe = {"truncated": True, "event": event}
     try:
         frappe.enqueue(
-            "vobiz_ai.api.call_log.append_callback", queue="short", timeout=120,
-            enqueue_after_commit=True, call_log=call_log, event=event, payload=safe,
+            "vobiz_click_to_call.services.callback_logging.append_callback_job", queue="short", timeout=120,
+            enqueue_after_commit=True, call_log=call_log, event_type=event, payload=safe,
         )
     except Exception:
         # Telemetry availability must not roll back a successful call transition.
@@ -418,7 +637,9 @@ def _dial_attrs(caller_id, row=None):
     if row:
         base = get_webhook_base_url() + "/api/method/vobiz_system_call.api.webrtc.provider_event?"
         query = {"call_log": row.name, "token": _provider_call_token(row)}
-        attrs += [("action", base + urlencode({**query, "final": "1"})), ("method", "POST"),
+        action_base = (get_webhook_base_url() + "/api/method/vobiz_system_call.api.webrtc.incoming_action?"
+                       if row.get("direction") == "Incoming" else base)
+        attrs += [("action", action_base + urlencode({**query, "final": "1"})), ("method", "POST"),
                   ("callbackUrl", base + urlencode(query)), ("callbackMethod", "POST")]
     return " ".join(f"{key}={quoteattr(str(value))}" for key, value in attrs)
 
