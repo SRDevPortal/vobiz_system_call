@@ -27,3 +27,13 @@ before_uninstall = "vobiz_system_call.install.before_uninstall"
 scheduler_events = {
     "cron": {"* * * * *": ["vobiz_system_call.api.lifecycle.recover_calls"]},
 }
+
+
+doc_events = {
+    "Vobiz User Mapping": {"validate": "vobiz_system_call.api.device.validate_mapping"},
+    "Vobiz Settings": {"validate": "vobiz_system_call.api.device.validate_settings"},
+}
+doctype_js = {
+    "Vobiz User Mapping": "public/js/user_mapping.js",
+    "Vobiz Settings": "public/js/settings.js",
+}

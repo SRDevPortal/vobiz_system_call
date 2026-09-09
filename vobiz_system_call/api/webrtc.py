@@ -17,7 +17,7 @@ from vobiz_click_to_call.services.numbers import normalize_phone_number, provide
 from vobiz_click_to_call.services.settings import get_default_country_code
 from vobiz_system_call.api import lifecycle
 from vobiz_system_call.api.settings import (
-    CALL_DEVICE_BROWSER_SOFTPHONE, get_browser_softphone_registrar,
+    CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_MOBILE_BRIDGE, device_enabled, get_browser_softphone_registrar,
     get_browser_softphone_sdk_url, get_call_device, get_caller_id,
     get_inbound_callback_token, get_profile_endpoint_uri, get_profile_password,
     get_settings, get_system_call_profile, get_webhook_base_url, is_enabled,
@@ -30,7 +30,7 @@ TERMINAL_EVENTS = {"onCallTerminated", "onCallFailed", "hangup", "failed", "term
 
 def _browser_enabled():
     settings = get_settings()
-    return is_enabled(settings) and get_call_device(settings) == CALL_DEVICE_BROWSER_SOFTPHONE
+    return is_enabled(settings) and get_call_device(settings, get_system_call_profile()) == CALL_DEVICE_BROWSER_SOFTPHONE and device_enabled(CALL_DEVICE_BROWSER_SOFTPHONE, settings)
 
 
 def _login():
@@ -45,7 +45,7 @@ def get_browser_softphone_config():
     profile = get_system_call_profile()
     enabled = _browser_enabled() and bool(profile and frappe.utils.cint(profile.get("browser_softphone_enabled")))
     if not enabled:
-        return {"enabled": False, "configured": False, "call_device": get_call_device(settings)}
+        return {"enabled": False, "configured": False, "call_device": get_call_device(settings, profile)}
     missing = []
     username = (profile.get("browser_softphone_username") or "").strip()
     password = get_profile_password(profile["name"])
@@ -110,6 +110,8 @@ def get_incoming_call(caller: str, tab_id: str):
     if not name:
         frappe.throw(_("No routed incoming call found."))
     mapping, row = lifecycle.lock_call(name)
+    if not lifecycle.is_browser_call(row):
+        frappe.throw(_("This call is routed to your mobile."))
     # The SIP leg presents the business DID; customer identity comes from the
     # authenticated provider's routed log, not the browser's displayed caller ID.
     if (row.user != frappe.session.user or row.direction != "Incoming"
@@ -128,6 +130,8 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
     mapping, row = lifecycle.lock_call(call_log)
     if row.user != frappe.session.user and "System Manager" not in frappe.get_roles():
         frappe.throw(_("Not permitted."))
+    if not lifecycle.is_browser_call(row):
+        frappe.throw(_("Browser events are not valid for a mobile call."))
     allowed = TERMINAL_EVENTS | {"browserCallStarted", "onCallRemoteRinging", "onCallAnswered"}
     if event not in allowed:
         frappe.throw(_("Unsupported browser event."))
@@ -185,7 +189,7 @@ def cancel_browser_call(call_log: str):
 @frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
 @rate_limit(limit=600, seconds=60)
 def answer(token=None):
-    if not _valid_public_token(token) or not _browser_enabled():
+    if not _valid_public_token(token) or not is_enabled(get_settings()):
         return _plain_response("Not permitted.", 403)
     payload = _request_params()
     if str(payload.get("Event") or payload.get("event") or "").lower() == "hangup":
@@ -221,7 +225,7 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
         frappe.db.rollback()
         return _xml_response(_hangup_xml())
     mapping, row = lifecycle.lock_call(mapping.current_call_log)
-    if (row.direction != "Outgoing" or destination != _number(row.customer_number)
+    if (not lifecycle.is_browser_call(row) or row.direction != "Outgoing" or destination != _number(row.customer_number)
             or row.status in lifecycle.TERMINAL
             or (row.call_uuid and row.call_uuid != uuid)
             or (not row.call_uuid and lifecycle.startup_expired(row))
@@ -245,7 +249,7 @@ def _answer_pstn_inbound(raw_from, raw_to, payload):
     if not caller or not did or not uuid:
         return _xml_response(_hangup_xml())
     profiles = frappe.get_all(
-        "Vobiz User Mapping", filters={"caller_id": did, "enabled": 1, "browser_softphone_enabled": 1},
+        "Vobiz User Mapping", filters={"caller_id": did, "enabled": 1},
         fields=["name", "user"], limit_start=0, limit_page_length=2,
     )
     # A shared DID needs an explicit routing policy; never pick the most recently edited agent.
@@ -261,15 +265,20 @@ def _answer_pstn_inbound(raw_from, raw_to, payload):
         valid = (row.status not in lifecycle.TERMINAL and mapping.current_call_log == key
                  and row.user == mapping.user and row.customer_number == caller and row.did_number == did
                  and row.call_status not in ("cancellation-requested", "browser-ended-pending-provider"))
-        xml = _dial_user_xml(row.agent_number, did, row) if valid else _hangup_xml()
+        xml = _dial_agent_xml(row.agent_number, did, row) if valid else _hangup_xml()
         frappe.db.commit()
         return _xml_response(xml)
-    if (not lifecycle.presence(mapping.user) or mapping.current_call_log
+    device = get_call_device(get_settings(), mapping)
+    if not device_enabled(device, get_settings()) or device not in (CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_MOBILE_BRIDGE):
+        frappe.db.rollback()
+        return _xml_response(_hangup_xml())
+    browser = device == CALL_DEVICE_BROWSER_SOFTPHONE
+    if ((browser and (not mapping.browser_softphone_enabled or not lifecycle.presence(mapping.user))) or mapping.current_call_log
             or mapping.availability_status != "Available" or not mapping.accept_calls):
         frappe.db.rollback()
         return _xml_response(_hangup_xml())
     lifecycle.assert_available(mapping)
-    endpoint = get_profile_endpoint_uri(mapping.as_dict())
+    endpoint = get_profile_endpoint_uri(mapping.as_dict()) if browser else _number(mapping.agent_mobile)
     if not endpoint:
         frappe.db.rollback()
         return _xml_response(_hangup_xml())
@@ -281,14 +290,14 @@ def _answer_pstn_inbound(raw_from, raw_to, payload):
         "caller_id": did, "did_number": did, "normalized_did": did,
         "agent_number": endpoint, "user_mobile": mapping.agent_mobile,
         "from_number": caller, "to_number": did, "start_time": frappe.utils.now(),
-        "request_json": json.dumps({"source": "vobiz_system_call", "call_device": "Browser Softphone"}),
+        "request_json": json.dumps({"source": "vobiz_system_call", "call_device": device, "incoming_mobile_bridge": not browser}),
         "recording_status": "Not Started", "cdr_sync_status": "Not Synced",
     }
     # Deliberately do not scan CRM/Patient phone fields to guess ownership.
     row = frappe.get_doc(data).insert(ignore_permissions=True)
     from vobiz_click_to_call.api.call import mark_mapping_busy
     mark_mapping_busy(mapping.name, row.name)
-    xml = _dial_user_xml(endpoint, did, row)
+    xml = _dial_agent_xml(endpoint, did, row)
     frappe.db.commit()
     return _xml_response(xml)
 
@@ -418,6 +427,13 @@ def _dial_number_xml(destination, caller_id, row=None):
     return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
             f'<Dial {_dial_attrs(caller_id, row)}><Number>{escape(provider_phone_number(destination))}</Number>'
             '</Dial></Response>')
+
+
+def _dial_agent_xml(endpoint, caller_id, row):
+    if lifecycle.context(row).get("call_device") == CALL_DEVICE_MOBILE_BRIDGE:
+        return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
+                f'<Dial {_dial_attrs(caller_id, row)}><Number>{escape(provider_phone_number(endpoint))}</Number></Dial></Response>')
+    return _dial_user_xml(endpoint, caller_id, row)
 
 
 def _dial_user_xml(endpoint_uri, caller_id, row=None):

@@ -27,11 +27,29 @@ def is_enabled(settings=None) -> bool:
     return bool(frappe.utils.cint(settings.get("enabled")))
 
 
-def get_call_device(settings=None) -> str:
+def device_enabled(device, settings=None):
     settings = settings or get_settings()
-    value = (settings.get("agent_call_device") or CALL_DEVICE_MOBILE_BRIDGE).strip()
-    options = {CALL_DEVICE_MOBILE_BRIDGE, CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}
-    return value if value in options else CALL_DEVICE_MOBILE_BRIDGE
+    field = {CALL_DEVICE_BROWSER_SOFTPHONE: "enable_browser_softphone",
+             CALL_DEVICE_MOBILE_BRIDGE: "enable_mobile_bridge"}.get(device)
+    if not field:
+        return device == CALL_DEVICE_SYSTEM_DIALER
+    value = settings.get(field)
+    return bool(frappe.utils.cint(value)) if value is not None else True
+
+
+def get_call_device(settings=None, profile=None) -> str:
+    settings = settings or get_settings()
+    selected = (profile or {}).get("agent_call_device")
+    value = selected if selected and selected != "Use Default" else settings.get("agent_call_device")
+    value = (value or CALL_DEVICE_MOBILE_BRIDGE).strip()
+    if value not in {CALL_DEVICE_MOBILE_BRIDGE, CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
+        frappe.throw(_("Invalid Agent Call Device."))
+    return value
+
+
+def assert_device_enabled(device, settings=None):
+    if not device_enabled(device, settings):
+        frappe.throw(_("{0} is disabled in Vobiz Settings.").format(device))
 
 
 def get_browser_softphone_registrar(settings=None) -> str:
@@ -79,6 +97,7 @@ def get_system_call_profile(user: str | None = None) -> dict | None:
         "current_call_log",
     ]
     for fieldname in (
+        "agent_call_device",
         "browser_softphone_enabled",
         "browser_softphone_username",
         "browser_softphone_endpoint_uri",

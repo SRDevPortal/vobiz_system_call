@@ -34,7 +34,7 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(lifecycle, "_", lambda value: value)
         self.replace(call, "_", lambda value: value)
         self.replace(frappe, "enqueue", MagicMock())
-        self.replace(webrtc, "get_settings", lambda: frappe._dict(enabled=1, store_raw_payloads=0))
+        self.replace(webrtc, "get_settings", lambda: frappe._dict(enabled=1, store_raw_payloads=0, agent_call_device="Browser Softphone"))
 
     def replace(self, obj, name, value):
         p = patch.object(obj, name, value)
@@ -42,10 +42,66 @@ class BrowserSafetyTests(unittest.TestCase):
         self.addCleanup(p.stop)
         return value
 
+    def test_agent_device_overrides_default_and_disabled_mode_is_rejected(self):
+        from vobiz_system_call.api import settings as devices
+        self.replace(devices, "_", lambda value: value)
+        settings = frappe._dict(agent_call_device="Browser Softphone", enable_browser_softphone=1, enable_mobile_bridge=1)
+        for selection, expected in [("Use Default", "Browser Softphone"), ("Browser Softphone", "Browser Softphone"),
+                                    ("Mobile Bridge", "Mobile Bridge"), (None, "Browser Softphone")]:
+            self.assertEqual(devices.get_call_device(settings, {"agent_call_device": selection}), expected)
+        settings.enable_mobile_bridge = 0
+        with self.assertRaises(ValueError):
+            devices.assert_device_enabled("Mobile Bridge", settings)
+        settings.agent_call_device = "System Dialer"
+        self.assertEqual(devices.get_call_device(settings, {}), "System Dialer")
+
+    def test_mobile_incoming_routes_without_browser_presence_and_records_device(self):
+        import json
+        caller, did, mobile = "+919876545966", "+911234565565", "+911234567890"
+        mapping = row(name="MAP", current_call_log="", enabled=1, availability_status="Available",
+                      accept_calls=1, agent_mobile=mobile, agent_call_device="Mobile Bridge", browser_softphone_enabled=0)
+        mapping.as_dict = lambda: dict(mapping)
+        self.replace(webrtc, "_number", lambda value: value)
+        self.replace(frappe, "get_all", lambda *a, **kw: [mapping])
+        self.replace(lifecycle, "lock_mapping", lambda _: mapping)
+        presence = self.replace(lifecycle, "presence", MagicMock(return_value=None))
+        self.replace(lifecycle, "assert_available", lambda _: None)
+        documents = []
+        def make_doc(data):
+            incoming = frappe._dict(data, name="INBOUND")
+            incoming.insert = lambda **kw: incoming
+            documents.append(incoming)
+            return incoming
+        self.replace(frappe, "get_doc", make_doc)
+        from vobiz_click_to_call.api import call as core_call
+        self.replace(core_call, "mark_mapping_busy", MagicMock())
+        self.replace(webrtc, "_dial_attrs", lambda *args: 'callerId="business"')
+        self.replace(webrtc, "provider_phone_number", lambda number: number)
+        self.db.exists.return_value = False
+        response = webrtc._answer_pstn_inbound(caller, did, {"CallUUID": "provider-mobile"})
+        self.assertIn("<Number>" + mobile + "</Number>", response.get_data(as_text=True))
+        self.assertNotIn("<User>", response.get_data(as_text=True))
+        presence.assert_not_called()
+        self.assertTrue(lifecycle.is_managed_call(documents[0]))
+        self.assertFalse(lifecycle.is_browser_call(documents[0]))
+        self.assertEqual(json.loads(documents[0].request_json)["call_device"], "Mobile Bridge")
+
+    def test_mapping_mode_change_is_rejected_during_active_call(self):
+        from vobiz_system_call.api import device
+        self.replace(frappe, "flags", frappe._dict())
+        self.replace(device, "_", lambda value: value)
+        previous = frappe._dict(agent_call_device="Browser Softphone")
+        mapping = row(agent_call_device="Mobile Bridge", enabled=1)
+        mapping.get_doc_before_save = lambda: previous
+        mapping.is_new = lambda: False
+        self.db.sql.return_value = [("ACTIVE",)]
+        with self.assertRaisesRegex(ValueError, "End the active call"):
+            device.validate_mapping(mapping)
+
     def test_inbound_sip_leg_presents_business_did_on_first_route_and_retry(self):
         caller, did = "+919876545966", "+911234565565"
         mapping = row(name="MAP", current_call_log="", availability_status="Available",
-                      accept_calls=1, agent_mobile="+911234567890")
+                      accept_calls=1, browser_softphone_enabled=1, agent_mobile="+911234567890")
         mapping.as_dict = lambda: dict(mapping)
         incoming = row(name="INBOUND", direction="Incoming", status="Ringing", customer_number=caller,
                        did_number=did, agent_number="sip:agent@registrar", call_status="provider-routed")
@@ -135,7 +191,7 @@ class BrowserSafetyTests(unittest.TestCase):
 
     def test_disabled_answer_never_routes(self):
         self.replace(webrtc, "_valid_public_token", lambda _: True)
-        self.replace(webrtc, "_browser_enabled", lambda: False)
+        self.replace(webrtc, "is_enabled", lambda _: False)
         handler = self.replace(webrtc, "_answer_sdk_outbound", MagicMock())
         self.assertEqual(inspect.unwrap(webrtc.answer)("token").status_code, 403)
         handler.assert_not_called()
@@ -143,7 +199,7 @@ class BrowserSafetyTests(unittest.TestCase):
     def test_disabled_config_does_not_fetch_or_return_secrets(self):
         self.replace(webrtc, "_browser_enabled", lambda: False)
         self.replace(webrtc, "get_system_call_profile", lambda: frappe._dict(name="MAP", browser_softphone_enabled=1))
-        self.replace(webrtc, "get_call_device", lambda _: "Mobile Bridge")
+        self.replace(webrtc, "get_call_device", lambda *args: "Mobile Bridge")
         password = self.replace(webrtc, "get_profile_password", MagicMock())
         result = webrtc.get_browser_softphone_config()
         self.assertNotIn("password", result)

@@ -2735,6 +2735,9 @@ class VobizAgentConsole {
 	}
 
 	handle_call_disconnected(payload = {}) {
+		if (payload.name && payload.direction === 'Incoming' && this.is_terminal_status(payload.status)) {
+			this.watch_browser_call_disposition(payload.name);
+		}
 		const active = this.state.active_call || {};
 		if (!payload.name || active.name !== payload.name || !this.is_terminal_status(payload.status)) return;
 		const call = Object.assign({}, active, payload);
@@ -4930,6 +4933,7 @@ class VobizAgentConsole {
 		}).then((r) => {
 			const call = r.message || { name: call_log };
 			if (!this.is_terminal_status(call.status)) {
+				this.watch_browser_call_disposition(call_log);
 				if (isBrowser) {
 					this.watch_browser_call_disposition(call_log);
 					softphone.status = __('Waiting for provider confirmation');

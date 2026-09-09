@@ -34,6 +34,12 @@ def is_browser_call(row):
     return data.get("source") == "vobiz_system_call" and data.get("call_device") == "Browser Softphone"
 
 
+def is_managed_call(row):
+    data = context(row)
+    return is_browser_call(row) or (data.get("source") == "vobiz_system_call"
+        and data.get("call_device") == "Mobile Bridge" and data.get("incoming_mobile_bridge") is True)
+
+
 def lock_mapping(user):
     mapping = core_call.get_user_mapping(user)
     if not mapping:
@@ -66,8 +72,8 @@ def lock_call(name):
         f"SELECT {columns} FROM `tabVobiz Call Log` WHERE name = %s FOR UPDATE",
         (name,), as_dict=True,
     )
-    if not rows or not is_browser_call(rows[0]):
-        frappe.throw(_("This is not a browser call."))
+    if not rows or not is_managed_call(rows[0]):
+        frappe.throw(_("This is not a managed Vobiz call."))
     return mapping, rows[0]
 
 
@@ -109,6 +115,10 @@ def finish_locked(mapping, row, event, reason="", status=None):
         update_reference_call_metrics(row.reference_doctype, row.reference_name)
     from vobiz_ai.api.call_log import sync_linked_summaries
     sync_linked_summaries(frappe.get_doc("Vobiz Call Log", row.name))
+    if context(row).get("incoming_mobile_bridge"):
+        frappe.publish_realtime("vobiz_call_disconnected", {
+            "name": row.name, "status": result, "direction": "Incoming",
+        }, user=row.user, after_commit=True)
     return result
 
 
@@ -117,7 +127,7 @@ def release_locked(mapping, row):
     now = frappe.utils.now_datetime()
     if mapping.current_call_log == row.name:
         available = (mapping.availability_status == "Busy" and bool(mapping.auto_available_after_call)
-                     and bool(presence(mapping.user)))
+                     and (not is_browser_call(row) or bool(presence(mapping.user))))
         next_status = mapping.availability_status if mapping.availability_status in ("Offline", "Away") else (
             "Available" if available else "Away"
         )
@@ -231,5 +241,5 @@ def recover_calls():
         fields=["name", "request_json"], limit_start=0, limit_page_length=100,
     )
     for row in calls:
-        if is_browser_call(row):
+        if is_managed_call(row):
             enqueue_reconcile(row.name)

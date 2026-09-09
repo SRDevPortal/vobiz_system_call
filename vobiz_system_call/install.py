@@ -36,6 +36,10 @@ def ensure_patch_fields():
     create_custom_fields(
         {
             "Vobiz Settings": [
+                {"fieldname": "enable_browser_softphone", "label": "Enable Browser Softphone",
+                 "fieldtype": "Check", "default": "1", "insert_after": "enable_mobile_bridge"},
+                {"fieldname": "enable_mobile_bridge", "label": "Enable Mobile Bridge",
+                 "fieldtype": "Check", "default": "1", "insert_after": "vsc_call_section"},
                 {
                     "fieldname": "vsc_call_section",
                     "label": "System Call",
@@ -45,11 +49,12 @@ def ensure_patch_fields():
                 },
                 {
                     "fieldname": "agent_call_device",
-                    "label": "Agent Call Device",
+                    "label": "Default Agent Call Device",
                     "fieldtype": "Select",
                     "options": "Mobile Bridge\nBrowser Softphone\nSystem Dialer",
                     "default": "Mobile Bridge",
-                    "insert_after": "vsc_call_section",
+                    "reqd": 1,
+                    "insert_after": "browser_softphone_sdk_url",
                     "description": "Added by Vobiz System Call. Browser Softphone uses the existing Vobiz Agent Console.",
                 },
                 {
@@ -57,8 +62,8 @@ def ensure_patch_fields():
                     "label": "Browser Softphone Registrar",
                     "fieldtype": "Data",
                     "default": "registrar.vobiz.ai",
-                    "insert_after": "agent_call_device",
-                    "depends_on": "eval:doc.agent_call_device=='Browser Softphone'",
+                    "insert_after": "enable_browser_softphone",
+                    "depends_on": "eval:doc.enable_browser_softphone",
                 },
                 {
                     "fieldname": "browser_softphone_sdk_url",
@@ -66,13 +71,13 @@ def ensure_patch_fields():
                     "fieldtype": "Data",
                     "default": "/assets/vobiz_system_call/vendor/vobiz-webrtc-sdk-1.0.3/vobiz-webrtc-sdk.min.js",
                     "insert_after": "browser_softphone_registrar",
-                    "depends_on": "eval:doc.agent_call_device=='Browser Softphone'",
+                    "depends_on": "eval:doc.enable_browser_softphone",
                 },
                 {
                     "fieldname": "system_dialer_sip_domain",
                     "label": "System Dialer SIP Domain",
                     "fieldtype": "Data",
-                    "insert_after": "browser_softphone_sdk_url",
+                    "insert_after": "agent_call_device",
                     "depends_on": "eval:doc.agent_call_device=='System Dialer'",
                 },
                 {
@@ -86,6 +91,10 @@ def ensure_patch_fields():
                 },
             ],
             "Vobiz User Mapping": [
+                {"fieldname": "agent_call_device", "label": "Agent Call Device",
+                 "fieldtype": "Select", "options": "Use Default\nBrowser Softphone\nMobile Bridge",
+                 "default": "Use Default", "insert_after": "caller_id",
+                 "description": "Use Default follows Vobiz Settings. Changes apply to new calls."},
                 {
                     "fieldname": "browser_softphone_section",
                     "label": "Browser Softphone",
@@ -204,8 +213,6 @@ def configure_profile_from_core_mapping(
     ensure_defaults()
 
     settings = frappe.get_single("Vobiz Settings")
-    if settings.meta.has_field("agent_call_device"):
-        settings.agent_call_device = "Browser Softphone"
     if webhook_base_url and settings.meta.has_field("webhook_base_url"):
         settings.webhook_base_url = webhook_base_url
     if settings.meta.has_field("browser_softphone_registrar"):
@@ -222,6 +229,7 @@ def configure_profile_from_core_mapping(
         frappe.throw(_("No active Vobiz User Mapping found for {0}.").format(user))
 
     mapping = frappe.get_doc("Vobiz User Mapping", mapping_name)
+    mapping.agent_call_device = "Browser Softphone"
     mapping.browser_softphone_enabled = 1
     mapping.browser_softphone_username = sip_username
     mapping.browser_softphone_endpoint_uri = endpoint_uri

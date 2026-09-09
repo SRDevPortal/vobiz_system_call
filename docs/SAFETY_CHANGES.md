@@ -178,3 +178,6 @@ ensure_indexes uses frappe.db.sql_ddl for ALTER TABLE, committing preceding setu
 
 ### Removed obsolete frappe_crm compatibility package
 Verified sites/apps.txt and sriaas.local installed apps use crm. Removed the frappe_crm shim, packaging inclusions, obsolete name-repair command/script, and their tests. The real apps/crm package and site data are unchanged.
+
+### Per-agent call devices
+Added independent browser/mobile enable flags and per-agent Use Default / Browser Softphone / Mobile Bridge selection. Device resolution occurs under the agent lock. Incoming mobile legs share authenticated callbacks and provider reconciliation while retaining their stored mode. Browser presence is required only for browser routing/release. Active-call device changes are blocked and the console retains the shared disposition flow. See AGENT_CALL_DEVICES.md for deployment and live validation.

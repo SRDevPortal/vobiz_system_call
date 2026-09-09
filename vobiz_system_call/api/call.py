@@ -20,6 +20,7 @@ from vobiz_system_call.api.settings import (
     CALL_DEVICE_SYSTEM_DIALER,
     build_system_dialer_url,
     get_call_device,
+    assert_device_enabled,
     get_inbound_callback_token,
     get_caller_id,
     get_profile_endpoint_uri,
@@ -47,11 +48,15 @@ def start_call(
     if not is_enabled(system_settings):
         return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)
 
-    call_device = get_call_device(system_settings)
+    profile = lifecycle.lock_mapping(frappe.session.user)
+    lifecycle.assert_available(profile)
+    system_settings = get_settings()
+    call_device = get_call_device(system_settings, profile)
+    assert_device_enabled(call_device, system_settings)
     if call_device not in {CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
         return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)
     if client_context != "agent_console":
-        return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)
+        frappe.throw(_("Open the Vobiz Agent Console to use your selected call device."))
 
     core_settings = get_core_settings()
     if not core_settings.enabled:
@@ -293,7 +298,7 @@ def start_browser_softphone_call(
 def cancel_call(call_log: str):
     # Protect browser calls even when cancellation comes from another core UI.
     row = frappe.db.get_value("Vobiz Call Log", call_log, ["request_json"], as_dict=True)
-    if row and lifecycle.is_browser_call(row):
+    if row and lifecycle.is_managed_call(row):
         from vobiz_system_call.api.webrtc import cancel_browser_call
         return cancel_browser_call(call_log)
     return core_call.cancel_call(call_log)
