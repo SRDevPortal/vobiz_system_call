@@ -685,6 +685,19 @@ class BrowserSafetyTests(unittest.TestCase):
         finish.assert_called_once()
         self.assertEqual(finish.call_args.kwargs["status"], "Cancelled")
 
+    def test_local_browser_call_without_uuid_is_not_startup_failed(self):
+        active = row(
+            call_uuid="",
+            status="Initiated",
+            call_status="browserCallStarted",
+            creation=datetime(2026, 9, 8, 10),
+            request_json='{"source":"vobiz_system_call","call_device":"Browser Softphone"}',
+        )
+        self.replace(lifecycle, "lock_call", MagicMock(return_value=(frappe._dict(), active)))
+        finish = self.replace(lifecycle, "finish_locked", MagicMock())
+        lifecycle.reconcile_call("CALL-1")
+        finish.assert_not_called()
+
     def test_client_missing_call_opt_in_does_not_hide_other_failures(self):
         from vobiz_click_to_call.services import client
         self.replace(client, "_", lambda value: value)

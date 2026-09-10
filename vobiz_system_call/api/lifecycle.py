@@ -21,6 +21,12 @@ CALL_FIELDS = [
     "agent_number", "normalized_customer_number", "from_number", "to_number", "modified",
 ]
 PROVIDER_PENDING_STATUSES = frozenset(("browser-ended-pending-provider", "cancellation-requested"))
+LOCAL_BROWSER_ACTIVE_STATUSES = frozenset((
+    "browserCallStarted",
+    "onCallRemoteRinging",
+    "onCallAnswered",
+    "browser-audio-connected",
+))
 
 
 def context(row):
@@ -230,7 +236,8 @@ def reconcile_call(call_log):
     """Expire unissued calls; release provider calls only after matching terminal CDR."""
     mapping, row = lock_call(call_log)
     if not row.call_uuid:
-        if row.status not in TERMINAL and startup_expired(row):
+        locally_started = row.call_status in LOCAL_BROWSER_ACTIVE_STATUSES
+        if row.status not in TERMINAL and not locally_started and startup_expired(row):
             finish_locked(mapping, row, "onCallFailed", "Browser startup timeout")
         frappe.db.commit()
         return
