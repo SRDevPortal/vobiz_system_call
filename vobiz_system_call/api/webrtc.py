@@ -140,6 +140,7 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
     if row.status in lifecycle.TERMINAL:
         frappe.db.commit()
         return {"status": row.status}
+    sdk_uuid = _provider_uuid({"CallUUID": call_uuid})
     # SDK IDs can identify a different leg; they must never overwrite the authenticated provider ID.
     if event in TERMINAL_EVENTS:
         if row.call_uuid:
@@ -150,14 +151,25 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
             result = lifecycle.finish_locked(mapping, row, event, str(reason or ""))
     else:
         values = {"event": event, "call_status": event}
+        if sdk_uuid and not row.call_uuid and not row.get("recording_call_uuid"):
+            values["recording_call_uuid"] = sdk_uuid
         if event == "onCallRemoteRinging" and not row.answer_time:
             values["status"] = "Ringing"
         elif event == "onCallAnswered":
-            # Browser audio is a UI signal; provider callbacks establish answer_time.
             values["call_status"] = "browser-audio-connected"
+            if row.direction == "Outgoing":
+                values["status"] = "Connected"
+                if not row.answer_time:
+                    values["answer_time"] = frappe.utils.now()
         frappe.db.set_value("Vobiz Call Log", call_log, values)
+        if event == "onCallAnswered" and row.direction == "Outgoing" and (sdk_uuid or row.get("recording_call_uuid")):
+            _enqueue_recording_start(call_log)
         result = values.get("status", row.status)
-    _append_callback_if_enabled(call_log, event, {"event": event, "reason": str(reason or "")[:500]})
+    _append_callback_if_enabled(call_log, event, {
+        "event": event,
+        "reason": str(reason or "")[:500],
+        "call_uuid": sdk_uuid,
+    })
     frappe.db.commit()
     return {"status": result}
 
@@ -683,6 +695,18 @@ def _append_callback_if_enabled(call_log, event, payload):
     except Exception:
         # Telemetry availability must not roll back a successful call transition.
         frappe.log_error(title="Vobiz callback logging unavailable", message=frappe.get_traceback())
+
+
+def _enqueue_recording_start(call_log: str) -> None:
+    try:
+        frappe.enqueue(
+            "vobiz_click_to_call.services.recording.start_recording_if_needed",
+            call_log=call_log, queue="short", timeout=180, enqueue_after_commit=True,
+            job_id="vsc-record-" + call_log, deduplicate=True,
+        )
+    except Exception:
+        # Recording must not interrupt the live browser call state update.
+        frappe.log_error(title="Vobiz browser recording start unavailable", message=frappe.get_traceback())
 
 
 def _sip_username(value):

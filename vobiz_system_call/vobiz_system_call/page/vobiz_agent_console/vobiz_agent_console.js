@@ -1090,7 +1090,7 @@ class VobizAgentConsole {
 		vobiz._vobizConsoleBound = true;
 		const client = vobiz.client;
 		const on = (event, handler) => client.on(event, (...args) => {
-			if (this.state.softphone.client === vobiz) handler(...args);
+			if (this.state.softphone.client === vobiz) handler(args.length > 1 ? args : args[0]);
 		});
 		on('onWebrtcNotSupported', () => this.browser_softphone_failed(__('WebRTC is not supported in this browser.')));
 		on('onLogin', () => {
@@ -1145,8 +1145,9 @@ class VobizAgentConsole {
 		});
 		on('onCallTerminated', (callInfo) => this.browser_softphone_call_done('onCallTerminated', callInfo));
 		on('onCallFailed', (callInfo) => this.browser_softphone_call_done('onCallFailed', callInfo));
-		on('onIncomingCall', (callerId, extraHeaders, callInfo, callerName) => {
-			this.browser_softphone_incoming(callerId, extraHeaders, callInfo, callerName);
+		on('onIncomingCall', (args) => {
+			const values = Array.isArray(args) ? args : [args];
+			this.browser_softphone_incoming(values[0], values[1], values[2], values[3]);
 		});
 		on('onIncomingCallCanceled', () => {
 			if (!this.state.softphone.incoming_pending && !this.state.softphone.incoming_caller) return;
@@ -1210,6 +1211,17 @@ class VobizAgentConsole {
 	}
 
 	normalize_browser_softphone_event(callInfo = {}) {
+		if (Array.isArray(callInfo)) {
+			const merged = { args: callInfo };
+			callInfo.forEach((part, index) => {
+				if (part && typeof part === 'object' && !Array.isArray(part)) {
+					Object.assign(merged, part);
+				} else if (part !== undefined && part !== null && part !== '') {
+					merged[`arg${index}`] = String(part);
+				}
+			});
+			return merged;
+		}
 		if (!callInfo || typeof callInfo !== 'object') {
 			return { reason: callInfo ? String(callInfo) : '' };
 		}
@@ -1217,7 +1229,27 @@ class VobizAgentConsole {
 	}
 
 	extract_call_uuid(callInfo = {}) {
-		return callInfo.callUUID || callInfo.call_uuid || callInfo.uuid || callInfo.id || '';
+		const keys = ['callUUID', 'CallUUID', 'callUuid', 'call_uuid', 'xcallUUID', 'uuid'];
+		const seen = new Set();
+		const scan = (value, depth = 0) => {
+			if (!value || depth > 4) return '';
+			if (typeof value !== 'object') return '';
+			if (seen.has(value)) return '';
+			seen.add(value);
+			for (const key of keys) {
+				const found = value[key];
+				if (found) return String(found);
+			}
+			if (value.id && String(value.id).length >= 8) return String(value.id);
+			for (const child of Object.values(value)) {
+				const found = Array.isArray(child)
+					? child.map(item => scan(item, depth + 1)).find(Boolean)
+					: scan(child, depth + 1);
+				if (found) return found;
+			}
+			return '';
+		};
+		return scan(this.normalize_browser_softphone_event(callInfo));
 	}
 
 	browser_softphone_failed(reason) {

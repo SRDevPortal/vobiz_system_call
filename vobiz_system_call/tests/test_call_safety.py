@@ -482,6 +482,19 @@ class BrowserSafetyTests(unittest.TestCase):
         webrtc.update_browser_softphone_call("CALL-1", "onCallAnswered", call_uuid="attacker-uuid")
         self.assertNotIn("call_uuid", self.db.set_value.call_args.args[2])
 
+    def test_outgoing_browser_answer_starts_recording_from_sdk_uuid(self):
+        self.replace(lifecycle, "lock_call", lambda _: (
+            frappe._dict(), row(direction="Outgoing", status="Ringing", answer_time=None, recording_call_uuid="")
+        ))
+        enqueue = self.replace(webrtc, "_enqueue_recording_start", MagicMock())
+        webrtc.update_browser_softphone_call("CALL-1", "onCallAnswered", call_uuid="provider-uuid")
+        values = self.db.set_value.call_args.args[2]
+        self.assertEqual(values["recording_call_uuid"], "provider-uuid")
+        self.assertEqual(values["status"], "Connected")
+        self.assertEqual(values["answer_time"], "2026-09-08 10:05:00")
+        self.assertNotIn("call_uuid", values)
+        enqueue.assert_called_once_with("CALL-1")
+
     def test_end_with_provider_uuid_retains_reservation_for_reconciliation(self):
         self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(), row(call_uuid="provider-uuid")))
         finish = self.replace(lifecycle, "finish_locked", MagicMock())
