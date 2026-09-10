@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 from urllib.parse import urlencode
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape, quoteattr
 
 import frappe
@@ -142,7 +143,7 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
     # SDK IDs can identify a different leg; they must never overwrite the authenticated provider ID.
     if event in TERMINAL_EVENTS:
         if row.call_uuid:
-            frappe.db.set_value("Vobiz Call Log", call_log, "call_status", "browser-ended-pending-provider")
+            frappe.db.set_value("Vobiz Call Log", call_log, lifecycle.provider_pending_values(row, event, reason))
             lifecycle.enqueue_reconcile(call_log)
             result = row.status
         else:
@@ -177,6 +178,9 @@ def cancel_browser_call(call_log: str):
     uuid = row.call_uuid
     context = lifecycle.context(row)
     context["agent_cancelled"] = True
+    context["browser_terminal_event"] = "hangup"
+    context["browser_terminal_reason"] = "Agent cancelled browser call"
+    context["browser_terminal_at"] = frappe.utils.now()
     frappe.db.set_value("Vobiz Call Log", call_log, "request_json", json.dumps(context))
     frappe.db.set_value("Vobiz Call Log", call_log, "call_status", "cancellation-requested")
     frappe.db.commit()
@@ -207,13 +211,96 @@ def answer(token=None):
     caller_key = hashlib.sha256(str(_number(raw_from) or raw_from).encode()).hexdigest()
     with frappe.cache().lock("vsc:incoming-caller:" + caller_key, timeout=120, blocking_timeout=5):
         with frappe.cache().lock("vsc:incoming-route:" + route_key, timeout=120, blocking_timeout=5):
-            return _answer_pstn_inbound(raw_from, raw_to, payload)
+            return _answer_core_routed_pstn_inbound(payload)
 
 
 def browser_softphone_answer_url(settings=None):
     settings = settings or get_settings()
     query = urlencode({"token": get_inbound_callback_token(settings)})
-    return f"{get_webhook_base_url(settings)}/api/method/vobiz_click_to_call.api.webrtc.answer?{query}"
+    return f"{get_webhook_base_url(settings)}/api/method/vobiz_system_call.api.webrtc.answer?{query}"
+
+
+def _answer_core_routed_pstn_inbound(payload):
+    """Use the core inbound router, then upgrade mapped browser agents to SIP User XML."""
+    from vobiz_click_to_call.api import inbound as core_inbound
+
+    response = core_inbound.route()
+    xml = response.get_data(as_text=True) if hasattr(response, "get_data") else ""
+    if not xml or "<Number" not in xml:
+        return response
+
+    call_log = core_inbound.find_existing_inbound_call(payload)
+    endpoint = _core_inbound_browser_endpoint(call_log)
+    if not endpoint:
+        return response
+
+    upgraded = _replace_dial_number_with_user(xml, call_log, endpoint)
+    if not upgraded:
+        return response
+
+    data = lifecycle.context(call_log)
+    data.update({
+        "source": "vobiz_system_call",
+        "call_device": CALL_DEVICE_BROWSER_SOFTPHONE,
+        "core_inbound_route": True,
+    })
+    frappe.db.set_value(
+        "Vobiz Call Log",
+        call_log.name,
+        {
+            "agent_number": endpoint,
+            "request_json": json.dumps(data, indent=2, default=str),
+        },
+        update_modified=False,
+    )
+    frappe.db.commit()
+    return _xml_response(upgraded)
+
+
+def _core_inbound_browser_endpoint(call_log):
+    if not call_log or not call_log.get("user"):
+        return ""
+    profile = get_system_call_profile(call_log.user)
+    if not profile:
+        return ""
+    mapping = frappe.get_doc("Vobiz User Mapping", profile["name"])
+    if mapping.get("current_call_log") != call_log.name:
+        return ""
+    settings = get_settings()
+    if get_call_device(settings, mapping) != CALL_DEVICE_BROWSER_SOFTPHONE:
+        return ""
+    if not device_enabled(CALL_DEVICE_BROWSER_SOFTPHONE, settings):
+        return ""
+    if not frappe.utils.cint(mapping.get("browser_softphone_enabled")):
+        return ""
+    return get_profile_endpoint_uri(mapping.as_dict(), settings)
+
+
+def _replace_dial_number_with_user(xml, call_log, endpoint):
+    target = _number(call_log.get("agent_number")) or _number(call_log.get("user_mobile"))
+    if not target:
+        return ""
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return ""
+    replaced = False
+    for dial in root.iter("Dial"):
+        children = list(dial)
+        for idx, child in enumerate(children):
+            if child.tag != "Number" or _number(child.text or "") != target:
+                continue
+            user = ElementTree.Element("User")
+            user.text = endpoint
+            dial.remove(child)
+            dial.insert(idx, user)
+            replaced = True
+            break
+        if replaced:
+            break
+    if not replaced:
+        return ""
+    return '<?xml version="1.0" encoding="UTF-8"?>' + ElementTree.tostring(root, encoding="unicode")
 
 
 def _answer_sdk_outbound(raw_from, raw_to, payload):

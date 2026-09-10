@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import json
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import frappe
+from werkzeug.wrappers import Response
 from vobiz_system_call.api import lifecycle, webrtc, call
 from vobiz_system_call import install
 
@@ -380,6 +382,55 @@ class BrowserSafetyTests(unittest.TestCase):
         self.assertEqual(inspect.unwrap(webrtc.answer)("token").status_code, 403)
         handler.assert_not_called()
 
+    def test_public_answer_uses_core_inbound_route_and_upgrades_browser_agent(self):
+        from contextlib import nullcontext
+        from vobiz_click_to_call.api import inbound
+
+        self.replace(webrtc, "_valid_public_token", lambda _: True)
+        self.replace(webrtc, "is_enabled", lambda _: True)
+        self.replace(webrtc, "get_default_country_code", lambda *args: "+91")
+        self.replace(webrtc, "_request_params", lambda: {
+            "From": "+919876543210", "To": "+919999999999", "CallUUID": "uuid-12345678",
+        })
+        self.replace(frappe, "cache", lambda: SimpleNamespace(lock=lambda *args, **kwargs: nullcontext()))
+        self.replace(inbound, "route", MagicMock(return_value=Response(
+            '<?xml version="1.0" encoding="UTF-8"?><Response><Dial><Number>911234567890</Number></Dial></Response>',
+            content_type="text/xml",
+        )))
+        call_log = row(
+            name="INBOUND",
+            user="agent@example.test",
+            agent_number="+911234567890",
+            user_mobile="+911234567890",
+            direction="Incoming",
+            request_json='{"CallUUID":"uuid-12345678"}',
+        )
+        self.replace(inbound, "find_existing_inbound_call", MagicMock(return_value=call_log))
+        mapping = row(
+            name="agent@example.test",
+            user="agent@example.test",
+            current_call_log="INBOUND",
+            agent_call_device="Browser Softphone",
+            browser_softphone_enabled=1,
+            browser_softphone_username="agent",
+        )
+        mapping.as_dict = lambda: dict(mapping)
+        self.replace(webrtc, "get_system_call_profile", lambda user: {"name": mapping.name})
+        self.replace(frappe, "get_doc", lambda *args, **kwargs: mapping)
+        self.replace(webrtc, "get_profile_endpoint_uri", lambda *args: "sip:agent@registrar")
+
+        response = inspect.unwrap(webrtc.answer)("secret")
+        xml = response.get_data(as_text=True)
+
+        self.assertIn("<User>sip:agent@registrar</User>", xml)
+        self.assertNotIn("<Number>911234567890</Number>", xml)
+        values = self.db.set_value.call_args.args[2]
+        self.assertEqual(values["agent_number"], "sip:agent@registrar")
+        context = json.loads(values["request_json"])
+        self.assertEqual(context["source"], "vobiz_system_call")
+        self.assertEqual(context["call_device"], "Browser Softphone")
+        self.assertTrue(context["core_inbound_route"])
+
     def test_disabled_config_does_not_fetch_or_return_secrets(self):
         self.replace(webrtc, "_browser_enabled", lambda: False)
         self.replace(webrtc, "get_system_call_profile", lambda: frappe._dict(name="MAP", browser_softphone_enabled=1))
@@ -565,6 +616,74 @@ class BrowserSafetyTests(unittest.TestCase):
         provider.hangup_call.assert_called_once_with("provider-uuid", allow_missing=True)
         finish.assert_not_called()
         enqueue.assert_called_once_with("CALL-1")
+
+    def test_provider_pending_call_releases_after_cdr_timeout(self):
+        from vobiz_click_to_call.services import cdr, client, settings
+        data = {
+            "source": "vobiz_system_call",
+            "call_device": "Browser Softphone",
+            "browser_terminal_at": "2026-09-08 10:00:00",
+            "browser_terminal_event": "onCallTerminated",
+            "browser_terminal_reason": "Terminated",
+        }
+        pending = row(
+            call_uuid="provider-uuid",
+            call_status="browser-ended-pending-provider",
+            request_json=json.dumps(data),
+            modified=datetime(2026, 9, 8, 10),
+        )
+        self.replace(lifecycle, "lock_call", MagicMock(return_value=(frappe._dict(), pending)))
+        self.replace(settings, "get_settings", lambda: frappe._dict(enabled=1, enable_cdr_sync=1))
+        provider = MagicMock()
+        provider.search_cdrs.return_value = {}
+        self.replace(client, "VobizClient", lambda _: provider)
+        self.replace(cdr, "extract_cdr_rows", lambda _: [])
+        finish = self.replace(lifecycle, "finish_locked", MagicMock(return_value="Completed"))
+        lifecycle.reconcile_call("CALL-1")
+        finish.assert_called_once()
+        self.assertEqual(finish.call_args.kwargs["status"], "Completed")
+
+    def test_provider_pending_call_waits_before_timeout(self):
+        from vobiz_click_to_call.services import cdr, client, settings
+        data = {
+            "source": "vobiz_system_call",
+            "call_device": "Browser Softphone",
+            "browser_terminal_at": "2026-09-08 10:04:00",
+            "browser_terminal_event": "onCallTerminated",
+        }
+        pending = row(
+            call_uuid="provider-uuid",
+            call_status="browser-ended-pending-provider",
+            request_json=json.dumps(data),
+            modified=datetime(2026, 9, 8, 10, 4),
+        )
+        self.replace(lifecycle, "lock_call", MagicMock(return_value=(frappe._dict(), pending)))
+        self.replace(settings, "get_settings", lambda: frappe._dict(enabled=1, enable_cdr_sync=1))
+        provider = MagicMock()
+        provider.search_cdrs.return_value = {}
+        self.replace(client, "VobizClient", lambda _: provider)
+        self.replace(cdr, "extract_cdr_rows", lambda _: [])
+        finish = self.replace(lifecycle, "finish_locked", MagicMock())
+        lifecycle.reconcile_call("CALL-1")
+        finish.assert_not_called()
+
+    def test_cancel_pending_provider_timeout_is_cancelled(self):
+        data = {
+            "source": "vobiz_system_call",
+            "call_device": "Browser Softphone",
+            "browser_terminal_at": "2026-09-08 10:00:00",
+        }
+        pending = row(
+            call_uuid="provider-uuid",
+            call_status="cancellation-requested",
+            request_json=json.dumps(data),
+            modified=datetime(2026, 9, 8, 10),
+        )
+        self.replace(lifecycle, "lock_call", MagicMock(return_value=(frappe._dict(), pending)))
+        finish = self.replace(lifecycle, "finish_locked", MagicMock(return_value="Cancelled"))
+        lifecycle.finish_provider_pending_if_expired("CALL-1", "provider-uuid")
+        finish.assert_called_once()
+        self.assertEqual(finish.call_args.kwargs["status"], "Cancelled")
 
     def test_client_missing_call_opt_in_does_not_hide_other_failures(self):
         from vobiz_click_to_call.services import client

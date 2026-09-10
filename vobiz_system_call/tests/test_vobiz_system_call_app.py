@@ -9,7 +9,7 @@ APP_ROOT = Path(__file__).resolve().parents[2]
 
 class TestVobizSystemCallPatchApp(unittest.TestCase):
     def read_text(self, relative_path: str) -> str:
-        return (APP_ROOT / relative_path).read_text()
+        return (APP_ROOT / relative_path).read_text(encoding="utf-8")
 
     def test_install_patches_core_doctypes(self):
         install_py = self.read_text("vobiz_system_call/install.py")
@@ -53,7 +53,7 @@ class TestVobizSystemCallPatchApp(unittest.TestCase):
         webrtc_py = self.read_text("vobiz_system_call/api/webrtc.py")
         hooks_py = self.read_text("vobiz_system_call/hooks.py")
 
-        self.assertIn("vobiz_click_to_call.api.webrtc.answer", webrtc_py)
+        self.assertIn("vobiz_system_call.api.webrtc.answer", webrtc_py)
         self.assertIn('"vobiz_click_to_call.api.webrtc.answer": "vobiz_system_call.api.webrtc.answer"', hooks_py)
         self.assertIn("<Number>{escape(provider_phone_number(destination))}</Number>", webrtc_py)
         self.assertIn("Vobiz User Mapping", webrtc_py)

@@ -12,13 +12,15 @@ from vobiz_click_to_call.services.safety import get_working_hours_block_reason
 ACTIVE = ("Initiated", "Queued", "Ringing", "Customer Answered", "Connected", "In Progress")
 TERMINAL = frozenset(("Completed", "Failed", "Busy", "No Answer", "Cancelled", "Canceled"))
 STARTUP_SECONDS = 45
+PROVIDER_PENDING_SECONDS = 120
 PRESENCE_SECONDS = 65
 CALL_FIELDS = [
     "name", "user", "status", "call_status", "call_uuid", "answer_time", "end_time",
     "start_time", "creation", "reference_doctype", "reference_name", "request_json",
     "callback_token", "caller_id", "did_number", "customer_number", "direction",
-    "agent_number", "normalized_customer_number", "from_number", "to_number",
+    "agent_number", "normalized_customer_number", "from_number", "to_number", "modified",
 ]
+PROVIDER_PENDING_STATUSES = frozenset(("browser-ended-pending-provider", "cancellation-requested"))
 
 
 def context(row):
@@ -149,6 +151,50 @@ def startup_expired(row):
     return frappe.utils.get_datetime(row.creation) + timedelta(seconds=STARTUP_SECONDS) < frappe.utils.now_datetime()
 
 
+def provider_pending_values(row, event, reason=""):
+    data = context(row)
+    data.update({
+        "browser_terminal_event": str(event or "")[:80],
+        "browser_terminal_reason": str(reason or "")[:500],
+        "browser_terminal_at": frappe.utils.now(),
+    })
+    return {
+        "call_status": "browser-ended-pending-provider",
+        "request_json": json.dumps(data),
+    }
+
+
+def provider_pending_expired(row):
+    if row.status in TERMINAL or row.call_status not in PROVIDER_PENDING_STATUSES:
+        return False
+    data = context(row)
+    activity = data.get("browser_terminal_at") or row.get("modified") or row.get("creation")
+    return frappe.utils.get_datetime(activity) + timedelta(seconds=PROVIDER_PENDING_SECONDS) < frappe.utils.now_datetime()
+
+
+def provider_pending_outcome(row):
+    data = context(row)
+    event = data.get("browser_terminal_event") or ("hangup" if row.call_status == "cancellation-requested" else "terminated")
+    reason = data.get("browser_terminal_reason") or "Provider final callback timeout"
+    if row.call_status == "cancellation-requested":
+        return "Cancelled", event, reason
+    return terminal_status(row.status, event, reason, bool(row.answer_time)), event, reason
+
+
+def finish_provider_pending_if_expired(call_log, expected_uuid=None):
+    mapping, row = lock_call(call_log)
+    if expected_uuid and row.call_uuid != expected_uuid:
+        frappe.db.rollback()
+        return False
+    if provider_pending_expired(row):
+        status, event, reason = provider_pending_outcome(row)
+        finish_locked(mapping, row, "provider-timeout", reason or event, status=status)
+        frappe.db.commit()
+        return True
+    frappe.db.commit()
+    return False
+
+
 def enqueue_reconcile(name):
     try:
         frappe.enqueue(
@@ -195,15 +241,23 @@ def reconcile_call(call_log):
     from vobiz_click_to_call.services.cdr import extract_cdr_rows
     settings = get_settings()
     if not settings.enabled or not settings.enable_cdr_sync:
-        return  # Retain the reservation when the provider outcome is unknown.
+        finish_provider_pending_if_expired(call_log, snapshot["call_uuid"])
+        return  # Retain briefly unless a browser-ended provider wait has expired.
     # Query the exact provider UUID; do not constrain incoming calls with outgoing From/To.
-    response = VobizClient(settings).search_cdrs({"call_uuid": snapshot["call_uuid"]})
+    try:
+        response = VobizClient(settings).search_cdrs({"call_uuid": snapshot["call_uuid"]})
+    except Exception:
+        if finish_provider_pending_if_expired(call_log, snapshot["call_uuid"]):
+            return
+        raise
     cdr = next((r for r in extract_cdr_rows(response)
                 if str(r.get("uuid") or r.get("call_uuid") or "") == snapshot["call_uuid"]), None)
     if not cdr:
+        finish_provider_pending_if_expired(call_log, snapshot["call_uuid"])
         return
     status = provider_outcome(cdr, bool(snapshot.get("answer_time")))
     if status not in TERMINAL:
+        finish_provider_pending_if_expired(call_log, snapshot["call_uuid"])
         return
     mapping, row = lock_call(call_log)
     if row.call_uuid != snapshot["call_uuid"]:
