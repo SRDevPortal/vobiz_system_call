@@ -633,6 +633,68 @@ class BrowserSafetyTests(unittest.TestCase):
         finish.assert_not_called()
         enqueue.assert_called_once_with("CALL-1")
 
+    def setup_static_hangup(self, payload, **changes):
+        self.replace(webrtc, "_valid_public_token", lambda token: token == "valid")
+        self.replace(webrtc, "_request_params", lambda: payload)
+        current = row(call_uuid="provider-uuid", **changes)
+        self.replace(frappe, "get_all", MagicMock(return_value=[current]))
+        self.replace(lifecycle, "lock_call", MagicMock(return_value=(frappe._dict(), current)))
+        self.replace(webrtc, "_append_callback_if_enabled", MagicMock())
+        self.replace(lifecycle, "enqueue_reconcile", MagicMock())
+        return self.replace(lifecycle, "finish_locked", MagicMock())
+
+    def test_static_hangup_rejects_invalid_token(self):
+        finish = self.setup_static_hangup({"CallUUID": "provider-uuid", "Event": "Hangup"})
+        self.assertEqual(webrtc.hangup("wrong").status_code, 403)
+        frappe.get_all.assert_not_called()
+        finish.assert_not_called()
+
+    def test_static_hangup_finishes_matching_parent(self):
+        finish = self.setup_static_hangup({"CallUUID": "provider-uuid", "Event": "Hangup",
+                                          "CallStatus": "completed", "token": "secret"})
+        self.assertEqual(webrtc.hangup("valid").status_code, 200)
+        self.assertEqual(finish.call_args.kwargs["status"], "Completed")
+        self.assertNotIn("token", webrtc._append_callback_if_enabled.call_args.args[2])
+
+    def test_static_hangup_ignores_progress_recording_and_missing_uuid(self):
+        for payload in ({"CallUUID": "provider-uuid", "Event": "RecordStop", "CallStatus": "completed"},
+                        {"CallUUID": "provider-uuid", "Event": "DialAnswer"},
+                        {"Event": "Hangup"},
+                        {"CallUUID": "provider-uuid", "CallStatus": "in-progress"}):
+            finish = self.setup_static_hangup(payload)
+            webrtc.hangup("valid")
+            finish.assert_not_called()
+
+    def test_static_hangup_ignores_unknown_ambiguous_or_changed_uuid(self):
+        for matches in ([], [row(), row()]):
+            finish = self.setup_static_hangup({"CallUUID": "provider-uuid", "Event": "Hangup"})
+            frappe.get_all.return_value = matches
+            webrtc.hangup("valid")
+            finish.assert_not_called()
+        finish = self.setup_static_hangup({"CallUUID": "other-uuid", "Event": "Hangup"})
+        webrtc.hangup("valid")
+        finish.assert_not_called()
+        self.db.rollback.assert_called()
+
+    def test_static_hangup_is_idempotent_and_keeps_failed_outcome(self):
+        finish = self.setup_static_hangup({"CallUUID": "provider-uuid", "Event": "Hangup"}, status="Failed")
+        release = self.replace(lifecycle, "release_locked", MagicMock())
+        webrtc.hangup("valid")
+        finish.assert_not_called()
+        release.assert_called_once()
+
+    def test_static_hangup_preserves_busy_classification(self):
+        finish = self.setup_static_hangup({"CallUUID": "provider-uuid", "Event": "Hangup",
+                                          "CallStatus": "busy"}, status="Ringing", answer_time=None)
+        webrtc.hangup("valid")
+        self.assertEqual(finish.call_args.kwargs["status"], "Busy")
+
+    def test_static_fallback_only_returns_hangup_xml(self):
+        self.replace(webrtc, "_valid_public_token", lambda token: token == "valid")
+        self.assertEqual(webrtc.fallback("wrong").status_code, 403)
+        self.assertIn("<Hangup", webrtc.fallback("valid").get_data(as_text=True))
+        self.db.set_value.assert_not_called()
+
     def test_cancel_after_delivered_terminal_event_preserves_evidence(self):
         pending = row(call_uuid="provider-uuid", call_status="browser-ended-pending-provider",
             request_json=json.dumps({"browser_terminal_event": "onCallTerminated",

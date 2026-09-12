@@ -227,6 +227,62 @@ def answer(token=None):
             return _answer_core_routed_pstn_inbound(payload)
 
 
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=600, seconds=60)
+def hangup(token=None):
+    """Application-level final callback; never route or dial from this endpoint."""
+    if not _valid_public_token(token):
+        return _plain_response("Not permitted.", 403)
+    payload = _request_params()
+    uuid = _provider_uuid(payload)
+    event = str(payload.get("Event") or payload.get("event") or "").lower()
+    state = str(payload.get("CallStatus") or payload.get("call_status") or "").lower()
+    # Recording and Dial progress callbacks do not prove the parent call ended.
+    if event not in ("", "hangup", "terminated", "oncallterminated"):
+        return _plain_response("IGNORED")
+    if event == "" and state not in ("completed", "hangup", "ended", "failed", "busy", "no-answer", "cancelled", "canceled"):
+        return _plain_response("IGNORED")
+    if not uuid:
+        return _plain_response("IGNORED")
+    matches = frappe.get_all("Vobiz Call Log", filters={"call_uuid": uuid},
+                            fields=["name", "request_json"], limit_page_length=2)
+    if len(matches) != 1 or not lifecycle.is_managed_call(matches[0]):
+        return _plain_response("IGNORED")
+    mapping, row = lifecycle.lock_call(matches[0].name)
+    if row.call_uuid != uuid:
+        frappe.db.rollback()
+        return _plain_response("IGNORED")
+    if row.status in lifecycle.TERMINAL:
+        lifecycle.release_locked(mapping, row)
+        frappe.db.commit()
+        return _plain_response("OK")
+    # Normalize the authenticated parent-call outcome without using Dial progress.
+    outcome = lifecycle.provider_outcome({
+        "status": state or "completed",
+        "hangup_cause": payload.get("HangupCause") or payload.get("hangup_cause") or "",
+    }, answered=bool(row.answer_time or _billable_seconds(payload)))
+    if outcome not in lifecycle.TERMINAL:
+        outcome = lifecycle.terminal_status(row.status, "terminated", answered=bool(row.answer_time))
+    lifecycle.finish_locked(mapping, row, "provider-hangup",
+                            str(payload.get("HangupCause") or "")[:140], status=outcome)
+    _append_callback_if_enabled(row.name, "provider-hangup", {
+        k: v for k, v in payload.items() if k not in ("token", "cmd")
+    })
+    lifecycle.enqueue_reconcile(row.name)
+    frappe.db.commit()
+    return _plain_response("OK")
+
+
+@frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
+@rate_limit(limit=600, seconds=60)
+def fallback(token=None):
+    """Fail closed if answering fails; final hangup/CDR confirms termination."""
+    if not _valid_public_token(token):
+        return _plain_response("Not permitted.", 403)
+    # Do not redial, reserve another agent, or clear a potentially active call.
+    return _xml_response(_hangup_xml())
+
+
 def browser_softphone_answer_url(settings=None):
     settings = settings or get_settings()
     query = urlencode({"token": get_inbound_callback_token(settings)})
