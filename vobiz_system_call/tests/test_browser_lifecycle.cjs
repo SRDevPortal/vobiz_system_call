@@ -32,10 +32,17 @@ function instance() {
 
     const startup = instance();
     startup.connect_browser_softphone = () => Promise.reject(new Error('login failed'));
-    let cancelled;
+    let cancelled, failureEvent, resetStartup = false;
     startup.cancel_call_log = name => {cancelled = name; return Promise.resolve();};
+    startup.sync_browser_softphone_event = (event, info, name) => {
+        failureEvent = {event, name}; return Promise.resolve();
+    };
+    startup.reset_browser_softphone_call_state = () => {resetStartup = true;};
     await assert.rejects(startup.start_browser_softphone_call({call_log: 'C2'}, {}), /login failed/);
-    assert.equal(cancelled, 'C2');
+    assert.equal(cancelled, undefined);
+    assert.equal(failureEvent.event, 'onCallFailed');
+    assert.equal(failureEvent.name, 'C2');
+    assert.equal(resetStartup, true);
 
     const pending = instance();
     pending.state.softphone.client = {client: {hangup() {}}};

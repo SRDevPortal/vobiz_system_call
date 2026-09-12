@@ -1569,6 +1569,7 @@ class VobizAgentConsole {
 		const softphone = this.state.softphone;
 		softphone.current_call_log = message.call_log;
 		softphone.sdk_call_uuid = '';
+		let dialAttempted = false;
 		return this.connect_browser_softphone().then(() => {
 			softphone.current_destination = message.destination || message.customer_number;
 			softphone.current_customer = row.title || row.name || __('Customer');
@@ -1580,10 +1581,22 @@ class VobizAgentConsole {
 			this.start_timer();
 			this.render_browser_softphone();
 			this.disable_browser_outgoing_tones();
+			dialAttempted = true;
 			softphone.client.client.call(softphone.current_destination, {});
 			return this.sync_browser_softphone_event('browserCallStarted', {}, message.call_log);
 		}).then(() => message).catch((err) => {
-			// Also covers connection rejection after the server prepared a call.
+			if (!dialAttempted) {
+				// Registration failed before invoking the SDK: no voice call was issued.
+				return Promise.resolve(this.sync_browser_softphone_event(
+					'onCallFailed', {reason: err.message || __('Softphone registration failed.')}, message.call_log
+				)).then(() => {
+					if (softphone.current_call_log === message.call_log) {
+						this.reset_browser_softphone_call_state(__('Disconnected'), message.call_log, 'Failed');
+					}
+					this.load();
+					throw err;
+				});
+			}
 			return this.cancel_call_log(message.call_log, row).then(() => { throw err; });
 		});
 	}
@@ -4969,6 +4982,7 @@ class VobizAgentConsole {
 			try {
 				if (!softphone.client || !softphone.client.client) throw new Error(__('Softphone session is unavailable.'));
 				Promise.resolve(softphone.client.client.hangup()).catch(err => {
+					if (softphone.current_call_log !== call_log) return;
 					softphone.error = err.message || __('Browser hang-up failed; awaiting provider termination.');
 					this.render_browser_softphone();
 				});

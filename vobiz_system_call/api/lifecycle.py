@@ -251,8 +251,12 @@ def reconcile_call(call_log):
     from vobiz_click_to_call.services.client import VobizClient
     from vobiz_click_to_call.services.cdr import extract_cdr_rows
     settings = get_settings()
-    if context(snapshot).get("agent_cancelled") and snapshot["status"] not in TERMINAL:
-        VobizClient(settings).hangup_call(snapshot["call_uuid"], allow_missing=True)
+    if settings.enabled and context(snapshot).get("agent_cancelled") and snapshot["status"] not in TERMINAL:
+        try:
+            VobizClient(settings).hangup_call(snapshot["call_uuid"], allow_missing=True)
+        except Exception:
+            # A failed DELETE must not prevent a terminal CDR from releasing the agent.
+            frappe.log_error(title="Vobiz cancellation retry failed", message=frappe.get_traceback())
     if not settings.enabled or not settings.enable_cdr_sync:
         finish_provider_pending_if_expired(call_log, snapshot["call_uuid"])
         return  # Retain briefly unless a browser-ended provider wait has expired.

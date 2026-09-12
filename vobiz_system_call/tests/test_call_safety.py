@@ -683,6 +683,25 @@ class BrowserSafetyTests(unittest.TestCase):
         lifecycle.reconcile_call("CALL-1")
         finish.assert_not_called()
 
+    def test_failed_cancel_retry_still_checks_terminal_cdr(self):
+        from vobiz_click_to_call.services import client, cdr, settings
+        pending = row(call_uuid="provider-uuid", call_status="cancellation-requested",
+                      request_json=json.dumps({"source": "vobiz_system_call",
+                          "call_device": "Browser Softphone", "agent_cancelled": True}))
+        self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(), pending))
+        self.replace(settings, "get_settings", lambda: frappe._dict(enabled=1, enable_cdr_sync=1))
+        provider = MagicMock()
+        provider.hangup_call.side_effect = RuntimeError("DELETE unavailable")
+        self.replace(client, "VobizClient", lambda _: provider)
+        self.replace(cdr, "extract_cdr_rows", lambda _: [{"uuid": "provider-uuid", "status": "completed"}])
+        finish = self.replace(lifecycle, "finish_locked", MagicMock())
+        self.replace(frappe, "log_error", MagicMock())
+        self.replace(frappe, "get_traceback", lambda: "DELETE unavailable")
+        lifecycle.reconcile_call("CALL-1")
+        provider.search_cdrs.assert_called_once()
+        finish.assert_called_once()
+        self.assertEqual(finish.call_args.kwargs["status"], "Completed")
+
     def test_cancel_pending_timeout_does_not_prove_termination(self):
         data = {
             "source": "vobiz_system_call",
