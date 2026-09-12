@@ -633,6 +633,44 @@ class BrowserSafetyTests(unittest.TestCase):
         finish.assert_not_called()
         enqueue.assert_called_once_with("CALL-1")
 
+    def test_cancel_after_delivered_terminal_event_preserves_evidence(self):
+        pending = row(call_uuid="provider-uuid", call_status="browser-ended-pending-provider",
+            request_json=json.dumps({"browser_terminal_event": "onCallTerminated",
+                                     "browser_terminal_at": "2026-09-08 10:00:00"}))
+        self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(), pending))
+        enqueue = self.replace(lifecycle, "enqueue_reconcile", MagicMock())
+        for _ in range(2):
+            self.assertTrue(webrtc.cancel_browser_call("CALL-1")["pending_provider"])
+        self.db.set_value.assert_not_called()
+        self.assertEqual(enqueue.call_count, 2)
+
+    def test_terminal_after_cancel_retains_recovery_and_first_timestamp(self):
+        pending = row(call_status="cancellation-requested",
+                      request_json=json.dumps({"agent_cancelled": True,
+                                               "browser_terminal_event": "hangup"}))
+        values = lifecycle.provider_pending_values(pending, "onCallTerminated", "Terminated")
+        pending.update(values)
+        data = json.loads(pending.request_json)
+        data["browser_terminal_at"] = "2026-09-08 10:00:00"
+        pending.request_json = json.dumps(data)
+        duplicate = lifecycle.provider_pending_values(pending, "onCallTerminated", "duplicate")
+        self.assertEqual(json.loads(duplicate["request_json"])["browser_terminal_at"], "2026-09-08 10:00:00")
+        self.assertTrue(lifecycle.provider_pending_expired(pending))
+        self.assertEqual(lifecycle.provider_pending_outcome(pending)[0], "Completed")
+
+    def test_live_cdr_prevents_browser_timeout_finalization(self):
+        from vobiz_click_to_call.services import cdr, client, settings
+        pending = row(call_uuid="provider-uuid", call_status="browser-ended-pending-provider",
+                      request_json=json.dumps({"browser_terminal_event": "onCallTerminated",
+                                               "browser_terminal_at": "2026-09-08 10:00:00"}))
+        self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(), pending))
+        self.replace(settings, "get_settings", lambda: frappe._dict(enabled=1, enable_cdr_sync=1))
+        self.replace(client, "VobizClient", lambda _: MagicMock())
+        self.replace(cdr, "extract_cdr_rows", lambda _: [{"uuid": "provider-uuid", "status": "in-progress"}])
+        finish = self.replace(lifecycle, "finish_locked", MagicMock())
+        lifecycle.reconcile_call("CALL-1")
+        finish.assert_not_called()
+
     def test_provider_pending_call_releases_after_cdr_timeout(self):
         from vobiz_click_to_call.services import cdr, client, settings
         data = {

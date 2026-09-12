@@ -183,12 +183,16 @@ def cancel_browser_call(call_log: str):
     if row.status in lifecycle.TERMINAL:
         frappe.db.commit()
         return {"status": row.status}
+    if lifecycle.has_browser_terminal_event(row):
+        # End Call after a delivered SDK end event is a reconciliation request.
+        # Preserve both the evidence and its original timestamp.
+        lifecycle.enqueue_reconcile(call_log)
+        frappe.db.commit()
+        return {"status": row.status, "pending_provider": True}
     uuid = row.call_uuid
     context = lifecycle.context(row)
     context["agent_cancelled"] = True
-    context["browser_terminal_event"] = "hangup"
-    context["browser_terminal_reason"] = "Agent cancelled browser call"
-    context["browser_terminal_at"] = frappe.utils.now()
+    context.setdefault("agent_cancel_requested_at", frappe.utils.now())
     frappe.db.set_value("Vobiz Call Log", call_log, "request_json", json.dumps(context))
     frappe.db.set_value("Vobiz Call Log", call_log, "call_status", "cancellation-requested")
     frappe.db.commit()

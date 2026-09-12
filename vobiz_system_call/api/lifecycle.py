@@ -157,13 +157,21 @@ def startup_expired(row):
     return frappe.utils.get_datetime(row.creation) + timedelta(seconds=STARTUP_SECONDS) < frappe.utils.now_datetime()
 
 
+def has_browser_terminal_event(row):
+    # Legacy "hangup" was also written by Cancel and is not termination evidence.
+    return context(row).get("browser_terminal_event") in {
+        "onCallTerminated", "onCallFailed", "terminated", "failed",
+    }
+
+
 def provider_pending_values(row, event, reason=""):
     data = context(row)
-    data.update({
-        "browser_terminal_event": str(event or "")[:80],
-        "browser_terminal_reason": str(reason or "")[:500],
-        "browser_terminal_at": frappe.utils.now(),
-    })
+    if not has_browser_terminal_event(row):
+        data.update({
+            "browser_terminal_event": str(event or "")[:80],
+            "browser_terminal_reason": str(reason or "")[:500],
+            "browser_terminal_at": frappe.utils.now(),
+        })
     return {
         "call_status": "browser-ended-pending-provider",
         "request_json": json.dumps(data),
@@ -175,7 +183,7 @@ def provider_pending_expired(row):
         return False
     data = context(row)
     # A cancellation request is not evidence that the voice connection ended.
-    if data.get("agent_cancelled") or row.call_status == "cancellation-requested":
+    if not has_browser_terminal_event(row):
         return False
     activity = data.get("browser_terminal_at") or row.get("modified") or row.get("creation")
     return frappe.utils.get_datetime(activity) + timedelta(seconds=PROVIDER_PENDING_SECONDS) < frappe.utils.now_datetime()
@@ -185,7 +193,7 @@ def provider_pending_outcome(row):
     data = context(row)
     event = data.get("browser_terminal_event") or ("hangup" if row.call_status == "cancellation-requested" else "terminated")
     reason = data.get("browser_terminal_reason") or "Provider final callback timeout"
-    if row.call_status == "cancellation-requested":
+    if row.call_status == "cancellation-requested" and not has_browser_terminal_event(row):
         return "Cancelled", event, reason
     return terminal_status(row.status, event, reason, bool(row.answer_time)), event, reason
 
@@ -274,7 +282,7 @@ def reconcile_call(call_log):
         return
     status = provider_outcome(cdr, bool(snapshot.get("answer_time")))
     if status not in TERMINAL:
-        finish_provider_pending_if_expired(call_log, snapshot["call_uuid"])
+        # Explicit provider activity must override elapsed local timeout.
         return
     mapping, row = lock_call(call_log)
     if row.call_uuid != snapshot["call_uuid"]:
