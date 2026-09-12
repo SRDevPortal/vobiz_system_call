@@ -9,7 +9,7 @@ from frappe import _
 from vobiz_click_to_call.api import call as core_call
 from vobiz_click_to_call.services.safety import get_working_hours_block_reason
 
-ACTIVE = ("Initiated", "Queued", "Ringing", "Customer Answered", "Connected", "In Progress")
+ACTIVE = ("Initiated", "Queued", "Agent Ringing", "Agent Answered", "Ringing", "Customer Answered", "Connected", "In Progress")
 TERMINAL = frozenset(("Completed", "Failed", "Busy", "No Answer", "Cancelled", "Canceled"))
 STARTUP_SECONDS = 45
 PROVIDER_PENDING_SECONDS = 120
@@ -174,6 +174,9 @@ def provider_pending_expired(row):
     if row.status in TERMINAL or row.call_status not in PROVIDER_PENDING_STATUSES:
         return False
     data = context(row)
+    # A cancellation request is not evidence that the voice connection ended.
+    if data.get("agent_cancelled") or row.call_status == "cancellation-requested":
+        return False
     activity = data.get("browser_terminal_at") or row.get("modified") or row.get("creation")
     return frappe.utils.get_datetime(activity) + timedelta(seconds=PROVIDER_PENDING_SECONDS) < frappe.utils.now_datetime()
 
@@ -236,7 +239,8 @@ def reconcile_call(call_log):
     """Expire unissued calls; release provider calls only after matching terminal CDR."""
     mapping, row = lock_call(call_log)
     if not row.call_uuid:
-        locally_started = row.call_status in LOCAL_BROWSER_ACTIVE_STATUSES
+        locally_started = (row.call_status in LOCAL_BROWSER_ACTIVE_STATUSES
+                           or context(row).get("agent_cancelled"))
         if row.status not in TERMINAL and not locally_started and startup_expired(row):
             finish_locked(mapping, row, "onCallFailed", "Browser startup timeout")
         frappe.db.commit()
@@ -247,6 +251,8 @@ def reconcile_call(call_log):
     from vobiz_click_to_call.services.client import VobizClient
     from vobiz_click_to_call.services.cdr import extract_cdr_rows
     settings = get_settings()
+    if context(snapshot).get("agent_cancelled") and snapshot["status"] not in TERMINAL:
+        VobizClient(settings).hangup_call(snapshot["call_uuid"], allow_missing=True)
     if not settings.enabled or not settings.enable_cdr_sync:
         finish_provider_pending_if_expired(call_log, snapshot["call_uuid"])
         return  # Retain briefly unless a browser-ended provider wait has expired.

@@ -183,10 +183,6 @@ def cancel_browser_call(call_log: str):
     if row.status in lifecycle.TERMINAL:
         frappe.db.commit()
         return {"status": row.status}
-    if not row.call_uuid:
-        result = lifecycle.finish_locked(mapping, row, "hangup", "Cancelled before provider routing")
-        frappe.db.commit()
-        return {"status": result}
     uuid = row.call_uuid
     context = lifecycle.context(row)
     context["agent_cancelled"] = True
@@ -199,7 +195,8 @@ def cancel_browser_call(call_log: str):
     from vobiz_click_to_call.services.client import VobizClient
     # On a provider error keep the reservation. A queued reconciliation may still resolve it.
     try:
-        VobizClient(get_settings()).hangup_call(uuid, allow_missing=True)
+        if uuid:
+            VobizClient(get_settings()).hangup_call(uuid, allow_missing=True)
     finally:
         lifecycle.enqueue_reconcile(call_log)
         frappe.db.commit()
@@ -337,6 +334,7 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
             or row.status in lifecycle.TERMINAL
             or (row.call_uuid and row.call_uuid != uuid)
             or (not row.call_uuid and lifecycle.startup_expired(row))
+            or lifecycle.context(row).get("agent_cancelled")
             or row.call_status in ("cancellation-requested", "browser-ended-pending-provider")):
         frappe.db.rollback()
         return _xml_response(_hangup_xml())

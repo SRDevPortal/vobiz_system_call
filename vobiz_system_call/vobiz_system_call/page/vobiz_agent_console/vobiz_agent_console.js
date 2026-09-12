@@ -4952,6 +4952,7 @@ class VobizAgentConsole {
 			if (this.is_terminal_status(call.status)) {
 				this.browser_disposition_watchers.delete(callLog);
 				this.maybe_prompt_workdesk_disposition(call);
+				this.load();
 				return;
 			}
 			if (++attempts < 60) setTimeout(check, 2000);
@@ -4964,12 +4965,28 @@ class VobizAgentConsole {
 		if (!call_log) return Promise.resolve();
 		const softphone = this.state.softphone;
 		const isBrowser = softphone.current_call_log === call_log;
-		if (isBrowser && softphone.client) {
-			try { softphone.client.client.hangup(); } catch (_) { /* Still request provider cancellation. */ }
-			softphone.in_call = false;
+		if (isBrowser) {
+			try {
+				if (!softphone.client || !softphone.client.client) throw new Error(__('Softphone session is unavailable.'));
+				Promise.resolve(softphone.client.client.hangup()).catch(err => {
+					softphone.error = err.message || __('Browser hang-up failed; awaiting provider termination.');
+					this.render_browser_softphone();
+				});
+			} catch (err) {
+				softphone.error = err.message || __('Browser hang-up failed; awaiting provider termination.');
+			}
+			softphone.status = __('Waiting for provider confirmation');
+			this.render_browser_softphone();
 		}
 		const endpoint = isBrowser ? 'vobiz_system_call.api.webrtc.cancel_browser_call' : 'vobiz_click_to_call.api.call.cancel_call';
-		return frappe.call(endpoint, { call_log }).then(() => {
+		return Promise.resolve(frappe.call(endpoint, { call_log })).catch(err => {
+			this.watch_browser_call_disposition(call_log);
+			if (isBrowser) {
+				softphone.error = __('Call could not be confirmed ended. Please retry End Call.');
+				this.render_browser_softphone();
+			}
+			throw err;
+		}).then(() => {
 			return frappe.call({
 				method: 'vobiz_click_to_call.api.call.get_call_status',
 				args: { call_log, sync_provider: 0 }
@@ -4979,7 +4996,6 @@ class VobizAgentConsole {
 			if (!this.is_terminal_status(call.status)) {
 				this.watch_browser_call_disposition(call_log);
 				if (isBrowser) {
-					this.watch_browser_call_disposition(call_log);
 					softphone.status = __('Waiting for provider confirmation');
 					this.render_browser_softphone();
 				}

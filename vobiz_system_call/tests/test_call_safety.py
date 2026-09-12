@@ -504,12 +504,15 @@ class BrowserSafetyTests(unittest.TestCase):
         finish.assert_not_called()
         enqueue.assert_called_once_with("CALL-1")
 
-    def test_cancel_without_uuid_closes_before_callback_can_route(self):
+    def test_cancel_without_uuid_retains_intent_until_confirmed(self):
         self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(), row(status="Initiated", answer_time=None)))
         finish = self.replace(lifecycle, "finish_locked", MagicMock(return_value="Cancelled"))
         result = webrtc.cancel_browser_call("CALL-1")
-        self.assertEqual(result["status"], "Cancelled")
-        finish.assert_called_once()
+        self.assertEqual(result["status"], "Initiated")
+        self.assertTrue(result["pending_provider"])
+        finish.assert_not_called()
+        writes = self.db.set_value.call_args_list
+        self.assertTrue(any(args.args[2] == "call_status" and args.args[3] == "cancellation-requested" for args in writes))
         self.db.commit.assert_called()
 
     def test_foreign_call_cannot_be_updated(self):
@@ -680,7 +683,7 @@ class BrowserSafetyTests(unittest.TestCase):
         lifecycle.reconcile_call("CALL-1")
         finish.assert_not_called()
 
-    def test_cancel_pending_provider_timeout_is_cancelled(self):
+    def test_cancel_pending_timeout_does_not_prove_termination(self):
         data = {
             "source": "vobiz_system_call",
             "call_device": "Browser Softphone",
@@ -695,8 +698,7 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(lifecycle, "lock_call", MagicMock(return_value=(frappe._dict(), pending)))
         finish = self.replace(lifecycle, "finish_locked", MagicMock(return_value="Cancelled"))
         lifecycle.finish_provider_pending_if_expired("CALL-1", "provider-uuid")
-        finish.assert_called_once()
-        self.assertEqual(finish.call_args.kwargs["status"], "Cancelled")
+        finish.assert_not_called()
 
     def test_local_browser_call_without_uuid_is_not_startup_failed(self):
         active = row(

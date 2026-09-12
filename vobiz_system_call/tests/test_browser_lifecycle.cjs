@@ -46,6 +46,19 @@ function instance() {
     assert.equal(reset, false);
     assert.equal(pending.state.softphone.status, 'Waiting for provider confirmation');
 
+    const failed = instance();
+    failed.state.softphone.client = {client: {hangup() {throw new Error('SDK unavailable');}}};
+    let requested = false, watching = false;
+    failed.watch_browser_call_disposition = () => {watching = true;};
+    ctx.frappe.call = method => {
+        if (typeof method === 'string') {requested = true; return Promise.reject(new Error('provider unavailable'));}
+        return Promise.resolve({message: {}});
+    };
+    await assert.rejects(failed.cancel_call_log('C1'), /provider unavailable/);
+    assert.equal(requested, true);
+    assert.equal(watching, true);
+    assert.match(failed.state.softphone.error, /retry End Call/);
+
     const late = instance();
     late.state.softphone.sdk_call_uuid = 'new-call';
     assert.equal(late.matches_browser_call_event({call_uuid: 'old-call'}), false);
