@@ -102,6 +102,60 @@ def browser_presence(tab_id: str, registered: int = 1):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limit(key="call_log", limit=12, seconds=60)
+def verify_browser_call(call_log: str):
+    """Recheck provider state after a browser/network interruption."""
+    _login()
+    row = frappe.get_doc("Vobiz Call Log", call_log)
+    if row.user != frappe.session.user and "System Manager" not in frappe.get_roles():
+        frappe.throw(_("Not permitted."), frappe.PermissionError)
+    if not lifecycle.is_browser_call(row):
+        frappe.throw(_("This is not a browser softphone call."))
+
+    def result(current, provider_state="unknown"):
+        return {"name": current.name, "status": current.status,
+                "provider_state": "ended" if current.status in lifecycle.TERMINAL else provider_state}
+
+    if row.status in lifecycle.TERMINAL:
+        return result(row)
+    uuid = row.call_uuid or lifecycle.browser_recovery_uuid(row)
+    if not uuid:
+        return result(row)
+    missing_id = not row.call_uuid
+    frappe.db.commit()  # Do not retain database locks/snapshots over network requests.
+    from vobiz_click_to_call.services.client import VobizClient
+
+    active = False
+    try:
+        client = VobizClient(get_settings())
+        client.timeout = 3
+        response = client.retrieve_live_call(uuid)
+        for data in (response, response.get("data")):
+            if not isinstance(data, dict):
+                continue
+            returned_uuid = str(data.get("call_uuid") or data.get("uuid") or data.get("CallUUID") or "")
+            state = str(data.get("call_status") or data.get("CallStatus") or data.get("status") or "").lower().replace("_", "-")
+            if returned_uuid == uuid and state in ("in-progress", "live", "ringing", "answered", "connected"):
+                active = not missing_id or lifecycle.verified_browser_candidate(row, data)
+    except Exception:
+        # A failed status request or "not found" is not proof of termination.
+        # A matching final CDR or server callback must confirm the outcome.
+        pass
+    if not active:
+        try:
+            lifecycle.reconcile_call(call_log, recovery_lookup=True)
+        except Exception:
+            pass  # Keep the UI in checking state; the bounded browser retry tries again.
+    frappe.db.commit()
+    current = frappe.get_doc("Vobiz Call Log", call_log)
+    current_uuid = current.call_uuid or lifecycle.browser_recovery_uuid(current)
+    if (current_uuid != uuid or current.call_uuid != row.call_uuid
+            or lifecycle.context(current).get("agent_cancelled")):
+        active = False
+    return result(current, "active" if active else "unknown")
+
+
+@frappe.whitelist(methods=["POST"])
 def get_incoming_call(caller: str, tab_id: str):
     _login()
     if lifecycle.presence(frappe.session.user) != tab_id:
@@ -143,8 +197,12 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
     sdk_uuid = _provider_uuid({"CallUUID": call_uuid})
     # SDK IDs can identify a different leg; they must never overwrite the authenticated provider ID.
     if event in TERMINAL_EVENTS:
-        if row.call_uuid:
-            frappe.db.set_value("Vobiz Call Log", call_log, lifecycle.provider_pending_values(row, event, reason))
+        if (row.call_uuid or row.get("recording_call_uuid") or sdk_uuid
+                or row.call_status in lifecycle.LOCAL_BROWSER_ACTIVE_STATUSES):
+            values = lifecycle.provider_pending_values(row, event, reason)
+            if sdk_uuid and not row.call_uuid and not row.get("recording_call_uuid"):
+                values["recording_call_uuid"] = sdk_uuid
+            frappe.db.set_value("Vobiz Call Log", call_log, values)
             lifecycle.enqueue_reconcile(call_log)
             result = row.status
         else:
@@ -181,26 +239,26 @@ def cancel_browser_call(call_log: str):
     if row.user != frappe.session.user and "System Manager" not in frappe.get_roles():
         frappe.throw(_("Not permitted."))
     if row.status in lifecycle.TERMINAL:
+        lifecycle.release_locked(mapping, row)
         frappe.db.commit()
         return {"status": row.status}
-    if lifecycle.has_browser_terminal_event(row):
-        # End Call after a delivered SDK end event is a reconciliation request.
-        # Preserve both the evidence and its original timestamp.
-        lifecycle.enqueue_reconcile(call_log)
-        frappe.db.commit()
-        return {"status": row.status, "pending_provider": True}
     uuid = row.call_uuid
     context = lifecycle.context(row)
     context["agent_cancelled"] = True
     context.setdefault("agent_cancel_requested_at", frappe.utils.now())
     frappe.db.set_value("Vobiz Call Log", call_log, "request_json", json.dumps(context))
-    frappe.db.set_value("Vobiz Call Log", call_log, "call_status", "cancellation-requested")
+    frappe.db.set_value("Vobiz Call Log", call_log, "call_status",
+                        "browser-ended-pending-provider" if lifecycle.has_browser_terminal_event(row)
+                        else "cancellation-requested")
     frappe.db.commit()
     from vobiz_click_to_call.services.client import VobizClient
     # On a provider error keep the reservation. A queued reconciliation may still resolve it.
     try:
         if uuid:
-            VobizClient(get_settings()).hangup_call(uuid, allow_missing=True)
+            client = VobizClient(get_settings())
+            if lifecycle.is_browser_call(row):
+                client.timeout = 3
+            client.hangup_call(uuid, allow_missing=True)
     finally:
         lifecycle.enqueue_reconcile(call_log)
         frappe.db.commit()

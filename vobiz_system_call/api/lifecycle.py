@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+import re
+from datetime import timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import frappe
 from frappe import _
@@ -15,7 +17,7 @@ STARTUP_SECONDS = 45
 PROVIDER_PENDING_SECONDS = 120
 PRESENCE_SECONDS = 65
 CALL_FIELDS = [
-    "name", "user", "status", "call_status", "call_uuid", "answer_time", "end_time",
+    "name", "user", "status", "call_status", "call_uuid", "recording_call_uuid", "answer_time", "end_time",
     "start_time", "creation", "reference_doctype", "reference_name", "request_json",
     "callback_token", "caller_id", "did_number", "customer_number", "direction",
     "agent_number", "normalized_customer_number", "from_number", "to_number", "modified",
@@ -123,9 +125,9 @@ def finish_locked(mapping, row, event, reason="", status=None):
         update_reference_call_metrics(row.reference_doctype, row.reference_name)
     from vobiz_ai.api.call_log import sync_linked_summaries
     sync_linked_summaries(frappe.get_doc("Vobiz Call Log", row.name))
-    if context(row).get("incoming_mobile_bridge"):
+    if is_browser_call(row) or context(row).get("incoming_mobile_bridge"):
         frappe.publish_realtime("vobiz_call_disconnected", {
-            "name": row.name, "status": result, "direction": "Incoming",
+            "name": row.name, "status": result, "direction": row.direction,
         }, user=row.user, after_commit=True)
     return result
 
@@ -179,6 +181,10 @@ def provider_pending_values(row, event, reason=""):
 
 
 def provider_pending_expired(row):
+    # Browser/SDK termination and elapsed time do not prove the customer leg ended.
+    # Keep the reservation until a provider callback or an exact final CDR arrives.
+    if is_browser_call(row):
+        return False
     if row.status in TERMINAL or row.call_status not in PROVIDER_PENDING_STATUSES:
         return False
     data = context(row)
@@ -243,12 +249,142 @@ def provider_outcome(cdr, answered=False):
         return "Completed" if answered else "No Answer"
     return None
 
-def reconcile_call(call_log):
+def find_recovery_cdr(client, snapshot):
+    """Bounded fallback when the provider ignores its call_uuid search filter."""
+    from vobiz_click_to_call.services.cdr import extract_cdr_rows
+
+    uuid = snapshot["call_uuid"]
+    response = client.search_cdrs({"call_uuid": uuid})
+    match = next((r for r in extract_cdr_rows(response)
+                  if str(r.get("uuid") or r.get("call_uuid") or "") == uuid), None)
+    if match:
+        return match
+    customer = str(snapshot.get("customer_number") or "").lstrip("+")
+    if not customer:
+        return None
+    params = {"from_number" if snapshot.get("direction") == "Incoming" else "to_number": customer,
+              "per_page": 50}
+    if snapshot.get("direction") == "Outgoing":
+        username = context(snapshot).get("endpoint_username")
+        if username:
+            params["from_number"] = username
+    for page in (1, 2):
+        response = client.search_cdrs(dict(params, page=page))
+        match = next((r for r in extract_cdr_rows(response)
+                      if str(r.get("uuid") or r.get("call_uuid") or "") == uuid), None)
+        if match:
+            return match
+        if not (response.get("pagination") or {}).get("has_next"):
+            break
+    return None
+
+
+def browser_recovery_uuid(row):
+    """An SDK candidate is not an authenticated routing ID; never promote it blindly."""
+    candidate = str(row.get("recording_call_uuid") or "")
+    if (is_browser_call(row) and row.get("direction") == "Outgoing"
+            and not row.get("call_uuid")
+            and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", candidate)):
+        return candidate
+    return None
+
+
+def provider_datetime(value):
+    """Provider REST times are UTC; Frappe stores datetimes in the site timezone."""
+    if not value:
+        return None
+    try:
+        dt = frappe.utils.get_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo(frappe.utils.get_system_timezone())).replace(tzinfo=None)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def verified_browser_candidate(snapshot, evidence):
+    """Match exact ID, browser endpoint, destination and start time before any action."""
+    uuid = browser_recovery_uuid(snapshot)
+    if not uuid or str(evidence.get("uuid") or evidence.get("call_uuid") or "") != uuid:
+        return False
+    endpoint = str(context(snapshot).get("endpoint_username") or "")
+    source = str(evidence.get("caller_id_number") or evidence.get("from") or "")
+    source = re.sub(r"^sips?:", "", source).split("@", 1)[0]
+    target = re.sub(r"\D", "", str(evidence.get("destination_number") or evidence.get("to") or ""))
+    customer = re.sub(r"\D", "", str(snapshot.get("customer_number") or ""))
+    started = provider_datetime(evidence.get("start_time") or evidence.get("session_start"))
+    if not endpoint or source != endpoint or not customer or target != customer or not started:
+        return False
+    created = frappe.utils.get_datetime(snapshot.get("creation"))
+    return abs((started - created).total_seconds()) <= STARTUP_SECONDS
+
+
+def final_provider_cdr(cdr):
+    state = str(cdr.get("status") or cdr.get("call_status") or "").lower().replace("_", "-")
+    if state in ("in-progress", "live", "ringing", "answered", "connected", "queued"):
+        return False
+    return bool(cdr.get("end_time")) or state in {
+        "completed", "hangup", "ended", "failed", "busy", "no-answer", "cancelled", "canceled",
+    }
+
+
+def reconcile_missing_browser_id(snapshot, recovery_lookup=False):
+    """Recover only a verified outbound browser leg, without changing routing identity."""
+    uuid = browser_recovery_uuid(snapshot)
+    if not uuid:
+        return
+    from vobiz_click_to_call.services.settings import get_settings
+    from vobiz_click_to_call.services.client import VobizClient
+    settings = get_settings()
+    if not settings.enabled:
+        return
+    client = VobizClient(settings)
+    client.timeout = 3
+    # Check final evidence first: an already-ended call needs no further DELETE.
+    try:
+        cdr = find_recovery_cdr(client, dict(snapshot, call_uuid=uuid))
+        if cdr and final_provider_cdr(cdr) and verified_browser_candidate(snapshot, cdr):
+            finish_reconciled_call(snapshot, cdr, missing_id=True)
+            return
+    except Exception:
+        pass  # A CDR outage must not disable the independent live hangup attempt.
+    if recovery_lookup or not context(snapshot).get("agent_cancelled"):
+        return
+    try:
+        live = client.retrieve_live_call(uuid)
+        evidence = live.get("data") if isinstance(live.get("data"), dict) else live
+        if not verified_browser_candidate(snapshot, evidence):
+            return
+        state = str(evidence.get("call_status") or evidence.get("status") or "").lower().replace("_", "-")
+        if state not in ("in-progress", "live", "ringing", "answered", "connected"):
+            return
+        mapping, current = lock_call(snapshot["name"])
+        unchanged = (browser_recovery_uuid(current) == uuid and current.status not in TERMINAL
+                     and mapping.current_call_log == current.name and context(current).get("agent_cancelled"))
+        frappe.db.commit()
+        if unchanged:
+            client.hangup_call(uuid, allow_missing=True)
+        # DELETE success/404 is not terminal proof. The scheduler checks again.
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(title="Vobiz browser fallback retry pending", message=frappe.get_traceback())
+
+
+def reconcile_call(call_log, recovery_lookup=False):
     """Expire unissued calls; release provider calls only after matching terminal CDR."""
     mapping, row = lock_call(call_log)
+    if row.status in TERMINAL:
+        release_locked(mapping, row)
+        frappe.db.commit()
+        return
     if not row.call_uuid:
+        if browser_recovery_uuid(row):
+            snapshot = dict(row)
+            frappe.db.commit()
+            return reconcile_missing_browser_id(snapshot, recovery_lookup=recovery_lookup)
         locally_started = (row.call_status in LOCAL_BROWSER_ACTIVE_STATUSES
-                           or context(row).get("agent_cancelled"))
+                           or context(row).get("agent_cancelled") or has_browser_terminal_event(row)
+                           or bool(row.get("recording_call_uuid")))
         if row.status not in TERMINAL and not locally_started and startup_expired(row):
             finish_locked(mapping, row, "onCallFailed", "Browser startup timeout")
         frappe.db.commit()
@@ -259,9 +395,13 @@ def reconcile_call(call_log):
     from vobiz_click_to_call.services.client import VobizClient
     from vobiz_click_to_call.services.cdr import extract_cdr_rows
     settings = get_settings()
-    if settings.enabled and context(snapshot).get("agent_cancelled") and snapshot["status"] not in TERMINAL:
+    if (not recovery_lookup and settings.enabled and context(snapshot).get("agent_cancelled")
+            and snapshot["status"] not in TERMINAL):
         try:
-            VobizClient(settings).hangup_call(snapshot["call_uuid"], allow_missing=True)
+            cancel_client = VobizClient(settings)
+            if is_browser_call(snapshot):
+                cancel_client.timeout = 3
+            cancel_client.hangup_call(snapshot["call_uuid"], allow_missing=True)
         except Exception:
             # A failed DELETE must not prevent a terminal CDR from releasing the agent.
             frappe.log_error(title="Vobiz cancellation retry failed", message=frappe.get_traceback())
@@ -270,27 +410,44 @@ def reconcile_call(call_log):
         return  # Retain briefly unless a browser-ended provider wait has expired.
     # Query the exact provider UUID; do not constrain incoming calls with outgoing From/To.
     try:
-        response = VobizClient(settings).search_cdrs({"call_uuid": snapshot["call_uuid"]})
+        client = VobizClient(settings)
+        if recovery_lookup or is_browser_call(snapshot):
+            client.timeout = 3
+            cdr = find_recovery_cdr(client, snapshot)
+        else:
+            response = client.search_cdrs({"call_uuid": snapshot["call_uuid"]})
+            cdr = next((r for r in extract_cdr_rows(response)
+                        if str(r.get("uuid") or r.get("call_uuid") or "") == snapshot["call_uuid"]), None)
     except Exception:
         if finish_provider_pending_if_expired(call_log, snapshot["call_uuid"]):
             return
         raise
-    cdr = next((r for r in extract_cdr_rows(response)
-                if str(r.get("uuid") or r.get("call_uuid") or "") == snapshot["call_uuid"]), None)
     if not cdr:
         finish_provider_pending_if_expired(call_log, snapshot["call_uuid"])
         return
+    if is_browser_call(snapshot) and not final_provider_cdr(cdr):
+        return
+    finish_reconciled_call(snapshot, cdr)
+
+
+def finish_reconciled_call(snapshot, cdr, missing_id=False):
     status = provider_outcome(cdr, bool(snapshot.get("answer_time")))
     if status not in TERMINAL:
         # Explicit provider activity must override elapsed local timeout.
         return
+    call_log = snapshot["name"]
     mapping, row = lock_call(call_log)
-    if row.call_uuid != snapshot["call_uuid"]:
+    if (row.call_uuid != snapshot["call_uuid"] or
+            (missing_id and browser_recovery_uuid(row) != browser_recovery_uuid(snapshot))):
         frappe.db.rollback()
         return
+    ended = provider_datetime(cdr.get("end_time"))
+    if ended and row.status not in TERMINAL:
+        row.end_time = ended
     finish_locked(mapping, row, "provider-cdr", str(cdr.get("hangup_cause") or ""), status=status)
     # CDR can enrich a final call without changing an already final outcome.
-    values = {"cdr_sync_status": "Synced", "cdr_synced_at": frappe.utils.now()}
+    values = {"cdr_sync_status": "Synced", "cdr_synced_at": frappe.utils.now(),
+              "cdr_json": json.dumps({"matched_cdr": cdr}, default=str)}
     for target, keys in {
         "duration": ("duration", "call_duration"), "billsec": ("billsec", "bill_seconds"),
         "recording_url": ("recording_url", "record_url"),

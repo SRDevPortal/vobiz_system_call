@@ -26,6 +26,7 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(frappe, "local", SimpleNamespace(flags=frappe._dict(in_test=False), request=None))
         self.replace(frappe.utils, "now", lambda: "2026-09-08 10:05:00")
         self.replace(frappe.utils, "now_datetime", lambda: datetime(2026, 9, 8, 10, 5))
+        self.replace(frappe.utils, "get_system_timezone", lambda: "Asia/Kolkata")
         self.db = self.replace(frappe, "db", MagicMock())
         self.replace(frappe, "session", SimpleNamespace(user="agent@example.test"))
         self.replace(frappe, "form_dict", {})
@@ -71,6 +72,25 @@ class BrowserSafetyTests(unittest.TestCase):
             "", candidate_users=["Administrator", "agent@example.test"], listed_only=True))
         profile.assert_called_once_with("agent@example.test")
         lock.assert_not_called()
+
+    def test_provider_completion_notifies_browser_owner_after_commit(self):
+        from vobiz_ai.api import call_log
+        self.replace(lifecycle, "release_locked", MagicMock())
+        self.replace(call_log, "sync_linked_summaries", MagicMock())
+        self.replace(frappe, "get_doc", MagicMock())
+        publish = self.replace(frappe, "publish_realtime", MagicMock())
+        for direction in ("Incoming", "Outgoing"):
+            with self.subTest(direction=direction):
+                publish.reset_mock()
+                call_row = row(direction=direction)
+                result = lifecycle.finish_locked(None, call_row, "provider-hangup", status="Completed")
+                self.assertEqual(result, "Completed")
+                publish.assert_called_once_with("vobiz_call_disconnected", {
+                    "name": "CALL-1", "status": "Completed", "direction": direction,
+                }, user="agent@example.test", after_commit=True)
+        publish.reset_mock()
+        lifecycle.finish_locked(None, row(status="Completed", direction="Outgoing"), "provider-hangup")
+        publish.assert_not_called()
 
     def test_mobile_incoming_routes_without_browser_presence_and_records_device(self):
         import json
@@ -696,6 +716,9 @@ class BrowserSafetyTests(unittest.TestCase):
         self.db.set_value.assert_not_called()
 
     def test_cancel_after_delivered_terminal_event_preserves_evidence(self):
+        from vobiz_click_to_call.services import client
+        provider = MagicMock()
+        self.replace(client, "VobizClient", lambda _: provider)
         pending = row(call_uuid="provider-uuid", call_status="browser-ended-pending-provider",
             request_json=json.dumps({"browser_terminal_event": "onCallTerminated",
                                      "browser_terminal_at": "2026-09-08 10:00:00"}))
@@ -703,7 +726,10 @@ class BrowserSafetyTests(unittest.TestCase):
         enqueue = self.replace(lifecycle, "enqueue_reconcile", MagicMock())
         for _ in range(2):
             self.assertTrue(webrtc.cancel_browser_call("CALL-1")["pending_provider"])
-        self.db.set_value.assert_not_called()
+        saved = [c.args[3] for c in self.db.set_value.call_args_list if c.args[2] == "request_json"]
+        self.assertTrue(all(json.loads(value)["browser_terminal_at"] == "2026-09-08 10:00:00" for value in saved))
+        self.assertTrue(all(json.loads(value)["agent_cancelled"] for value in saved))
+        self.assertEqual(provider.hangup_call.call_count, 2)
         self.assertEqual(enqueue.call_count, 2)
 
     def test_terminal_after_cancel_retains_recovery_and_first_timestamp(self):
@@ -733,7 +759,7 @@ class BrowserSafetyTests(unittest.TestCase):
         lifecycle.reconcile_call("CALL-1")
         finish.assert_not_called()
 
-    def test_provider_pending_call_releases_after_cdr_timeout(self):
+    def test_provider_pending_browser_call_stays_reserved_after_cdr_timeout(self):
         from vobiz_click_to_call.services import cdr, client, settings
         data = {
             "source": "vobiz_system_call",
@@ -756,8 +782,7 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(cdr, "extract_cdr_rows", lambda _: [])
         finish = self.replace(lifecycle, "finish_locked", MagicMock(return_value="Completed"))
         lifecycle.reconcile_call("CALL-1")
-        finish.assert_called_once()
-        self.assertEqual(finish.call_args.kwargs["status"], "Completed")
+        finish.assert_not_called()
 
     def test_provider_pending_call_waits_before_timeout(self):
         from vobiz_click_to_call.services import cdr, client, settings
@@ -890,6 +915,241 @@ class BrowserSafetyTests(unittest.TestCase):
         self.db.set_value.reset_mock()
         mapping.current_call_log = "NEW-CALL"
         lifecycle.release_locked(mapping, row())
+        self.db.set_value.assert_not_called()
+
+
+    def test_recovery_verification_requires_owner_or_manager(self):
+        from vobiz_click_to_call.services import client
+        self.replace(frappe, "get_doc", lambda *args: row(user="other@example.test", call_uuid="provider-uuid"))
+        self.replace(frappe, "throw", lambda message, *args: (_ for _ in ()).throw(ValueError(message)))
+        provider = self.replace(client, "VobizClient", MagicMock())
+        with self.assertRaisesRegex(ValueError, "Not permitted"):
+            webrtc.verify_browser_call("CALL-1")
+        provider.assert_not_called()
+
+    def test_recovery_verification_skips_finished_or_unissued_calls(self):
+        from vobiz_click_to_call.services import client
+        provider = self.replace(client, "VobizClient", MagicMock())
+        current = row(status="Completed", call_uuid="provider-uuid")
+        self.replace(frappe, "get_doc", lambda *args: current)
+        self.assertEqual(webrtc.verify_browser_call("CALL-1")["provider_state"], "ended")
+        current.status, current.call_uuid = "Connected", ""
+        self.assertEqual(webrtc.verify_browser_call("CALL-1")["provider_state"], "unknown")
+        provider.assert_not_called()
+
+    def test_recovery_active_requires_matching_provider_uuid(self):
+        from vobiz_click_to_call.services import client
+        current = row(call_uuid="provider-uuid")
+        self.replace(frappe, "get_doc", lambda *args: current)
+        provider = MagicMock()
+        self.replace(client, "VobizClient", lambda *args: provider)
+        reconcile = self.replace(lifecycle, "reconcile_call", MagicMock())
+        for uuid, expected in [("unrelated", "unknown"), ("provider-uuid", "active")]:
+            provider.retrieve_live_call.return_value = {"data": {"call_uuid": uuid, "call_status": "in-progress"}}
+            self.assertEqual(webrtc.verify_browser_call("CALL-1")["provider_state"], expected)
+        self.assertEqual(provider.timeout, 3)
+        reconcile.assert_called_once_with("CALL-1", recovery_lookup=True)
+
+    def test_recovery_not_found_or_provider_errors_do_not_prove_termination(self):
+        from vobiz_click_to_call.services import client
+        current = row(call_uuid="provider-uuid")
+        self.replace(frappe, "get_doc", lambda *args: current)
+        provider = MagicMock()
+        provider.retrieve_live_call.side_effect = RuntimeError("call not found")
+        self.replace(client, "VobizClient", lambda *args: provider)
+        self.replace(lifecycle, "reconcile_call", MagicMock(side_effect=RuntimeError("provider unavailable")))
+        result = webrtc.verify_browser_call("CALL-1")
+        self.assertEqual(result["provider_state"], "unknown")
+        self.assertEqual(result["status"], "Connected")
+        self.db.set_value.assert_not_called()
+
+    def test_recovery_detects_changed_uuid_during_network_lookup(self):
+        from vobiz_click_to_call.services import client
+        self.replace(frappe, "get_doc", MagicMock(side_effect=[row(call_uuid="provider-uuid"), row(call_uuid="new-uuid")]))
+        provider = MagicMock()
+        provider.retrieve_live_call.return_value = {"call_uuid": "provider-uuid", "call_status": "in-progress"}
+        self.replace(client, "VobizClient", lambda *args: provider)
+        self.assertEqual(webrtc.verify_browser_call("CALL-1")["provider_state"], "unknown")
+
+    def test_recovery_finds_exact_cdr_when_uuid_filter_is_ignored(self):
+        provider = MagicMock()
+        provider.search_cdrs.side_effect = [
+            {"data": [{"uuid": "unrelated", "end_time": "2026-09-08 10:01:00"}]},
+            {"data": [{"uuid": "provider-uuid", "end_time": "2026-09-08 10:02:00"}]},
+        ]
+        current = row(call_uuid="provider-uuid", direction="Outgoing", customer_number="+919873090386",
+                      request_json=json.dumps({"endpoint_username": "agent-endpoint"}))
+        result = lifecycle.find_recovery_cdr(provider, current)
+        self.assertEqual(result["uuid"], "provider-uuid")
+        params = provider.search_cdrs.call_args.args[0]
+        self.assertEqual(params, {"from_number": "agent-endpoint", "to_number": "919873090386", "page": 1, "per_page": 50})
+
+    def test_recovery_cdr_scan_is_bounded_and_incoming_filters_use_caller(self):
+        provider = MagicMock()
+        provider.search_cdrs.return_value = {"data": [{"uuid": "unrelated", "end_time": "2026-09-08 10:01:00"}],
+                                           "pagination": {"has_next": True}}
+        current = row(call_uuid="provider-uuid", direction="Incoming", customer_number="+919873090386")
+        self.assertIsNone(lifecycle.find_recovery_cdr(provider, current))
+        self.assertEqual(provider.search_cdrs.call_count, 3)
+        self.assertEqual(provider.search_cdrs.call_args.args[0], {"from_number": "919873090386", "page": 2, "per_page": 50})
+
+    def test_recovery_final_cdr_clears_call_even_when_hangup_callback_was_missed(self):
+        from vobiz_click_to_call.services import client, settings
+        current = row(call_uuid="provider-uuid", direction="Outgoing", customer_number="+919873090386")
+        self.replace(frappe, "get_doc", lambda *args: current)
+        self.replace(lifecycle, "lock_call", lambda *args: (frappe._dict(), current))
+        self.replace(settings, "get_settings", lambda: frappe._dict(enabled=1, enable_cdr_sync=1))
+        provider = MagicMock()
+        provider.retrieve_live_call.side_effect = RuntimeError("call not found")
+        provider.search_cdrs.return_value = {"data": [{"uuid": "provider-uuid", "end_time": "2026-09-08 10:02:00",
+                                                      "hangup_cause": "NORMAL_CLEARING", "billsec": 21}]}
+        self.replace(client, "VobizClient", lambda *args: provider)
+        def finish(mapping, record, event, reason, status):
+            record.status = status
+        self.replace(lifecycle, "finish_locked", finish)
+        result = webrtc.verify_browser_call("CALL-1")
+        self.assertEqual(result, {"name": "CALL-1", "status": "Completed", "provider_state": "ended"})
+        provider.hangup_call.assert_not_called()
+
+
+    def fallback_fixture(self, **overrides):
+        from vobiz_click_to_call.services import client, settings
+        current = row(status="Ringing", answer_time=None, direction="Outgoing",
+            call_status="cancellation-requested", customer_number="+919556979042",
+            recording_call_uuid="400bd404-2462-410f-82d3-36debe2b9023",
+            request_json=json.dumps({"source": "vobiz_system_call", "call_device": "Browser Softphone",
+                                     "endpoint_username": "agent-sip", "agent_cancelled": True}))
+        current.update(overrides)
+        mapping = row(current_call_log=current.name)
+        self.replace(lifecycle, "lock_call", lambda _: (mapping, current))
+        self.replace(frappe, "get_doc", lambda *a: current)
+        self.replace(settings, "get_settings", lambda: frappe._dict(enabled=1, enable_cdr_sync=1))
+        provider = MagicMock()
+        provider.search_cdrs.return_value = {"data": []}
+        provider.retrieve_live_call.return_value = {}
+        self.replace(client, "VobizClient", lambda _: provider)
+        self.replace(frappe, "log_error", MagicMock())
+        finish = self.replace(lifecycle, "finish_locked", MagicMock())
+        evidence = {"uuid": current.recording_call_uuid, "caller_id_number": "sip:agent-sip@registrar.vobiz.ai",
+                    "destination_number": "919556979042", "start_time": "2026-09-08T04:30:00Z",
+                    "end_time": "2026-09-08T04:30:25Z", "hangup_cause": "USER_BUSY", "billsec": 0}
+        return current, mapping, provider, finish, evidence
+
+    def test_missing_id_exact_final_cdr_recovers_kuldeep_case(self):
+        current, mapping, provider, finish, evidence = self.fallback_fixture()
+        provider.search_cdrs.return_value = {"data": [evidence]}
+        lifecycle.reconcile_call(current.name)
+        finish.assert_called_once()
+        self.assertEqual(finish.call_args.kwargs["status"], "Busy")
+        self.assertEqual(current.end_time, datetime(2026, 9, 8, 10, 0, 25))
+        self.assertFalse(current.call_uuid)  # SDK identity must not become a routing credential.
+        provider.hangup_call.assert_not_called()
+        provider.retrieve_live_call.assert_not_called()
+
+    def test_missing_id_rejects_wrong_uuid_endpoint_destination_time_and_active_cdr(self):
+        current, _, provider, finish, evidence = self.fallback_fixture()
+        for mutation in ({"uuid": "another-call"}, {"caller_id_number": "sip:other@registrar.vobiz.ai"},
+                         {"destination_number": "919111111111"}, {"start_time": "2026-09-08T04:00:00Z"},
+                         {"start_time": "invalid"}, {"status": "in-progress"}, {"end_time": None}):
+            with self.subTest(mutation=mutation):
+                provider.search_cdrs.return_value = {"data": [dict(evidence, **mutation)]}
+                lifecycle.reconcile_call(current.name)
+        finish.assert_not_called()
+        provider.hangup_call.assert_not_called()
+
+    def test_missing_id_live_verified_hangup_waits_for_final_evidence(self):
+        current, _, provider, finish, evidence = self.fallback_fixture()
+        provider.retrieve_live_call.return_value = {
+            "call_uuid": evidence["uuid"], "from": evidence["caller_id_number"],
+            "to": evidence["destination_number"], "session_start": evidence["start_time"],
+            "call_status": "in-progress"}
+        lifecycle.reconcile_call(current.name)
+        provider.hangup_call.assert_called_once_with(evidence["uuid"], allow_missing=True)
+        finish.assert_not_called()
+        # A later exact final CDR, not the successful DELETE, closes the reservation.
+        provider.search_cdrs.return_value = {"data": [evidence]}
+        lifecycle.reconcile_call(current.name)
+        finish.assert_called_once()
+
+    def test_missing_id_live_wrong_party_and_newer_mapping_never_hung_up(self):
+        current, mapping, provider, finish, evidence = self.fallback_fixture()
+        provider.retrieve_live_call.return_value = dict(evidence, end_time=None, call_status="in-progress",
+                                                       caller_id_number="sip:other@registrar.vobiz.ai")
+        lifecycle.reconcile_call(current.name)
+        provider.retrieve_live_call.return_value = dict(evidence, end_time=None, call_status="in-progress")
+        mapping.current_call_log = "NEW-CALL"
+        lifecycle.reconcile_call(current.name)
+        provider.hangup_call.assert_not_called()
+        finish.assert_not_called()
+
+    def test_missing_id_outage_and_404_keep_reserved_then_retry_recovers(self):
+        current, _, provider, finish, evidence = self.fallback_fixture()
+        provider.search_cdrs.side_effect = RuntimeError("network down")
+        provider.retrieve_live_call.side_effect = RuntimeError("call not found")
+        lifecycle.reconcile_call(current.name)
+        finish.assert_not_called()
+        provider.search_cdrs.side_effect = None
+        provider.search_cdrs.return_value = {"data": [evidence]}
+        lifecycle.reconcile_call(current.name)
+        finish.assert_called_once()
+
+    def test_missing_id_read_only_verification_never_hangs_up_live_call(self):
+        current, _, provider, finish, evidence = self.fallback_fixture()
+        provider.retrieve_live_call.return_value = dict(evidence, call_status="in-progress")
+        self.assertEqual(webrtc.verify_browser_call(current.name)["provider_state"], "unknown")
+        provider.hangup_call.assert_not_called()
+        finish.assert_not_called()
+
+    def test_missing_id_verified_live_call_can_resume_after_network_recovery(self):
+        current, _, provider, finish, evidence = self.fallback_fixture()
+        data = lifecycle.context(current)
+        data.pop("agent_cancelled")
+        current.request_json = json.dumps(data)
+        provider.retrieve_live_call.return_value = dict(evidence, call_status="in-progress", end_time=None)
+        self.assertEqual(webrtc.verify_browser_call(current.name)["provider_state"], "active")
+        provider.hangup_call.assert_not_called()
+        finish.assert_not_called()
+
+    def test_missing_id_changed_candidate_or_authenticated_id_blocks_stale_cdr(self):
+        current, _, _, finish, evidence = self.fallback_fixture()
+        snapshot = dict(current)
+        current.recording_call_uuid = "500bd404-2462-410f-82d3-36debe2b9023"
+        lifecycle.finish_reconciled_call(snapshot, evidence, missing_id=True)
+        current.recording_call_uuid = snapshot["recording_call_uuid"]
+        current.call_uuid = "authenticated-other-leg"
+        lifecycle.finish_reconciled_call(snapshot, evidence, missing_id=True)
+        finish.assert_not_called()
+
+    def test_missing_id_fallback_excludes_mobile_and_incoming_legs(self):
+        current, _, provider, finish, _ = self.fallback_fixture()
+        current.direction = "Incoming"
+        lifecycle.reconcile_call(current.name)
+        current.direction = "Outgoing"
+        current.request_json = json.dumps({"source": "vobiz_system_call", "call_device": "Mobile Bridge",
+                                          "agent_cancelled": True})
+        lifecycle.reconcile_call(current.name)
+        provider.search_cdrs.assert_not_called()
+        provider.hangup_call.assert_not_called()
+        finish.assert_not_called()
+
+    def test_terminal_sdk_event_retains_candidate_and_waits_for_provider(self):
+        current, _, _, finish, _ = self.fallback_fixture(recording_call_uuid="", call_status="browserCallStarted")
+        self.replace(lifecycle, "enqueue_reconcile", MagicMock())
+        webrtc.update_browser_softphone_call(current.name, "onCallFailed", reason="Unavailable",
+                                            call_uuid="400bd404-2462-410f-82d3-36debe2b9023")
+        values = self.db.set_value.call_args.args[2]
+        self.assertEqual(values["recording_call_uuid"], "400bd404-2462-410f-82d3-36debe2b9023")
+        current.update(values)
+        self.assertFalse(lifecycle.provider_pending_expired(current))
+        finish.assert_not_called()
+
+    def test_sdk_candidate_is_available_under_the_call_lock(self):
+        self.assertIn("recording_call_uuid", lifecycle.CALL_FIELDS)
+
+    def test_final_old_call_cannot_release_newer_agent_reservation(self):
+        current = row(status="Completed")
+        mapping = row(current_call_log="NEW-CALL")
+        lifecycle.release_locked(mapping, current)
         self.db.set_value.assert_not_called()
 
 

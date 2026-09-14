@@ -23,6 +23,7 @@ frappe.pages['vobiz-agent-console'].on_page_hide = function(wrapper) {
 
 const VOBIZ_WHATSAPP_PAGE_SIZE = 30;
 const VOBIZ_AGENT_IDLE_MS = 5 * 60 * 1000;
+const VOBIZ_NETWORK_RECOVERY_MS = 30000;
 const VOBIZ_MISSED_CALL_SEEN_KEY = 'vobiz_agent_console_missed_call_seen';
 
 class VobizAgentConsole {
@@ -700,7 +701,9 @@ class VobizAgentConsole {
 		if (!enabledMode) return;
 
 		let dotClass = 'vobiz-softphone-dot';
-		if (softphone.in_call) {
+		if (this.browser_softphone_reconnecting()) {
+			dotClass += ' connecting';
+		} else if (softphone.in_call) {
 			dotClass += ' in-call';
 		} else if (softphone.registered) {
 			dotClass += ' online';
@@ -712,7 +715,7 @@ class VobizAgentConsole {
 		this.page.main.find('[data-role="softphone-dot"]').attr('class', dotClass);
 
 		const missing = (config.missing || []).join(', ');
-		const status = softphone.error || (missing ? __('Missing: {0}', [missing]) : softphone.status || __('Not Connected'));
+		const status = this.browser_softphone_network_message() || softphone.error || (missing ? __('Missing: {0}', [missing]) : softphone.status || __('Not Connected'));
 		this.page.main.find('[data-role="softphone-status"]').text(status);
 		this.page.main.find('[data-role="softphone-endpoint"]').text(config.endpoint_uri || config.username || '');
 		this.page.main.find('[data-role="softphone-answer-url"]').text(config.answer_url ? __('Answer URL ready') : '');
@@ -733,9 +736,9 @@ class VobizAgentConsole {
 		const config = softphone.config || {};
 		const title = softphone.current_customer || __('Customer');
 		const destination = softphone.current_destination || '';
-		const status = softphone.error || softphone.status || __('Calling');
+		const status = this.browser_softphone_network_message() || softphone.error || softphone.status || __('Calling');
 		const headsetState = softphone.media_granted ? __('Headset active') : __('Headset ready');
-		const audioState = softphone.in_call ? __('Browser audio active') : __('Browser audio ready');
+		const audioState = this.browser_softphone_reconnecting() ? __('Checking audio connection') : (softphone.in_call ? __('Browser audio active') : __('Browser audio ready'));
 		const micState = softphone.muted ? __('Mic muted') : __('Mic live');
 		const duration = this.browser_softphone_duration_label();
 		const direction = softphone.direction || (softphone.incoming_call_uuid || softphone.incoming_caller ? __('Incoming') : __('Outgoing'));
@@ -1042,6 +1045,9 @@ class VobizAgentConsole {
 	connect_browser_softphone(options = {}) {
 		const softphone = this.state.softphone;
 		const config = softphone.config || {};
+		if (softphone.client && (this.browser_softphone_reconnecting() || softphone.pending_end_call)) {
+			return Promise.reject(new Error(__('Softphone is reconnecting. Please wait.')));
+		}
 		if (softphone.registered) return Promise.resolve();
 		if (softphone.register_promise) return softphone.register_promise;
 		if (!config.call_device && softphone.config_promise) {
@@ -1092,7 +1098,7 @@ class VobizAgentConsole {
 		const on = (event, handler) => client.on(event, (...args) => {
 			if (this.state.softphone.client === vobiz) handler(args.length > 1 ? args : args[0]);
 		});
-		on('onWebrtcNotSupported', () => this.browser_softphone_failed(__('WebRTC is not supported in this browser.')));
+			on('onWebrtcNotSupported', () => this.browser_softphone_failed(__('WebRTC is not supported in this browser.')));
 		on('onLogin', () => {
 			const softphone = this.state.softphone;
 			softphone.registering = false;
@@ -1100,22 +1106,25 @@ class VobizAgentConsole {
 			softphone.status = __('Registered');
 			softphone.error = '';
 			this.render_browser_softphone();
-			this.send_browser_presence().then(() => {
-				if (this.state.softphone.client !== vobiz) return;
-				clearInterval(this.browser_presence_timer);
-				this.browser_presence_timer = setInterval(() => {
-					this.send_browser_presence().catch((err) => {
-						softphone.error = err.message || __('Browser registration expired.');
-						this.disconnect_browser_softphone();
-					});
-				}, 25000);
-				if (softphone.resolve_register) softphone.resolve_register();
-			}).catch((err) => {
-				if (softphone.reject_register) softphone.reject_register(err);
-			});
+			this.start_browser_network_monitor(vobiz);
+			// Presence was claimed before SDK login. A later transport failure must
+			// not log out the SDK: logout also terminates its active call.
+			if (softphone.resolve_register) softphone.resolve_register();
+		});
+		on('onConnectionChange', (info) => {
+			if (!info || !['connected', 'disconnected'].includes(info.state)) return;
+			this.set_browser_network_issue('signaling', info.state === 'disconnected');
+			if (info.state === 'connected') this.check_browser_network(vobiz, true);
+		});
+		on('onMediaConnected', (callInfo) => {
+			if (!this.matches_browser_call_event(callInfo)) return;
+			this.set_browser_network_issue('media', false);
+			this.attach_browser_softphone_audio();
+			this.enable_browser_softphone_audio();
 		});
 		on('onLoginFailed', (reason) => this.browser_softphone_failed(reason || __('Softphone login failed.')));
 		on('onLogout', () => {
+			this.stop_browser_network_monitor();
 			this.stop_browser_softphone_audio();
 			const softphone = this.state.softphone;
 			softphone.registering = false;
@@ -1278,6 +1287,7 @@ class VobizAgentConsole {
 		if (!this.matches_browser_call_event(callInfo)) return;
 		const callLog = softphone.current_call_log;
 		if (!callLog) return;
+		this.set_browser_network_issue('media', false);
 		this.sync_browser_softphone_event(event, callInfo, callLog).then(() => {
 			this.watch_browser_call_disposition(callLog);
 			if (softphone.current_call_log !== callLog) return;
@@ -1303,7 +1313,7 @@ class VobizAgentConsole {
 
 	disconnect_browser_softphone() {
 		const softphone = this.state.softphone;
-		clearInterval(this.browser_presence_timer);
+		this.stop_browser_network_monitor();
 		this.send_browser_presence(false).catch(() => {});
 		const client = softphone.client;
 		softphone.client = null;
@@ -1313,9 +1323,179 @@ class VobizAgentConsole {
 	}
 
 	send_browser_presence(registered = true) {
-		return frappe.call({
+		const request = frappe.call({
 			method: 'vobiz_system_call.api.webrtc.browser_presence',
-			args: { tab_id: this.attendance_tab_id, registered: registered ? 1 : 0 }
+			args: { tab_id: this.attendance_tab_id, registered: registered ? 1 : 0 },
+			silent: true
+		});
+		return this.browser_request_with_timeout(request);
+	}
+
+	browser_request_with_timeout(request, timeoutMs = 8000) {
+		// Frappe's call wrapper does not forward a timeout option to jQuery.
+		return new Promise((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				reject(new Error(__('Server request timed out.')));
+				if (request && typeof request.abort === 'function') request.abort();
+			}, timeoutMs);
+			Promise.resolve(request).then(resolve, reject).finally(() => clearTimeout(timeout));
+		});
+	}
+
+	browser_softphone_reconnecting() {
+		const softphone = this.state.softphone;
+		return Object.keys(softphone.network_issues || {}).length > 0
+			|| Boolean(softphone.recovery_verification && softphone.recovery_verification.call_log === softphone.current_call_log);
+	}
+
+	browser_softphone_network_message() {
+		const softphone = this.state.softphone;
+		if (softphone.pending_end_call) return __('Ending call—waiting for connection and provider confirmation');
+		if (!this.browser_softphone_reconnecting()) return '';
+		const issues = softphone.network_issues || {};
+		if (issues.offline !== undefined || issues.media !== undefined || issues.signaling !== undefined) return __('Network issue—reconnecting…');
+		if (issues.server !== undefined) return __('Server connection interrupted—retrying…');
+		return __('Connection restored—checking call status…');
+	}
+
+	set_browser_network_issue(source, failed) {
+		const softphone = this.state.softphone;
+		const issues = softphone.network_issues || (softphone.network_issues = {});
+		const hadIssue = issues[source] !== undefined;
+		if (failed && !hadIssue) {
+			issues[source] = Date.now();
+			if (softphone.current_call_log) {
+				// Reconnection is not evidence that the customer call survived.
+				softphone.recovery_verification = {call_log: softphone.current_call_log};
+			}
+		}
+		if (!failed) delete issues[source];
+		if (!failed && hadIssue && softphone.recovery_verification) softphone.recovery_verification.next_check_at = 0;
+		if (hadIssue !== failed) {
+			this.render_browser_softphone();
+			this.render_workdesk_live_call();
+		}
+	}
+
+	start_browser_network_monitor(vobiz) {
+		this.stop_browser_network_monitor();
+		this.browser_network_listener = () => this.check_browser_network(vobiz, true);
+		window.addEventListener('offline', this.browser_network_listener);
+		window.addEventListener('online', this.browser_network_listener);
+		this.browser_presence_timer = setInterval(() => this.check_browser_network(vobiz), 3000);
+		this.check_browser_network(vobiz, true);
+	}
+
+	stop_browser_network_monitor() {
+		clearInterval(this.browser_presence_timer);
+		if (this.browser_network_listener) {
+			window.removeEventListener('offline', this.browser_network_listener);
+			window.removeEventListener('online', this.browser_network_listener);
+			this.browser_network_listener = null;
+		}
+		this.browser_presence_check = null;
+		this.browser_presence_checked_at = 0;
+		this.state.softphone.network_issues = {};
+	}
+
+	check_browser_network(vobiz, force = false) {
+		const softphone = this.state.softphone;
+		if (softphone.client !== vobiz) return;
+		const sdk = vobiz.client;
+		const offline = window.navigator && window.navigator.onLine === false;
+		this.set_browser_network_issue('offline', Boolean(offline));
+		try {
+			if (typeof sdk.isConnected === 'function') this.set_browser_network_issue('signaling', !sdk.isConnected());
+			// Use the SDK's public accessor only. Its own reconnect/re-INVITE logic
+			// owns ICE recovery; competing negotiations can destroy the SIP call.
+			const sameCall = softphone.current_call_log && softphone.sdk_call_uuid
+				&& typeof sdk.getCallUUID === 'function' && sdk.getCallUUID() === softphone.sdk_call_uuid;
+			const pc = sameCall && typeof sdk.getPeerConnection === 'function' && (sdk.getPeerConnection() || {}).pc;
+			softphone.recovery_media_connected = Boolean(pc && ['connected', 'completed'].includes(pc.iceConnectionState));
+			if (pc) {
+				if (['disconnected', 'failed', 'closed'].includes(pc.iceConnectionState)) this.set_browser_network_issue('media', true);
+				if (['connected', 'completed'].includes(pc.iceConnectionState)) this.set_browser_network_issue('media', false);
+			}
+		} catch (_) {} // A session may end between the SDK accessors.
+		const issues = softphone.network_issues || {};
+		const mediaLostAt = Math.min(...['offline', 'media'].filter(key => issues[key] !== undefined).map(key => issues[key]));
+		if (softphone.current_call_log && Date.now() - mediaLostAt >= VOBIZ_NETWORK_RECOVERY_MS
+			&& !softphone.pending_end_call) {
+			// A server-only failure must never end healthy audio. Only sustained
+			// browser/media loss exhausts this grace period.
+			this.cancel_call_log(softphone.current_call_log).catch(() => {});
+		}
+		if (offline) return;
+		if (softphone.pending_end_call && !this.browser_end_retry) {
+			const callLog = softphone.pending_end_call;
+			if (callLog === softphone.current_call_log) {
+				const retry = {};
+				this.browser_end_retry = retry;
+				this.cancel_call_log(callLog).catch(() => {}).finally(() => {
+					if (this.browser_end_retry === retry) this.browser_end_retry = null;
+				});
+			}
+		}
+		if (this.browser_presence_check || (!force && !this.browser_softphone_reconnecting()
+			&& Date.now() - this.browser_presence_checked_at < 25000)) return;
+		const check = {};
+		this.browser_presence_check = check;
+		return this.send_browser_presence().then(() => {
+			if (softphone.client !== vobiz || this.browser_presence_check !== check) return;
+			this.set_browser_network_issue('server', false);
+			if (softphone.recovery_verification) return this.verify_recovered_browser_call(vobiz);
+			return this.refresh_browser_softphone_call(this.state.active_call || {});
+		}).catch(err => {
+			if (softphone.client !== vobiz || this.browser_presence_check !== check) return;
+			const status = Number(err && err.status);
+			if ([401, 403, 417].includes(status)) {
+				// Authentication, permissions and tab-ownership rejection are not
+				// temporary network failures. Keep the existing enforcement.
+				softphone.error = __('Browser registration was rejected. Please sign in again or close the other calling tab.');
+				this.disconnect_browser_softphone();
+				return;
+			}
+			this.set_browser_network_issue('server', true);
+		}).finally(() => {
+			if (this.browser_presence_check === check) {
+				this.browser_presence_check = null;
+				this.browser_presence_checked_at = Date.now();
+			}
+		});
+	}
+
+	verify_recovered_browser_call(vobiz) {
+		const softphone = this.state.softphone;
+		const verification = softphone.recovery_verification;
+		const callLog = softphone.current_call_log;
+		if (!verification || verification.call_log !== callLog || softphone.client !== vobiz) return Promise.resolve();
+		if (this.browser_recovery_check || Date.now() < (verification.next_check_at || 0)) return Promise.resolve();
+		const check = {};
+		this.browser_recovery_check = check;
+		return this.browser_request_with_timeout(frappe.call({
+			method: 'vobiz_system_call.api.webrtc.verify_browser_call',
+			args: {call_log: callLog}, silent: true
+		}), 15000).then(r => {
+			if (softphone.client !== vobiz || softphone.current_call_log !== callLog) return;
+			const call = r.message || {};
+			if (call.name !== callLog) return;
+			if (this.is_terminal_status(call.status)) {
+				this.reconcile_browser_softphone_call(call);
+				this.load();
+			} else if (call.provider_state === 'active' && softphone.recovery_verification === verification
+				&& Object.keys(softphone.network_issues || {}).length === 0 && !softphone.pending_end_call
+				&& (!softphone.in_call || softphone.recovery_media_connected)) {
+				softphone.recovery_verification = null;
+				this.attach_browser_softphone_audio();
+				this.enable_browser_softphone_audio();
+				this.render_browser_softphone();
+				this.render_workdesk_live_call();
+			}
+		}).catch(() => {
+			// A failed verification stays visibly pending, never "In Call".
+		}).finally(() => {
+			verification.next_check_at = Date.now() + 10000;
+			if (this.browser_recovery_check === check) this.browser_recovery_check = null;
 		});
 	}
 
@@ -1358,9 +1538,56 @@ class VobizAgentConsole {
 		return this.confirm_end_call(callLog, this.state.softphone.current_customer);
 	}
 
+	reconcile_browser_softphone_call(call = {}) {
+		const softphone = this.state.softphone;
+		if (!call.name || !this.is_terminal_status(call.status) || softphone.current_call_log !== call.name) return false;
+		const sdk = softphone.client && softphone.client.client;
+		let matchingSession = false;
+		try {
+			matchingSession = Boolean(sdk && softphone.sdk_call_uuid && typeof sdk.getCallUUID === 'function'
+				&& sdk.getCallUUID() === softphone.sdk_call_uuid);
+		} catch (_) {}
+		// Clear the matching UI before SDK cleanup, which may emit another end event.
+		softphone.error = '';
+		if ((this.state.active_call || {}).name === call.name) {
+			this.state.active_call = { last_call: Object.assign({}, this.state.active_call, call) };
+		}
+		this.reset_browser_softphone_call_state(
+			softphone.registered ? __('Registered') : __('Disconnected'), call.name, call.status
+		);
+		if (matchingSession) {
+			try { Promise.resolve(sdk.hangup()).catch(() => {}); } catch (_) {}
+		}
+		return true;
+	}
+
+	refresh_browser_softphone_call(active = {}) {
+		const callLog = this.state.softphone.current_call_log;
+		if (!callLog) return Promise.resolve();
+		const call = active.name === callLog ? active : active.last_call;
+		if (call && call.name === callLog) {
+			this.reconcile_browser_softphone_call(call);
+			return Promise.resolve();
+		}
+		// The console may omit a finished call; absence alone is not termination evidence.
+		if (this.browser_status_in_flight) return this.browser_status_in_flight;
+		this.browser_status_in_flight = Promise.resolve(frappe.call({
+			method: 'vobiz_click_to_call.api.call.get_call_status',
+			args: { call_log: callLog, sync_provider: 0 }
+		})).then(r => {
+			const current = r.message || {};
+			if (current.name === callLog) this.reconcile_browser_softphone_call(current);
+		}).catch(() => {}).finally(() => { this.browser_status_in_flight = null; });
+		return this.browser_status_in_flight;
+	}
+
 	reset_browser_softphone_call_state(status, callLog, terminalStatus) {
+		if (callLog && this.state.softphone.current_call_log !== callLog) return;
 		this.stop_browser_softphone_audio();
 		const softphone = this.state.softphone;
+		softphone.pending_end_call = '';
+		softphone.recovery_verification = null;
+		this.set_browser_network_issue('media', false);
 		softphone.in_call = false;
 		softphone.muted = false;
 		softphone.current_destination = '';
@@ -1385,6 +1612,7 @@ class VobizAgentConsole {
 		this.render_queue();
 		this.render_workdesk_live_call();
 		this.update_workdesk_primary_action(this.state.active_workdesk_row);
+		this.render_active_call(true);
 	}
 
 	toggle_browser_softphone_mute() {
@@ -1627,6 +1855,7 @@ class VobizAgentConsole {
 			this.prune_selected_queue_keys();
 			this.reset_filter_group_if_doctype_changed();
 			this.state.active_call = data.active_call || null;
+			this.refresh_browser_softphone_call(data.active_call || {});
 			this.state.dispositions = data.dispositions || [];
 			this.state.patient_followup_status_options = data.patient_followup_status_options || [];
 			this.state.ai_disposition_enabled = Boolean(data.ai_disposition_enabled);
@@ -1680,7 +1909,7 @@ class VobizAgentConsole {
 		this.poller = setInterval(() => this.load(), 30000);
 		$(window).one('beforeunload', () => {
 			clearInterval(this.poller);
-			clearInterval(this.browser_presence_timer);
+			this.stop_browser_network_monitor();
 			clearInterval(this.timer);
 			clearTimeout(this.search_timer);
 			clearTimeout(this.idle_timer);
@@ -2792,6 +3021,7 @@ class VobizAgentConsole {
 	}
 
 	handle_call_disconnected(payload = {}) {
+		this.reconcile_browser_softphone_call(payload);
 		if (payload.name && payload.direction === 'Incoming' && this.is_terminal_status(payload.status)) {
 			this.watch_browser_call_disposition(payload.name);
 		}
@@ -3207,6 +3437,8 @@ class VobizAgentConsole {
 		}
 
 		const steps = this.live_call_steps(call);
+		const networkMessage = this.state.softphone.current_call_log === call.name
+			? this.browser_softphone_network_message() : '';
 		const details = [
 			call.dial_status ? __('Dial: {0}', [call.dial_status]) : '',
 			call.hangup_cause ? __('Hangup: {0}', [call.hangup_cause]) : '',
@@ -3217,7 +3449,7 @@ class VobizAgentConsole {
 			<div class="vobiz-live-call">
 				<div class="vobiz-live-call-head">
 					<strong>${__('Live Call')}</strong>
-					<span class="vobiz-live-pill">${frappe.utils.escape_html(call.status || __('Active'))}</span>
+					<span class="vobiz-live-pill">${frappe.utils.escape_html(networkMessage || call.status || __('Active'))}</span>
 				</div>
 				${this.workdesk_phone_surface_html(call)}
 				<div class="vobiz-live-steps">
@@ -3240,7 +3472,9 @@ class VobizAgentConsole {
 		const title = call.reference_title || call.reference_name || __('Customer');
 		const number = call.customer_number_display || call.customer_number || call.to_number || '';
 		const agent = call.agent_mobile_display || call.user_mobile || call.from_number || '';
-		const status = call.status || __('Calling');
+		const networkMessage = this.state.softphone.current_call_log === call.name
+			? this.browser_softphone_network_message() : '';
+		const status = networkMessage || call.status || __('Calling');
 		const isBrowser = ((this.state.softphone || {}).current_call_log === call.name) || call.call_device === 'Browser Softphone';
 		return `
 			<div class="vobiz-live-phone">
@@ -3250,8 +3484,8 @@ class VobizAgentConsole {
 					<div class="vobiz-live-phone-number">${frappe.utils.escape_html(number || __('No phone'))}</div>
 					<div class="vobiz-softphone-live-chips">
 						<span class="vobiz-softphone-chip ok"><i class="fa fa-plug"></i> ${frappe.utils.escape_html(status)}</span>
-						<span class="vobiz-softphone-chip ok"><i class="fa fa-headphones"></i> ${isBrowser ? __('Browser connected') : __('System calling')}</span>
-						<span class="vobiz-softphone-chip ok"><i class="fa fa-volume-up"></i> ${__('Audio active')}<span class="vobiz-softphone-wave"><span></span><span></span><span></span></span></span>
+						<span class="vobiz-softphone-chip ok"><i class="fa fa-headphones"></i> ${networkMessage ? __('Checking connection') : (isBrowser ? __('Browser connected') : __('System calling'))}</span>
+						<span class="vobiz-softphone-chip ok"><i class="fa fa-volume-up"></i> ${networkMessage ? __('Checking audio connection') : __('Audio active')}<span class="vobiz-softphone-wave"><span></span><span></span><span></span></span></span>
 						${agent ? `<span class="vobiz-softphone-chip"><i class="fa fa-user"></i> ${frappe.utils.escape_html(agent)}</span>` : ''}
 					</div>
 				</div>
@@ -3303,7 +3537,9 @@ class VobizAgentConsole {
 			args: { call_log: callLog, sync_provider: 0 }
 		}).then((r) => {
 			const call = r.message || {};
+			if (this.state.workdesk_live_call_log !== callLog) return;
 			if (call.name) {
+				this.reconcile_browser_softphone_call(call);
 				this.state.workdesk_live_call = call;
 				if ((this.state.active_call || {}).name === call.name) {
 					this.state.active_call = this.is_terminal_status(call.status) ? { last_call: call } : call;
@@ -4964,6 +5200,9 @@ class VobizAgentConsole {
 			const call = r.message || {};
 			if (this.is_terminal_status(call.status)) {
 				this.browser_disposition_watchers.delete(callLog);
+				const currentCall = this.state.softphone.current_call_log || (this.state.active_call || {}).name;
+				if (call.name !== callLog || (currentCall && currentCall !== callLog)) return;
+				if (call.name === callLog) this.reconcile_browser_softphone_call(call);
 				this.maybe_prompt_workdesk_disposition(call);
 				this.load();
 				return;
@@ -4976,12 +5215,25 @@ class VobizAgentConsole {
 
 	cancel_call_log(call_log, row) {
 		if (!call_log) return Promise.resolve();
+		// Online events and the retry timer can arrive during a slow Stop request.
+		const requests = this.browser_cancel_requests || (this.browser_cancel_requests = new Map());
+		if (requests.has(call_log)) return requests.get(call_log);
+		const request = this.cancel_call_log_request(call_log, row).finally(() => requests.delete(call_log));
+		requests.set(call_log, request);
+		return request;
+	}
+
+	cancel_call_log_request(call_log, row) {
 		const softphone = this.state.softphone;
 		const isBrowser = softphone.current_call_log === call_log;
 		if (isBrowser) {
+			if (this.browser_softphone_reconnecting()) softphone.pending_end_call = call_log;
 			try {
 				if (!softphone.client || !softphone.client.client) throw new Error(__('Softphone session is unavailable.'));
-				Promise.resolve(softphone.client.client.hangup()).catch(err => {
+				const sdk = softphone.client.client;
+				const sameSession = typeof sdk.getCallUUID !== 'function' ||
+					(softphone.sdk_call_uuid && sdk.getCallUUID() === softphone.sdk_call_uuid);
+				Promise.resolve(sameSession ? sdk.hangup() : undefined).catch(err => {
 					if (softphone.current_call_log !== call_log) return;
 					softphone.error = err.message || __('Browser hang-up failed; awaiting provider termination.');
 					this.render_browser_softphone();
@@ -4993,20 +5245,18 @@ class VobizAgentConsole {
 			this.render_browser_softphone();
 		}
 		const endpoint = isBrowser ? 'vobiz_system_call.api.webrtc.cancel_browser_call' : 'vobiz_click_to_call.api.call.cancel_call';
-		return Promise.resolve(frappe.call(endpoint, { call_log })).catch(err => {
-			this.watch_browser_call_disposition(call_log);
-			if (isBrowser) {
-				softphone.error = __('Call could not be confirmed ended. Please retry End Call.');
-				this.render_browser_softphone();
-			}
-			throw err;
-		}).then(() => {
-			return frappe.call({
+		const request = frappe.call(endpoint, { call_log });
+		return (isBrowser ? this.browser_request_with_timeout(request) : Promise.resolve(request)).then(() => {
+			const statusRequest = frappe.call({
 				method: 'vobiz_click_to_call.api.call.get_call_status',
 				args: { call_log, sync_provider: 0 }
 			});
+			return isBrowser ? this.browser_request_with_timeout(statusRequest) : statusRequest;
 		}).then((r) => {
 			const call = r.message || { name: call_log };
+			if (isBrowser && softphone.current_call_log !== call_log) return call;
+			const currentCall = softphone.current_call_log || (this.state.active_call || {}).name;
+			if (currentCall && currentCall !== call_log) return call;
 			if (!this.is_terminal_status(call.status)) {
 				this.watch_browser_call_disposition(call_log);
 				if (isBrowser) {
@@ -5016,9 +5266,7 @@ class VobizAgentConsole {
 				this.load();
 				return call;
 			}
-			if (isBrowser) this.reset_browser_softphone_call_state(
-				softphone.registered ? __('Registered') : __('Disconnected'), call_log, call.status
-			);
+			if (isBrowser) this.reconcile_browser_softphone_call(call);
 			if (this.state.workdesk_live_call_log === call_log) {
 				this.clear_tracked_live_call(call_log);
 			}
@@ -5032,6 +5280,16 @@ class VobizAgentConsole {
 			}
 			frappe.show_alert({ message: __('Call stopped.'), indicator: 'orange' });
 			this.load();
+		}).catch(err => {
+			this.watch_browser_call_disposition(call_log);
+			if (isBrowser && softphone.current_call_log === call_log) {
+				const status = Number(err && err.status) || 0;
+				if (status === 0 || status >= 500) softphone.pending_end_call = call_log;
+				else softphone.pending_end_call = '';
+				softphone.error = __('Call could not be confirmed ended. Please retry End Call.');
+				this.render_browser_softphone();
+			}
+			throw err;
 		});
 	}
 
