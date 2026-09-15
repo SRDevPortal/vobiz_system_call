@@ -541,6 +541,66 @@ class BrowserSafetyTests(unittest.TestCase):
             webrtc.update_browser_softphone_call("CALL-1", "onCallTerminated")
         self.db.set_value.assert_not_called()
 
+    def test_manual_complete_saves_only_status_and_releases_exact_call(self):
+        current = row(status="Initiated", answer_time=None, call_status="browserCallStarted", call_uuid="provider-id")
+        current.save = MagicMock()
+        mapping = row(name="MAP", current_call_log=current.name)
+        self.replace(lifecycle, "lock_mapping", MagicMock(return_value=mapping))
+        get_doc = self.replace(frappe, "get_doc", MagicMock(return_value=current))
+        release = self.replace(lifecycle, "release_locked", MagicMock())
+        provider = self.replace(lifecycle.core_call, "VobizClient", MagicMock())
+        before = dict(current)
+        result = call.complete_call_log(current.name)
+        self.assertEqual(result, {"name": current.name, "status": "Completed"})
+        self.assertEqual(dict(current), dict(before, status="Completed"))
+        get_doc.assert_called_once_with("Vobiz Call Log", current.name, for_update=True)
+        current.save.assert_called_once_with(ignore_permissions=True)
+        release.assert_called_once_with(mapping, current)
+        provider.assert_not_called()
+        self.db.commit.assert_called_once()
+
+    def test_manual_complete_rejects_guest_before_reading_call(self):
+        self.replace(frappe, "session", SimpleNamespace(user="Guest"))
+        get_doc = self.replace(frappe, "get_doc", MagicMock())
+        with self.assertRaisesRegex(ValueError, "Login required"):
+            call.complete_call_log("CALL-1")
+        get_doc.assert_not_called()
+
+    def test_manual_complete_rejects_other_agents_and_stale_call_selection(self):
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                current = row(user="another-agent" if foreign else frappe.session.user)
+                current.save = MagicMock()
+                self.replace(lifecycle, "lock_mapping", MagicMock(return_value=row(current_call_log="CALL-2")))
+                self.replace(frappe, "get_doc", MagicMock(return_value=current))
+                release = self.replace(lifecycle, "release_locked", MagicMock())
+                with self.assertRaises(ValueError):
+                    call.complete_call_log(current.name)
+                current.save.assert_not_called()
+                release.assert_not_called()
+
+    def test_manual_complete_duplicate_keeps_final_outcome_and_newer_mapping(self):
+        for status in ("Completed", "Failed", "Cancelled"):
+            with self.subTest(status=status):
+                current = row(status=status)
+                current.save = MagicMock()
+                self.replace(lifecycle, "lock_mapping", MagicMock(return_value=row(current_call_log="CALL-2")))
+                self.replace(frappe, "get_doc", MagicMock(return_value=current))
+                self.assertEqual(call.complete_call_log(current.name)["status"], status)
+                current.save.assert_not_called()
+                self.db.set_value.assert_not_called()
+
+    def test_manual_complete_save_error_does_not_release_or_commit(self):
+        current = row()
+        current.save = MagicMock(side_effect=RuntimeError("save failed"))
+        self.replace(lifecycle, "lock_mapping", MagicMock(return_value=row(current_call_log=current.name)))
+        self.replace(frappe, "get_doc", MagicMock(return_value=current))
+        release = self.replace(lifecycle, "release_locked", MagicMock())
+        with self.assertRaisesRegex(RuntimeError, "save failed"):
+            call.complete_call_log(current.name)
+        release.assert_not_called()
+        self.db.commit.assert_not_called()
+
     def test_callback_job_arguments_bind_to_actual_worker(self):
         self.replace(webrtc, "get_settings", lambda: frappe._dict(store_raw_payloads=1))
         webrtc._append_callback_if_enabled("CALL-1", "answer", {"token": "secret", "cmd": "method", "CallUUID": "uuid"})

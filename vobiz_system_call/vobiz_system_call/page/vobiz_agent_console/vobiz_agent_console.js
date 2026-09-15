@@ -155,6 +155,9 @@ class VobizAgentConsole {
 							<button type="button" class="btn btn-danger btn-xs" data-action="end-active-call">
 								<i class="fa fa-phone"></i> ${__('End Call')}
 							</button>
+							<button type="button" class="btn btn-success btn-xs" data-action="complete-active-call" title="${__('Mark this call log Completed')}">
+								${__('Complete Call')}
+							</button>
 						</div>
 						<button class="btn btn-default btn-sm" data-action="open-analytics">
 							<i class="fa fa-line-chart"></i> ${__('Analytics')}
@@ -573,6 +576,7 @@ class VobizAgentConsole {
 		$main.on('click', '[data-action="refresh"]', () => this.load());
 		$main.on('click', '[data-action="open-analytics"]', () => frappe.set_route('vobiz-agent-analytics'));
 		$main.on('click', '[data-action="end-active-call"]', () => this.end_header_active_call());
+		$main.on('click', '[data-action="complete-active-call"]', () => this.complete_header_active_call());
 		$main.on('click', '[data-action="softphone-connect"]', () => this.connect_browser_softphone());
 		$main.on('click', '[data-action="softphone-use-here"]', () => this.use_softphone_here());
 		$main.on('click', '[data-action="softphone-mute"]', () => this.toggle_browser_softphone_mute());
@@ -696,6 +700,7 @@ class VobizAgentConsole {
 	}
 
 	render_browser_softphone() {
+		this.sync_post_call_disposition();
 		const softphone = this.state.softphone || {};
 		const config = softphone.config || {};
 		const enabledMode = config.call_device === 'Browser Softphone';
@@ -734,8 +739,11 @@ class VobizAgentConsole {
 		this.page.main.find('[data-action="softphone-mute"]').toggleClass('hidden', !softphone.in_call);
 		this.page.main.find('[data-action="softphone-stop"]').toggleClass('hidden', !softphone.current_call_log);
 		this.page.main.find('[data-action="softphone-mute"] span').text(softphone.muted ? __('Unmute') : __('Mute'));
-		const incomingWaiting = Boolean(softphone.incoming_call_uuid || softphone.incoming_caller) && softphone.status === __('Incoming Call');
-		this.page.main.find('[data-action="softphone-answer"]').toggleClass('hidden', !incomingWaiting);
+		const incomingWaiting = this.browser_incoming_waiting();
+		this.page.main.find('[data-action="softphone-answer"]')
+			.toggleClass('hidden', !incomingWaiting)
+			.prop('disabled', Boolean(softphone.incoming_answering))
+			.text(softphone.incoming_answering ? __('Connecting…') : __('Pick Call'));
 	}
 
 	browser_softphone_live_html() {
@@ -1114,7 +1122,7 @@ class VobizAgentConsole {
 			softphone.ownership_blocked = false;
 			softphone.registering = false;
 			softphone.registered = true;
-			softphone.status = __('Registered');
+			if (!softphone.in_call && !softphone.current_call_log && !softphone.incoming_pending) softphone.status = __('Registered');
 			softphone.error = '';
 			this.render_browser_softphone();
 			this.start_browser_network_monitor(vobiz);
@@ -1145,6 +1153,8 @@ class VobizAgentConsole {
 			softphone.direction = '';
 			softphone.incoming_call_uuid = '';
 			softphone.incoming_caller = '';
+			softphone.incoming_answering = false;
+			softphone.incoming_answered = false;
 			softphone.status = __('Disconnected');
 			clearInterval(this.browser_presence_timer);
 			this.render_browser_softphone();
@@ -1159,6 +1169,10 @@ class VobizAgentConsole {
 		});
 		on('onCallAnswered', (callInfo) => {
 			if (!this.matches_browser_call_event(callInfo)) return;
+			const softphone = this.state.softphone;
+			softphone.incoming_answering = false;
+			softphone.incoming_answered = true;
+			softphone.incoming_call_uuid = '';
 			this.browser_softphone_status(__('In Call'), true);
 			this.attach_browser_softphone_audio();
 			this.sync_browser_softphone_event('onCallAnswered', callInfo).catch(() => this.load());
@@ -1169,13 +1183,18 @@ class VobizAgentConsole {
 			const values = Array.isArray(args) ? args : [args];
 			this.browser_softphone_incoming(values[0], values[1], values[2], values[3]);
 		});
-		on('onIncomingCallCanceled', () => {
+		on('onIncomingCallCanceled', (callInfo) => {
+			const eventUUID = this.extract_call_uuid(callInfo);
+			const currentUUID = this.state.softphone.sdk_call_uuid;
+			if (eventUUID && currentUUID && eventUUID !== currentUUID) return;
 			if (!this.state.softphone.incoming_pending && !this.state.softphone.incoming_caller) return;
 			this.state.softphone.incoming_pending = false;
 			this.browser_softphone_call_done('onCallTerminated', {});
 			const softphone = this.state.softphone;
 			softphone.incoming_call_uuid = '';
 			softphone.incoming_caller = '';
+			softphone.incoming_answering = false;
+			softphone.incoming_answered = false;
 			softphone.direction = '';
 			this.browser_softphone_status(softphone.registered ? __('Registered') : __('Disconnected'), false);
 			this.render_queue();
@@ -1200,12 +1219,19 @@ class VobizAgentConsole {
 		if (softphone.current_call_log || softphone.in_call) return;
 		const info = this.normalize_browser_softphone_event(callInfo);
 		const caller = callerId || info.caller_id || info.from || '';
+		const incomingRequest = {};
+		softphone.incoming_request = incomingRequest;
+		softphone.incoming_call_uuid = this.extract_call_uuid(info);
+		softphone.sdk_call_uuid = softphone.incoming_call_uuid;
 		softphone.incoming_pending = true;
+		softphone.incoming_answering = false;
+		softphone.incoming_answered = false;
+		this.sync_post_call_disposition();
 		frappe.call({
 			method: 'vobiz_system_call.api.webrtc.get_incoming_call',
 			args: { caller, tab_id: this.get_softphone_tab_id() }
 		}).then((r) => {
-			if (!softphone.incoming_pending) return;
+			if (!softphone.incoming_pending || softphone.incoming_request !== incomingRequest) return;
 			const call = r.message || {};
 			if (!call.call_log) throw new Error(__('Incoming call could not be linked.'));
 			softphone.current_call_log = call.call_log;
@@ -1223,7 +1249,9 @@ class VobizAgentConsole {
 			this.render_browser_softphone();
 			this.render_queue();
 		}).catch((err) => {
+			if (!softphone.incoming_pending || softphone.incoming_request !== incomingRequest) return;
 			softphone.incoming_pending = false;
+			softphone.incoming_call_uuid = '';
 			softphone.error = err.message || __('Incoming call could not be linked.');
 			try { softphone.client.client.hangup(); } catch (_) {}
 			this.render_browser_softphone();
@@ -1720,36 +1748,45 @@ class VobizAgentConsole {
 		});
 	}
 
+	browser_incoming_waiting() {
+		const s = this.state.softphone || {};
+		return Boolean(s.current_call_log && (s.incoming_call_uuid || s.incoming_caller)) && !s.incoming_answered;
+	}
+
 	answer_browser_softphone() {
 		this.stop_browser_microphone_test();
 		const softphone = this.state.softphone;
+		if (!this.browser_incoming_waiting() || softphone.incoming_answering) return;
 		if (!softphone.client || !softphone.client.client) {
 			frappe.msgprint(__('Softphone is not connected yet.'));
 			return;
 		}
 		const sdk = softphone.client.client;
 		const callUUID = softphone.incoming_call_uuid || '';
+		const callLog = softphone.current_call_log;
+		const failed = (error) => {
+			if (softphone.client?.client !== sdk || softphone.current_call_log !== callLog
+				|| softphone.incoming_call_uuid !== callUUID || softphone.incoming_answered) return;
+			softphone.incoming_answering = false;
+			softphone.status = __('Incoming Call');
+			softphone.error = error?.message || __('Could not answer the call. Try Pick Call again.');
+			this.render_browser_softphone();
+		};
+		softphone.incoming_answering = true;
+		softphone.error = '';
+		softphone.status = __('Connecting…');
+		this.render_browser_softphone();
 		try {
-			if (typeof sdk.answer === 'function') {
-				callUUID ? sdk.answer(callUUID) : sdk.answer();
-			} else if (typeof sdk.accept === 'function') {
-				callUUID ? sdk.accept(callUUID) : sdk.accept();
-			} else if (typeof sdk.pickup === 'function') {
-				callUUID ? sdk.pickup(callUUID) : sdk.pickup();
-			} else {
-				throw new Error(__('Pick Call is not supported by this softphone SDK.'));
+			const answer = ['answer', 'accept', 'pickup'].find(name => typeof sdk[name] === 'function');
+			if (!answer) throw new Error(__('Pick Call is not supported by this softphone SDK.'));
+			const result = callUUID ? sdk[answer](callUUID) : sdk[answer]();
+			if (result === false) failed();
+			else if (result && typeof result.then === 'function') {
+				Promise.resolve(result).then(value => { if (value === false) failed(); }).catch(failed);
 			}
-			softphone.incoming_call_uuid = '';
-			softphone.status = __('In Call');
-			softphone.in_call = true;
-			softphone.direction = __('Incoming Call');
-			this.attach_browser_softphone_audio();
-			this.render_browser_softphone();
-			this.render_queue();
-		} catch (err) {
-			softphone.error = (err && err.message) || __('Could not pick the incoming call.');
-			this.render_browser_softphone();
-			frappe.msgprint(softphone.error);
+			// SDK acceptance is not a connected call. onCallAnswered confirms it.
+		} catch (error) {
+			failed(error);
 		}
 	}
 
@@ -1819,6 +1856,8 @@ class VobizAgentConsole {
 		softphone.direction = '';
 		softphone.incoming_call_uuid = '';
 		softphone.incoming_caller = '';
+		softphone.incoming_answering = false;
+		softphone.incoming_answered = false;
 		softphone.started_at = null;
 		softphone.current_call_log = '';
 		softphone.sdk_call_uuid = '';
@@ -3270,6 +3309,33 @@ class VobizAgentConsole {
 		$control.find('[data-role="head-call-status"]').text(status);
 		$control.find('[data-role="head-call-customer"]').text(customer).attr('title', customer);
 		$control.find('[data-action="end-active-call"]').prop('disabled', Boolean(this.state.ending_active_call));
+		$control.find('[data-action="complete-active-call"]')
+			.prop('disabled', Boolean(this.state.completing_call_log))
+			.text(this.state.completing_call_log === active.name ? __('Completing…') : __('Complete Call'));
+	}
+
+	complete_header_active_call() {
+		const active = this.state.active_call || {};
+		if (!active.name || this.is_terminal_status(active.status) || this.state.completing_call_log) return;
+		const callLog = active.name;
+		this.state.completing_call_log = callLog;
+		this.render_header_active_call(active);
+		return this.browser_request_with_timeout(Promise.resolve().then(() => frappe.call({
+			method: 'vobiz_system_call.api.call.complete_call_log',
+			args: {call_log: callLog}
+		}))).then(r => {
+			const call = r.message || {};
+			if (call.name !== callLog || !this.is_terminal_status(call.status)) {
+				throw new Error(__('Call log was not marked completed. Please retry.'));
+			}
+			this.handle_call_disconnected(Object.assign({}, active, call));
+			this.load();
+		}).catch(error => {
+			frappe.msgprint(error.message || __('Could not complete the call log. Please retry.'));
+		}).finally(() => {
+			if (this.state.completing_call_log === callLog) this.state.completing_call_log = '';
+			this.render_header_active_call(this.state.active_call || {});
+		});
 	}
 
 	end_header_active_call() {
@@ -5520,6 +5586,47 @@ class VobizAgentConsole {
 		});
 	}
 
+	disposition_call_in_progress() {
+		const s = this.state.softphone || {};
+		const active = this.state.active_call || {};
+		return Boolean(s.current_call_log || s.in_call || s.incoming_pending ||
+			(active.name && !this.is_terminal_status(active.status)));
+	}
+
+	queue_post_call_disposition(call, row, on_done, options) {
+		const queue = this.pending_post_call_dispositions || (this.pending_post_call_dispositions = new Map());
+		if (!queue.has(call.name)) queue.set(call.name, [call, row, on_done,
+			Object.assign({}, options, {disposition_context_refreshed: false})]);
+	}
+
+	sync_post_call_disposition() {
+		const current = this.post_call_disposition;
+		const busy = this.disposition_call_in_progress();
+		if (current) {
+			const callLog = (this.state.softphone || {}).current_call_log || (this.state.active_call || {}).name;
+			if (busy && callLog && callLog !== current.call_log) current.waiting_for_end.add(callLog);
+			if (busy && !current.suspended) {
+				current.suspended = true;
+				current.hiding = true;
+				current.dialog.hide();
+			} else if (!busy && !current.waiting_for_end.size && current.suspended && !current.hiding) {
+				current.suspended = false;
+				current.dialog.show();
+			}
+			return;
+		}
+		if (busy || this.disposition_opening_call || this.disposition_drain_timer
+			|| !this.pending_post_call_dispositions?.size) return;
+		this.disposition_drain_timer = setTimeout(() => {
+			this.disposition_drain_timer = null;
+			if (this.post_call_disposition || this.disposition_opening_call || this.disposition_call_in_progress()) return;
+			const [key, args] = this.pending_post_call_dispositions.entries().next().value || [];
+			if (!key) return;
+			this.pending_post_call_dispositions.delete(key);
+			this.open_post_call_disposition_dialog(...args);
+		}, 150);
+	}
+
 	is_disposition_call_current(callLog) {
 		const browserCall = (this.state.softphone || {}).current_call_log;
 		const active = this.state.active_call || {};
@@ -5529,6 +5636,8 @@ class VobizAgentConsole {
 
 	maybe_prompt_workdesk_disposition(call) {
 		if (!call || !call.name || !this.is_terminal_status(call.status)) return;
+		this.post_call_disposition?.waiting_for_end.delete(call.name);
+		this.sync_post_call_disposition();
 		if (!this.is_disposition_call_current(call.name)) return;
 		if (call.direction === 'Incoming' && !call.reference_name && !call.incoming_reference_checked) {
 			this.incoming_disposition_pending = this.incoming_disposition_pending || new Set();
@@ -5578,6 +5687,7 @@ class VobizAgentConsole {
 
 	open_post_call_disposition_dialog(call, row, on_done, options = {}) {
 		if (options.check_current_call && !this.is_disposition_call_current(call.name)) {
+			if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
 			if (this.state.disposition_prompted_call_log === call.name) this.state.disposition_prompted_call_log = null;
 			return;
 		}
@@ -5588,13 +5698,25 @@ class VobizAgentConsole {
 			return;
 		}
 		if (this.state.active_disposition_call_log === call.name) return;
+		if (this.post_call_disposition || (this.disposition_opening_call && this.disposition_opening_call !== call.name)
+			|| this.disposition_call_in_progress()) {
+			if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
+			this.queue_post_call_disposition(call, row, on_done, options);
+			return;
+		}
 		if (!call.reference_doctype && !call.reference_name && !options.generic_dispositions) {
+			this.disposition_opening_call = call.name;
 			frappe.call('vobiz_click_to_call.api.disposition.get_disposition_options_api').then(r => {
 				this.open_post_call_disposition_dialog(call, row, on_done, Object.assign({}, options, { generic_dispositions: r.message || [] }));
-			}).catch(() => { this.state.disposition_prompted_call_log = null; });
+			}).catch(() => {
+				this.state.disposition_prompted_call_log = null;
+				if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
+				this.sync_post_call_disposition();
+			});
 			return;
 		}
 		if (!options.disposition_context_refreshed && (row.doctype || call.reference_doctype) && (row.name || call.reference_name)) {
+			this.disposition_opening_call = call.name;
 			frappe.call('vobiz_click_to_call.api.console.get_reference_context', {
 				reference_doctype: row.doctype || call.reference_doctype,
 				reference_name: row.name || call.reference_name,
@@ -5609,6 +5731,7 @@ class VobizAgentConsole {
 			});
 			return;
 		}
+		if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
 		this.state.active_disposition_call_log = call.name;
 		this.state.disposition_prompted_call_log = call.name;
 		if (this.state.ai_disposition_enabled) {
@@ -5686,10 +5809,13 @@ class VobizAgentConsole {
 			if (this.state.active_disposition_call_log === call.name) {
 				this.state.active_disposition_call_log = null;
 			}
+			if (this.post_call_disposition === controller) this.post_call_disposition = null;
 			if (on_done) on_done();
+			this.sync_post_call_disposition();
 		};
 		const saveDisposition = (values, isAutoSave = false) => {
-			if (done || autoSubmitting || loadingIncomingLead || dispositionOptionsLoading) return;
+			if (done || autoSubmitting || loadingIncomingLead || dispositionOptionsLoading
+				|| controller.suspended || this.disposition_call_in_progress()) return;
 			if (needsIncomingLead && !hasReference) {
 				frappe.msgprint(__('Select the matching CRM Lead before saving its status and disposition.'));
 				return;
@@ -5719,6 +5845,8 @@ class VobizAgentConsole {
 						: __('Disposition saved'),
 					indicator: isAutoSave ? 'orange' : 'green'
 				});
+				controller.saved = true;
+				if (controller.suspended && !controller.hiding) finish();
 				dialog.hide();
 				this.load();
 			}).always(() => {
@@ -5802,6 +5930,8 @@ class VobizAgentConsole {
 					saveDisposition(values);
 			}
 		});
+		const controller = {call_log: call.name, dialog, suspended: false, hiding: false, waiting_for_end: new Set()};
+		this.post_call_disposition = controller;
 		const loadIncomingLead = async () => {
 			const name = dialog.get_value('incoming_lead');
 			if (!name || loadingIncomingLead || hasReference) return;
@@ -5838,12 +5968,24 @@ class VobizAgentConsole {
 				dialog.get_primary_btn().prop('disabled', false);
 			}
 		};
-		dialog.$wrapper.on('hidden.bs.modal', finish);
+		dialog.$wrapper.on('shown.bs.modal', () => {
+			// Bootstrap ignores hide() while the opening animation is running.
+			if (controller.suspended || controller.saved) {
+				controller.hiding = true;
+				dialog.hide();
+			}
+		});
+		dialog.$wrapper.on('hidden.bs.modal', () => {
+			controller.hiding = false;
+			if (controller.saved || !controller.suspended) finish();
+			else this.sync_post_call_disposition();
+		});
 		dialog.show();
 		dialog.get_close_btn().hide();
 		if (timedDisposition) {
 			const $countdown = dialog.$wrapper.find('[data-role="auto-disposition-countdown"]');
 			countdownTimer = setInterval(() => {
+				if (controller.suspended || this.disposition_call_in_progress()) return;
 				countdownSeconds -= 1;
 				$countdown.text(String(Math.max(0, countdownSeconds)));
 				if (countdownSeconds <= 0) {

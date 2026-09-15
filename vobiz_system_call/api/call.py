@@ -295,6 +295,32 @@ def start_browser_softphone_call(
 
 
 @frappe.whitelist(methods=["POST"])
+def complete_call_log(call_log: str):
+    """Agent-requested manual completion, equivalent to saving Status=Completed."""
+    if frappe.session.user == "Guest":
+        frappe.throw(_("Login required."))
+    # Lock in the same order as call start/cancellation, and bind the action to
+    # the requesting agent's exact current call. Never accept a status from JS.
+    mapping = lifecycle.lock_mapping(frappe.session.user)
+    doc = frappe.get_doc("Vobiz Call Log", call_log, for_update=True)
+    if doc.user != frappe.session.user:
+        frappe.throw(_("Not permitted."))
+    if doc.status in lifecycle.TERMINAL:
+        lifecycle.release_locked(mapping, doc)
+        frappe.db.commit()
+        return {"name": doc.name, "status": doc.status}
+    if mapping.current_call_log != doc.name:
+        frappe.throw(_("This is no longer your current call. Refresh and try again."))
+    doc.status = "Completed"
+    # The agent may only perform this fixed transition on their own reserved
+    # call; normal save hooks still run, just as for a manual form edit.
+    doc.save(ignore_permissions=True)
+    lifecycle.release_locked(mapping, doc)
+    frappe.db.commit()
+    return {"name": doc.name, "status": doc.status}
+
+
+@frappe.whitelist(methods=["POST"])
 def cancel_call(call_log: str):
     # Protect browser calls even when cancellation comes from another core UI.
     row = frappe.db.get_value("Vobiz Call Log", call_log, ["request_json"], as_dict=True)
