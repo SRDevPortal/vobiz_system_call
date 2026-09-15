@@ -148,7 +148,7 @@ def release_locked(mapping, row):
         })
 
 def presence(user):
-    return frappe.cache().get_value("vsc:presence:" + user)
+    return frappe.cache().get_value("vsc:presence:" + user, expires=True)
 
 
 def set_presence(user, tab_id):

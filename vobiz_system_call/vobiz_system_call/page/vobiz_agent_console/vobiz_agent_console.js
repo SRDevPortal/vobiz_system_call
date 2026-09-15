@@ -201,6 +201,7 @@ class VobizAgentConsole {
 						<div class="vobiz-softphone-live hidden" data-role="softphone-live"></div>
 					</div>
 					<div class="vobiz-softphone-actions">
+						<button class="btn btn-primary btn-sm hidden" data-action="softphone-use-here">${__('Use here')}</button>
 						<button class="btn btn-default btn-sm" data-action="softphone-test-mic">
 							<i class="fa fa-microphone"></i> ${__('Test Mic')}
 						</button>
@@ -573,6 +574,7 @@ class VobizAgentConsole {
 		$main.on('click', '[data-action="open-analytics"]', () => frappe.set_route('vobiz-agent-analytics'));
 		$main.on('click', '[data-action="end-active-call"]', () => this.end_header_active_call());
 		$main.on('click', '[data-action="softphone-connect"]', () => this.connect_browser_softphone());
+		$main.on('click', '[data-action="softphone-use-here"]', () => this.use_softphone_here());
 		$main.on('click', '[data-action="softphone-mute"]', () => this.toggle_browser_softphone_mute());
 		$main.on('click', '[data-action="softphone-stop"]', () => this.hangup_browser_softphone());
 		$main.on('click', '[data-action="softphone-answer"]', () => this.answer_browser_softphone());
@@ -675,6 +677,7 @@ class VobizAgentConsole {
 	}
 
 	load_browser_softphone_config() {
+		this.bind_softphone_window_channel();
 		const softphone = this.state.softphone;
 		softphone.config_promise = frappe.call('vobiz_click_to_call.api.webrtc.get_browser_softphone_config').then((r) => {
 			this.state.softphone.config = r.message || {};
@@ -717,6 +720,10 @@ class VobizAgentConsole {
 		const missing = (config.missing || []).join(', ');
 		const status = this.browser_softphone_network_message() || softphone.error || (missing ? __('Missing: {0}', [missing]) : softphone.status || __('Not Connected'));
 		this.page.main.find('[data-role="softphone-status"]').text(status);
+		this.page.main.find('[data-action="softphone-use-here"]')
+			.toggleClass('hidden', !this.show_softphone_use_here())
+			.prop('disabled', Boolean(softphone.switching_window))
+			.text(softphone.switching_window ? __('Switching…') : __('Use here'));
 		this.page.main.find('[data-role="softphone-endpoint"]').text(config.endpoint_uri || config.username || '');
 		this.page.main.find('[data-role="softphone-answer-url"]').text(config.answer_url ? __('Answer URL ready') : '');
 		this.page.main.find('[data-role="softphone-diagnostics"]').html(this.browser_softphone_diagnostics_html());
@@ -1032,7 +1039,7 @@ class VobizAgentConsole {
 		const softphone = this.state.softphone;
 		const config = softphone.config || {};
 		if (!config.enabled || config.call_device !== 'Browser Softphone') return Promise.resolve();
-		if (softphone.registered || softphone.registering || softphone.auto_connect_attempted) return Promise.resolve();
+		if (softphone.ownership_blocked || softphone.registered || softphone.registering || softphone.auto_connect_attempted) return Promise.resolve();
 		softphone.auto_connect_attempted = true;
 		return this.connect_browser_softphone({ silent: true }).catch((err) => {
 			softphone.auto_connect_attempted = false;
@@ -1045,6 +1052,7 @@ class VobizAgentConsole {
 	connect_browser_softphone(options = {}) {
 		const softphone = this.state.softphone;
 		const config = softphone.config || {};
+		if (softphone.ownership_blocked) return Promise.reject(this.softphone_ownership_error());
 		if (softphone.client && (this.browser_softphone_reconnecting() || softphone.pending_end_call)) {
 			return Promise.reject(new Error(__('Softphone is reconnecting. Please wait.')));
 		}
@@ -1054,10 +1062,12 @@ class VobizAgentConsole {
 			return softphone.config_promise.then(() => this.connect_browser_softphone(options));
 		}
 		if (!config.enabled) return Promise.reject(new Error(__('Browser Softphone is not configured.')));
+		softphone.connection_attempted = true;
 		softphone.registering = true;
 		softphone.error = '';
 		softphone.status = __('Connecting');
-		const attempt = this.load_browser_softphone_sdk().then(() => this.send_browser_presence()).then(() => new Promise((resolve, reject) => {
+		const attempt = this.load_browser_softphone_sdk().then(() => this.send_browser_presence(true, true)).then(() => new Promise((resolve, reject) => {
+			if (softphone.ownership_blocked) return reject(this.softphone_ownership_error());
 			const timeout = setTimeout(() => reject(new Error(__('Softphone login timed out.'))), 15000);
 			softphone.resolve_register = () => { clearTimeout(timeout); resolve(); };
 			softphone.reject_register = (err) => { clearTimeout(timeout); reject(err); };
@@ -1099,8 +1109,9 @@ class VobizAgentConsole {
 			if (this.state.softphone.client === vobiz) handler(args.length > 1 ? args : args[0]);
 		});
 			on('onWebrtcNotSupported', () => this.browser_softphone_failed(__('WebRTC is not supported in this browser.')));
-		on('onLogin', () => {
+			on('onLogin', () => {
 			const softphone = this.state.softphone;
+			softphone.ownership_blocked = false;
 			softphone.registering = false;
 			softphone.registered = true;
 			softphone.status = __('Registered');
@@ -1192,7 +1203,7 @@ class VobizAgentConsole {
 		softphone.incoming_pending = true;
 		frappe.call({
 			method: 'vobiz_system_call.api.webrtc.get_incoming_call',
-			args: { caller, tab_id: this.attendance_tab_id }
+			args: { caller, tab_id: this.get_softphone_tab_id() }
 		}).then((r) => {
 			if (!softphone.incoming_pending) return;
 			const call = r.message || {};
@@ -1322,13 +1333,222 @@ class VobizAgentConsole {
 		this.render_browser_softphone();
 	}
 
-	send_browser_presence(registered = true) {
+	send_browser_presence(registered = true, claimIdle = false) {
+		return this.prepare_softphone_window().then(() => this.send_browser_window_presence(registered, claimIdle));
+	}
+
+	send_browser_window_presence(registered, claimIdle = false) {
 		const request = frappe.call({
 			method: 'vobiz_system_call.api.webrtc.browser_presence',
-			args: { tab_id: this.attendance_tab_id, registered: registered ? 1 : 0 },
+			args: { tab_id: this.get_softphone_tab_id(), registered: registered ? 1 : 0, claim_idle: registered && claimIdle ? 1 : 0 },
 			silent: true
 		});
-		return this.browser_request_with_timeout(request);
+		return this.browser_request_with_timeout(request).then(r => {
+			const data = (r || {}).message || {};
+			if (registered && data.registered === false) {
+				if (data.ownership === 'release_requested') this.release_softphone_for_switch(data).catch(() => {});
+				else this.mark_softphone_other_window();
+				throw this.softphone_ownership_error(data.ownership);
+			}
+			return r;
+		});
+	}
+
+	get_softphone_tab_id() {
+		if (typeof vobiz_system_call !== 'undefined' && vobiz_system_call.get_softphone_window) {
+			this.softphone_window = this.softphone_window || vobiz_system_call.get_softphone_window();
+			return this.softphone_window.id;
+		}
+		// Safe fallback while an older shared asset is still cached.
+		if (!this.softphone_tab_id) this.softphone_tab_id = window.crypto && window.crypto.randomUUID
+			? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		return this.softphone_tab_id;
+	}
+
+	prepare_softphone_window() {
+		this.get_softphone_tab_id();
+		return this.softphone_window ? this.softphone_window.ready : Promise.resolve(this.softphone_tab_id);
+	}
+
+	show_softphone_use_here() {
+		const s = this.state.softphone;
+		return !s.registered && !s.registering && !s.sdk_loading && Boolean(s.ownership_blocked || s.connection_attempted);
+	}
+
+	softphone_ownership_error(state) {
+		const messages = {
+			active_call: __('Finish the current call or stop auto-dial before switching windows.'),
+			superseded: __('Use here was selected in another window. Your softphone is switching there.'),
+			expired: __('The previous switch request expired. Please select Use softphone here again.')
+		};
+		const err = new Error(messages[state] || __('A previous window still holds the softphone registration. Select Use here to switch.'));
+		err.softphone_ownership = true;
+		return err;
+	}
+
+	bind_softphone_window_channel() {
+		if (this.softphone_window_channel_bound) return;
+		this.softphone_window_channel_bound = true;
+		const key = 'vobiz-softphone-window:' + ((frappe.session || {}).user || 'session');
+		this.softphone_window_signal_key = key;
+		try {
+			if (typeof window.BroadcastChannel === 'function') {
+				this.softphone_window_channel = new window.BroadcastChannel(key);
+				this.softphone_window_channel.onmessage = event => this.handle_softphone_ownership(event.data || {});
+				return;
+			}
+		} catch (_) {}
+		if (typeof window.addEventListener === 'function') window.addEventListener('storage', event => {
+			if (event.key !== key || !event.newValue) return;
+			try { this.handle_softphone_ownership(JSON.parse(event.newValue)); } catch (_) {}
+		});
+	}
+
+	signal_softphone_window(data) {
+		this.bind_softphone_window_channel();
+		try {
+			if (this.softphone_window_channel) this.softphone_window_channel.postMessage(data);
+			else if (window.localStorage) {
+				window.localStorage.setItem(this.softphone_window_signal_key, JSON.stringify(data));
+				window.localStorage.removeItem(this.softphone_window_signal_key);
+			}
+		} catch (_) {} // Server realtime and heartbeat remain independent fallbacks.
+	}
+
+	softphone_has_live_session() {
+		const s = this.state.softphone;
+		const active = this.state.active_call || {};
+		if ((this.state.auto_dial || {}).running || s.current_call_log || s.in_call || s.incoming_pending || s.pending_end_call ||
+			(active.name && !this.is_terminal_status(active.status))) return true;
+		try { return Boolean(s.client && s.client.client.getCallUUID && s.client.client.getCallUUID()); }
+		catch (_) { return true; }
+	}
+
+	mark_softphone_other_window() {
+		const s = this.state.softphone;
+		s.ownership_blocked = true;
+		s.auto_connect_attempted = true;
+		s.error = '';
+		s.status = __('Softphone registration is reserved');
+		if (!this.softphone_has_live_session()) {
+			s.network_issues = {};
+			s.recovery_verification = null;
+			this.disconnect_browser_softphone();
+		}
+		this.render_browser_softphone();
+	}
+
+	async use_softphone_here() {
+		const s = this.state.softphone;
+		if (s.switching_window) return;
+		if (this.softphone_has_live_session()) {
+			s.error = __('Finish the current call or stop auto-dial before switching windows.');
+			this.render_browser_softphone();
+			return;
+		}
+		s.switching_window = true;
+		s.ownership_action = (s.ownership_action || 0) + 1;
+		s.error = '';
+		s.status = __('Waiting for the other window to disconnect…');
+		this.render_browser_softphone();
+		try {
+			await this.prepare_softphone_window();
+			let token;
+			let signalledToken;
+			for (let waitedMs = 0; waitedMs < 75000;) {
+				const r = await this.browser_request_with_timeout(frappe.call({
+					method: 'vobiz_system_call.api.ownership.use_here', type: 'POST', silent: true,
+					args: {tab_id: this.get_softphone_tab_id(), transfer_token: token}
+				}));
+				const data = r.message || {};
+				if (data.ownership === 'granted') {
+					s.ownership_blocked = false;
+					s.auto_connect_attempted = false;
+					// Reclaiming this window must not race its previous SDK unregister.
+					if (this.softphone_switch_release) await this.softphone_switch_release;
+					await this.connect_browser_softphone();
+					return;
+				}
+				if (data.ownership !== 'waiting') throw this.softphone_ownership_error(data.ownership);
+				token = data.transfer_token;
+				if (token !== signalledToken && data.old_tab) {
+					signalledToken = token;
+					this.signal_softphone_window({state: 'release_requested', tab_id: data.old_tab, transfer_token: token});
+				}
+				// Catch a prompt SDK logout sooner, then return to normal polling.
+				// Keep the full fallback wait for a suspended or unreachable owner.
+				const waitMs = waitedMs < 1000 ? 250 : 1000;
+				await new Promise(resolve => setTimeout(resolve, waitMs));
+				waitedMs += waitMs;
+			}
+			throw new Error(__('Window switch timed out. Please try Use softphone here again.'));
+		} catch (err) {
+			s.ownership_blocked = true;
+			s.error = err.message || __('Could not switch windows. Please try again.');
+		} finally {
+			s.switching_window = false;
+			this.render_browser_softphone();
+		}
+	}
+
+	release_softphone_for_switch(data) {
+		if (data.tab_id !== this.get_softphone_tab_id()) return Promise.resolve();
+		if (this.softphone_switch_release) {
+			if (this.softphone_switch_release_token === data.transfer_token) return this.softphone_switch_release;
+			return this.softphone_switch_release.then(
+				() => this.release_softphone_for_switch(data), () => this.release_softphone_for_switch(data));
+		}
+		const s = this.state.softphone;
+		const action = s.ownership_action || 0;
+		this.softphone_switch_release_token = data.transfer_token;
+		let busy = true;
+		const release = async () => {
+			const check = await this.browser_request_with_timeout(frappe.call({
+				method: 'vobiz_system_call.api.ownership.switch_status', type: 'POST', silent: true,
+				args: {tab_id: this.get_softphone_tab_id(), transfer_token: data.transfer_token}
+			}));
+			const state = (check.message || {}).ownership;
+			if (!['release_requested', 'active_call'].includes(state)) return;
+			if ((s.ownership_action || 0) !== action) return;
+			busy = state === 'active_call' || this.softphone_has_live_session();
+			if (!busy) {
+				s.ownership_blocked = true;
+				s.auto_connect_attempted = true;
+				this.stop_browser_network_monitor();
+				if (s.reject_register) s.reject_register(this.softphone_ownership_error());
+				const wrapper = s.client;
+				s.client = null; // Ignore delayed login/logout events from the old SDK.
+				s.registered = false;
+				if (wrapper && wrapper.client) await new Promise((resolve, reject) => {
+					const sdk = wrapper.client;
+					const timer = setTimeout(() => reject(new Error(__('Waiting for the old softphone to disconnect.'))), 6000);
+					sdk.on('onLogout', () => { clearTimeout(timer); resolve(); });
+					try { sdk.logout(); } catch (err) { clearTimeout(timer); reject(err); }
+				});
+			}
+			await this.browser_request_with_timeout(frappe.call({
+				method: 'vobiz_system_call.api.ownership.release_for_switch', type: 'POST', silent: true,
+				args: {tab_id: this.get_softphone_tab_id(), transfer_token: data.transfer_token, busy: busy ? 1 : 0}
+			}));
+		};
+		this.softphone_switch_release = release().finally(() => {
+			this.softphone_switch_release = null;
+			this.softphone_switch_release_token = null;
+			if (!busy && (s.ownership_action || 0) === action) this.mark_softphone_other_window();
+		});
+		return this.softphone_switch_release;
+	}
+
+	handle_softphone_ownership(data = {}) {
+		if (data.state === 'release_requested') this.release_softphone_for_switch(data).catch(() => {});
+		if (data.state === 'granted' && data.tab_id !== this.get_softphone_tab_id()) {
+			// Realtime messages may arrive late; confirm ownership before disconnecting.
+			this.send_browser_presence().catch(() => {});
+		}
+		if (data.state === 'blocked' && data.tab_id === this.get_softphone_tab_id()) {
+			this.state.softphone.error = __('Finish the current call or stop auto-dial before switching windows.');
+			this.render_browser_softphone();
+		}
 	}
 
 	browser_request_with_timeout(request, timeoutMs = 8000) {
@@ -1447,6 +1667,7 @@ class VobizAgentConsole {
 			return this.refresh_browser_softphone_call(this.state.active_call || {});
 		}).catch(err => {
 			if (softphone.client !== vobiz || this.browser_presence_check !== check) return;
+			if (err && err.softphone_ownership) return;
 			const status = Number(err && err.status);
 			if ([401, 403, 417].includes(status)) {
 				// Authentication, permissions and tab-ownership rejection are not
@@ -2038,9 +2259,11 @@ class VobizAgentConsole {
 		this.callback_handler = (payload) => this.handle_customer_callback(payload || {});
 		this.patient_routed_handler = (payload) => this.handle_patient_routed_call(payload || {});
 		this.call_disconnected_handler = (payload) => this.handle_call_disconnected(payload || {});
+		this.softphone_ownership_handler = (payload) => this.handle_softphone_ownership(payload || {});
 		frappe.realtime.on('vobiz_customer_callback', this.callback_handler);
 		frappe.realtime.on('vobiz_patient_routed_call', this.patient_routed_handler);
 		frappe.realtime.on('vobiz_call_disconnected', this.call_disconnected_handler);
+		frappe.realtime.on('vobiz_softphone_ownership', this.softphone_ownership_handler);
 	}
 
 	unbind_realtime() {
@@ -2052,6 +2275,7 @@ class VobizAgentConsole {
 		}
 		if (frappe.realtime && this.call_disconnected_handler && frappe.realtime.off) {
 			frappe.realtime.off('vobiz_call_disconnected', this.call_disconnected_handler);
+			frappe.realtime.off('vobiz_softphone_ownership', this.softphone_ownership_handler);
 		}
 		this.callback_handler = null;
 		this.patient_routed_handler = null;
@@ -4685,7 +4909,7 @@ class VobizAgentConsole {
 				phone_number: patientPhone ? patientPhone.number : row.phone,
 				patient_phone_selected: patientPhone ? 1 : 0,
 				client_context: 'agent_console',
-				tab_id: this.attendance_tab_id
+				tab_id: this.get_softphone_tab_id()
 			},
 			freeze: true,
 			freeze_message: __('Starting call...')

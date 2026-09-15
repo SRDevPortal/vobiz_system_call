@@ -81,24 +81,10 @@ def get_provider_answer_url():
 
 
 @frappe.whitelist(methods=["POST"])
-def browser_presence(tab_id: str, registered: int = 1):
-    _login()
-    if not _browser_enabled() or not get_system_call_profile():
-        frappe.throw(_("Browser calling is disabled."))
-    if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", tab_id or ""):
-        frappe.throw(_("Invalid browser tab ID."))
-    user = frappe.session.user
-    cache = frappe.cache()
-    with cache.lock("vsc:presence-lock:" + user, timeout=5, blocking_timeout=2):
-        current = lifecycle.presence(user)
-        if not frappe.utils.cint(registered):
-            if current == tab_id:
-                cache.delete_value("vsc:presence:" + user)
-        else:
-            if current and current != tab_id:
-                frappe.throw(_("Another browser tab is already registered for calling."))
-            lifecycle.set_presence(user, tab_id)
-    return {"registered": bool(frappe.utils.cint(registered))}
+def browser_presence(tab_id: str, registered: int = 1, claim_idle: int = 0):
+    from vobiz_system_call.api.ownership import presence_heartbeat
+    return presence_heartbeat(tab_id, registered, claim_idle=claim_idle)
+
 
 
 @frappe.whitelist(methods=["POST"])

@@ -208,6 +208,7 @@ test('a stalled presence request times out and aborts without logging out the SD
     t.ctx.frappe.call = () => pending;
     const checking = Object.getPrototypeOf(t.obj).send_browser_presence.call(t.obj);
     const rejected = assert.rejects(checking, /timed out/);
+    await new Promise(setImmediate); // Window identity resolves before the HTTP request starts.
     [...t.timeouts.values()][0]();
     await rejected;
     assert.equal(aborted, true);
