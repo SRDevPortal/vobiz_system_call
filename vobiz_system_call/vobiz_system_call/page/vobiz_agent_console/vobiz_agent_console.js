@@ -1779,6 +1779,9 @@ class VobizAgentConsole {
 		if (matchingSession) {
 			try { Promise.resolve(sdk.hangup()).catch(() => {}); } catch (_) {}
 		}
+		// Keep the verified call context: the next console reload may omit it
+		// because the server has already released the agent's call mapping.
+		this.maybe_prompt_workdesk_disposition(call);
 		return true;
 	}
 
@@ -5517,8 +5520,16 @@ class VobizAgentConsole {
 		});
 	}
 
+	is_disposition_call_current(callLog) {
+		const browserCall = (this.state.softphone || {}).current_call_log;
+		const active = this.state.active_call || {};
+		return (!browserCall || browserCall === callLog)
+			&& (!active.name || active.name === callLog || this.is_terminal_status(active.status));
+	}
+
 	maybe_prompt_workdesk_disposition(call) {
 		if (!call || !call.name || !this.is_terminal_status(call.status)) return;
+		if (!this.is_disposition_call_current(call.name)) return;
 		if (call.direction === 'Incoming' && !call.reference_name && !call.incoming_reference_checked) {
 			this.incoming_disposition_pending = this.incoming_disposition_pending || new Set();
 			if (this.incoming_disposition_pending.has(call.name)) return;
@@ -5551,14 +5562,25 @@ class VobizAgentConsole {
 		if ((!row.doctype || !row.name) && call.direction !== 'Incoming') return;
 
 		this.state.disposition_prompted_call_log = call.name;
-		setTimeout(() => this.open_post_call_disposition_dialog(call, row, null, {
-			force_timer: true,
-			timeout_seconds: 60,
-			timeout_status: 'Agent Not Available'
-		}), 150);
+		setTimeout(() => {
+			if (!this.is_disposition_call_current(call.name)) {
+				if (this.state.disposition_prompted_call_log === call.name) this.state.disposition_prompted_call_log = null;
+				return;
+			}
+			this.open_post_call_disposition_dialog(call, row, null, {
+				check_current_call: true,
+				force_timer: true,
+				timeout_seconds: 60,
+				timeout_status: 'Agent Not Available'
+			});
+		}, 150);
 	}
 
 	open_post_call_disposition_dialog(call, row, on_done, options = {}) {
+		if (options.check_current_call && !this.is_disposition_call_current(call.name)) {
+			if (this.state.disposition_prompted_call_log === call.name) this.state.disposition_prompted_call_log = null;
+			return;
+		}
 		if (this.should_skip_post_call_disposition(call, row)) {
 			this.state.active_disposition_call_log = null;
 			this.state.disposition_prompted_call_log = call && call.name ? call.name : null;

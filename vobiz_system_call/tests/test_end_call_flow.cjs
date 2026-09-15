@@ -10,14 +10,14 @@ function instance(){const obj=Object.create(ctx.Class.prototype);obj.state={soft
  obj.hangup_browser_softphone();assert.equal(ended,0);no();assert.equal(ended,0);
  obj.hangup_browser_softphone();yes();await new Promise(setImmediate);assert.equal(ended,1);
  obj.hangup_browser_softphone();obj.state.softphone.current_call_log='C2';obj.state.active_call={name:'C2'};yes();assert.equal(ended,1);
- const incoming=instance();incoming.state.selected={doctype:'Issue',name:'unrelated'};let prompts=0;
+ const incoming=instance();incoming.state.softphone.current_call_log='IN';incoming.state.active_call={name:'IN'};incoming.state.selected={doctype:'Issue',name:'unrelated'};let prompts=0;
  incoming.open_post_call_disposition_dialog=(call,row)=>{prompts++;assert.equal(call.name,'IN');assert.equal(row.doctype,undefined);};
  const call={name:'IN',status:'Completed',direction:'Incoming',incoming_reference_checked:true,incoming_reference_skipped:true,customer_number:'test'};
  incoming.maybe_prompt_workdesk_disposition(call);incoming.maybe_prompt_workdesk_disposition(call);tasks.shift()();assert.equal(prompts,1);
- const pending=instance();let reads=0,notices=0;ctx.frappe.call=()=>Promise.resolve({message:{name:'C1',status:++reads===1?'Connected':'Completed'}});pending.maybe_prompt_workdesk_disposition=()=>notices++;
+ const pending=instance();let reads=0,notices=0;ctx.frappe.call=()=>Promise.resolve({message:{name:'C1',status:++reads===1?'Connected':'Completed',reference_doctype:'CRM Lead',reference_name:'LEAD1'}});pending.open_post_call_disposition_dialog=()=>notices++;
  pending.watch_browser_call_disposition('C1');pending.watch_browser_call_disposition('C1');assert.equal(tasks.length,1);
- await tasks.shift()();assert.equal(notices,0);await tasks.shift()();assert.equal(notices,1);
- const deferred=instance();let prompted=0;
+ await tasks.shift()();assert.equal(notices,0);await tasks.shift()();assert.equal(tasks.length,1);tasks.shift()();assert.equal(notices,1);
+ const deferred=instance();deferred.state.softphone.current_call_log='IN-JQ';deferred.state.active_call={name:'IN-JQ'};let prompted=0;
  deferred.open_post_call_disposition_dialog=()=>prompted++;
  // Frappe 15 returns a jQuery thenable, without native Promise.finally.
  ctx.frappe.call=()=>({then(resolve){resolve({message:{}});}});
