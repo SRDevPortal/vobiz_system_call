@@ -214,6 +214,9 @@ class VobizAgentConsole {
 						<button class="btn btn-success btn-sm hidden" data-action="softphone-answer">
 							<i class="fa fa-phone"></i> ${__('Pick Call')}
 						</button>
+						<button class="btn btn-default btn-sm hidden" data-action="softphone-workdesk">
+							<i class="fa fa-address-card-o"></i> ${__('Open Workdesk')}
+						</button>
 						<button class="btn btn-danger btn-sm hidden" data-action="softphone-stop">
 							<i class="fa fa-phone"></i> ${__('Stop Call')}
 						</button>
@@ -581,7 +584,8 @@ class VobizAgentConsole {
 		$main.on('click', '[data-action="softphone-use-here"]', () => this.use_softphone_here());
 		$main.on('click', '[data-action="softphone-mute"]', () => this.toggle_browser_softphone_mute());
 		$main.on('click', '[data-action="softphone-stop"]', () => this.hangup_browser_softphone());
-		$main.on('click', '[data-action="softphone-answer"]', () => this.answer_browser_softphone());
+		$main.on('click', '[data-action="softphone-answer"]', (e) => this.answer_browser_softphone($(e.currentTarget).attr('data-call-log')));
+		$main.on('click', '[data-action="softphone-workdesk"]', (e) => this.open_softphone_workdesk($(e.currentTarget).attr('data-call-log')));
 		$main.on('click', '[data-action="softphone-test-mic"]', () => this.test_browser_microphone());
 		$main.on('click', '[data-action="softphone-stop-mic-test"]', () => this.stop_browser_microphone_test());
 		$main.on('click', '[data-action="softphone-test-audio"]', () => this.test_browser_audio());
@@ -742,8 +746,92 @@ class VobizAgentConsole {
 		const incomingWaiting = this.browser_incoming_waiting();
 		this.page.main.find('[data-action="softphone-answer"]')
 			.toggleClass('hidden', !incomingWaiting)
+			.attr('data-call-log', softphone.current_call_log || '')
 			.prop('disabled', Boolean(softphone.incoming_answering))
 			.text(softphone.incoming_answering ? __('Connecting…') : __('Pick Call'));
+		this.page.main.find('[data-action="softphone-workdesk"]')
+			.toggleClass('hidden', !softphone.current_call_log)
+			.attr('data-call-log', softphone.current_call_log || '')
+			.prop('disabled', Boolean(this.softphone_workdesk_request));
+		this.render_workdesk_incoming_controls();
+	}
+
+	workdesk_incoming_controls_html() {
+		if (!this.browser_incoming_waiting()) return '';
+		const softphone = this.state.softphone;
+		const escape = frappe.utils.escape_html;
+		const caller = softphone.current_customer || __('Customer');
+		const number = softphone.current_destination || softphone.incoming_caller || '';
+		return `<div class="vobiz-live-call" role="group" aria-label="${escape(__('Incoming Call'))}">
+			<div class="vobiz-live-call-head" style="gap:12px;flex-wrap:wrap;margin-bottom:0">
+				<div><strong>${__('Incoming Call')}: ${escape(caller)}</strong><div>${escape(number)}</div></div>
+				<div class="vobiz-call-controls">
+					<button type="button" class="btn btn-success btn-sm" data-incoming-answer data-call-log="${escape(softphone.current_call_log)}" ${softphone.incoming_answering ? 'disabled' : ''}>
+						<i class="fa fa-phone"></i> ${softphone.incoming_answering ? __('Connecting…') : __('Pick Call')}
+					</button>
+				</div>
+			</div>
+		</div>`;
+	}
+
+	render_workdesk_incoming_controls() {
+		const $body = this.state.active_workdesk_body;
+		if ($body && $body.length) $body.find('[data-workdesk-incoming]').html(this.workdesk_incoming_controls_html());
+	}
+
+	async open_softphone_workdesk(expectedCallLog) {
+		const callLog = this.state.softphone.current_call_log;
+		if (!callLog || (expectedCallLog && expectedCallLog !== callLog) || this.softphone_workdesk_request) return;
+		const request = {};
+		const originalDialog = this.state.active_workdesk_dialog;
+		const stillCurrent = () => this.state.softphone.current_call_log === callLog;
+		this.softphone_workdesk_request = request;
+		this.render_browser_softphone();
+		try {
+			const response = await this.browser_request_with_timeout(frappe.call({
+				method: 'vobiz_click_to_call.api.call.get_call_status',
+				args: { call_log: callLog, sync_provider: 0 }
+			}));
+			const call = response.message || {};
+			if (!stillCurrent() || call.name !== callLog) return;
+			if (!call.reference_doctype || !call.reference_name) {
+				frappe.msgprint(__('This caller is not linked to a customer record yet. You can still pick up the call.'));
+				return;
+			}
+			const row = (this.state.queue || []).find(item => item.doctype === call.reference_doctype && item.name === call.reference_name)
+				|| { doctype: call.reference_doctype, name: call.reference_name, title: call.reference_title || call.reference_name,
+					phone: this.state.softphone.current_destination || call.customer_number_display || '' };
+			if (this.state.active_workdesk_dialog && this.state.active_workdesk_key === this.detail_key(row)) {
+				this.state.active_workdesk_dialog.show();
+				this.render_workdesk_incoming_controls();
+				return;
+			}
+			const details = await this.browser_request_with_timeout(frappe.call({
+				method: 'vobiz_click_to_call.api.console.get_reference_context',
+				args: { reference_doctype: row.doctype, reference_name: row.name, lite: 1 }
+			}));
+			if (!stillCurrent() || this.state.active_workdesk_dialog !== originalDialog) return;
+			const context = details.message || {};
+			const workdeskRow = { ...row, ...(context.reference || {}), doctype: row.doctype, name: row.name };
+			const open = () => {
+				if (!stillCurrent() || (this.state.active_workdesk_dialog && this.state.active_workdesk_dialog !== originalDialog)) return;
+				this.state.context = context;
+				this.state.selected = workdeskRow;
+				this.apply_context_dispositions(context);
+				this.open_detail_dialog(workdeskRow, context);
+			};
+			if (originalDialog && originalDialog.$wrapper.is(':visible')) {
+				originalDialog.$wrapper.one('hidden.bs.modal', open);
+				originalDialog.hide();
+			} else {
+				open();
+			}
+		} catch (_) {
+			if (stillCurrent()) frappe.msgprint(__('Could not open this customer’s workdesk. Please try again.'));
+		} finally {
+			if (this.softphone_workdesk_request === request) this.softphone_workdesk_request = null;
+			this.render_browser_softphone();
+		}
 	}
 
 	browser_softphone_live_html() {
@@ -1753,9 +1841,10 @@ class VobizAgentConsole {
 		return Boolean(s.current_call_log && (s.incoming_call_uuid || s.incoming_caller)) && !s.incoming_answered;
 	}
 
-	answer_browser_softphone() {
+	answer_browser_softphone(expectedCallLog) {
 		this.stop_browser_microphone_test();
 		const softphone = this.state.softphone;
+		if (expectedCallLog && softphone.current_call_log !== expectedCallLog) return;
 		if (!this.browser_incoming_waiting() || softphone.incoming_answering) return;
 		if (!softphone.client || !softphone.client.client) {
 			frappe.msgprint(__('Softphone is not connected yet.'));
@@ -1807,6 +1896,13 @@ class VobizAgentConsole {
 			}
 		}
 		pending.set(call.name, merged);
+		if (this.is_terminal_status(merged.status)) {
+			// Keep completion evidence after the disposition context is consumed.
+			// A slower console snapshot must not resurrect this same call.
+			const confirmed = this.confirmed_terminal_calls || (this.confirmed_terminal_calls = new Set());
+			confirmed.add(call.name);
+			if (confirmed.size > 200) confirmed.delete(confirmed.values().next().value);
+		}
 		return merged;
 	}
 
@@ -2127,6 +2223,12 @@ class VobizAgentConsole {
 			filters: JSON.stringify(this.state.queue_filters || [])
 		}).then((r) => {
 			const data = r.message || {};
+			const returnedCall = data.active_call || {};
+			if (this.confirmed_terminal_calls?.has(returnedCall.name) && !this.is_terminal_status(returnedCall.status)) {
+				// This response was captured before confirmed termination. Applying it
+				// would restore Connected/Busy and silently block Save Disposition.
+				return;
+			}
 			this.state.queue = data.queue || [];
 			this.state.queue_has_more = Boolean((data.queue_pagination || {}).has_more);
 			this.state.queue_meta = Object.assign(this.default_queue_meta(), data.queue_meta || {});
@@ -3499,6 +3601,7 @@ class VobizAgentConsole {
 		dialog.$wrapper.addClass('vobiz-workdesk-modal');
 		dialog.get_close_btn().show();
 		dialog.$wrapper.on('hidden.bs.modal', () => {
+			if (this.state.active_workdesk_dialog !== dialog) return;
 			this.state.active_workdesk_key = null;
 			this.state.active_workdesk_body = null;
 			this.state.active_workdesk_row = null;
@@ -3532,6 +3635,7 @@ class VobizAgentConsole {
 		};
 		$body.html(`
 			<div class="vobiz-detail-dialog">
+				<div data-workdesk-incoming></div>
 				<div class="vobiz-tabs">
 					<button class="active" data-detail-tab="summary">${frappe.utils.escape_html(this.queue_meta_value('summary_tab_label'))}</button>
 					<button data-detail-tab="encounters">${__('Encounters')}</button>
@@ -3543,6 +3647,8 @@ class VobizAgentConsole {
 				<div data-detail-panel></div>
 			</div>
 		`);
+		$body.on('click', '[data-incoming-answer]', (e) => this.answer_browser_softphone($(e.currentTarget).attr('data-call-log')));
+		this.render_workdesk_incoming_controls();
 		$body.on('click', '[data-detail-tab]', (e) => {
 			const tab = $(e.currentTarget).data('detail-tab');
 			this.load_workdesk_tab(row, context, tab, $body, render);

@@ -180,3 +180,35 @@ test('transient status failure retries instead of losing disposition', async () 
     t.timers.shift()();
     assert.equal(t.opened.length, 1);
 });
+
+test('late Connected console response cannot block Save after confirmed completion', async () => {
+    const t = setup(); let resolve;
+    t.obj.start_timer = () => {};
+    t.ctx.frappe.call = () => new Request(done => { resolve = done; });
+    t.obj.load();
+    t.obj.reconcile_browser_softphone_call(completed);
+    t.timers.shift()();
+    assert.equal(t.opened.length, 1);
+    // Prompting consumes the context queue; completion must still be remembered.
+    assert.equal(t.obj.completed_call_contexts.has('C1'), false);
+    resolve({message: {active_call: {...completed, status: 'Connected'}, queue: []}});
+    await flush();
+    assert.equal(t.obj.disposition_call_in_progress(), false, 'Save must not silently return for an ended call');
+    assert.equal(t.obj.state.active_call.last_call.status, 'Completed');
+    assert.equal(t.obj.state.softphone.current_call_log, '');
+});
+
+test('stale ended-call response preserves a different newer active call', async () => {
+    const t = setup(); let resolve;
+    t.obj.start_timer = () => {};
+    t.ctx.frappe.call = () => new Request(done => { resolve = done; });
+    t.obj.load();
+    t.obj.reconcile_browser_softphone_call(completed);
+    t.obj.state.active_call = {name: 'C2', status: 'Connected'};
+    Object.assign(t.obj.state.softphone, {current_call_log: 'C2', in_call: true});
+    resolve({message: {active_call: {...completed, status: 'Connected'}, queue: []}});
+    await flush();
+    assert.equal(t.obj.state.active_call.name, 'C2');
+    assert.equal(t.obj.disposition_call_in_progress(), true);
+    assert.equal(t.obj.state.softphone.current_call_log, 'C2');
+});
