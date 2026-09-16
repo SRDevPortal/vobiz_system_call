@@ -212,3 +212,66 @@ test('stale ended-call response preserves a different newer active call', async 
     assert.equal(t.obj.disposition_call_in_progress(), true);
     assert.equal(t.obj.state.softphone.current_call_log, 'C2');
 });
+
+test('terminal polling clears the matching stale console call after SDK cleanup', () => {
+    const t = setup();
+    Object.assign(t.obj.state.softphone, {current_call_log: '', in_call: false});
+    t.obj.state.active_call = {...completed, status: 'Initiated'};
+    t.obj.state.workdesk_live_call_log = 'C1';
+    t.obj.state.workdesk_live_call = t.obj.state.active_call;
+    assert.equal(t.obj.reconcile_browser_softphone_call(completed), true);
+    assert.equal(t.obj.state.active_call.name, undefined);
+    assert.equal(t.obj.state.active_call.last_call.status, 'Completed');
+    assert.equal(t.obj.state.workdesk_live_call_log, null);
+    t.obj.reconcile_browser_softphone_call(completed);
+    t.timers.shift()();
+    assert.equal(t.opened.length, 1);
+});
+
+test('console transition to idle drains an already queued disposition exactly once', () => {
+    const t = setup();
+    Object.assign(t.obj.state.softphone, {current_call_log: '', in_call: false});
+    t.obj.state.active_call = {...completed, status: 'Initiated'};
+    // Exercise the real queuing path while the old console snapshot still says busy.
+    Object.getPrototypeOf(t.obj).open_post_call_disposition_dialog.call(t.obj,
+        completed, {doctype: 'CRM Lead', name: 'LEAD1'}, null, {});
+    assert.equal(t.obj.pending_post_call_dispositions.size, 1);
+    t.obj.state.active_call = {};
+    t.obj.render_active_call();
+    t.obj.render_active_call();
+    assert.equal(t.timers.length, 1);
+    t.timers.shift()();
+    assert.equal(t.opened.length, 1);
+    assert.equal(t.opened[0][0].name, 'C1');
+    assert.equal(t.obj.pending_post_call_dispositions.size, 0);
+});
+
+test('a queued form waits if a newer call arrives before the drain timer', () => {
+    const t = setup();
+    t.obj.queue_post_call_disposition(completed, {doctype: 'CRM Lead', name: 'LEAD1'}, null, {});
+    Object.assign(t.obj.state.softphone, {current_call_log: '', in_call: false});
+    t.obj.state.active_call = {};
+    t.obj.render_active_call();
+    t.obj.state.active_call = {name: 'C2', status: 'Connected'};
+    Object.assign(t.obj.state.softphone, {current_call_log: 'C2', in_call: true});
+    t.timers.shift()();
+    assert.equal(t.opened.length, 0);
+    assert.equal(t.obj.pending_post_call_dispositions.size, 1);
+    assert.equal(t.obj.reconcile_browser_softphone_call(completed), false);
+    assert.equal(t.obj.state.active_call.name, 'C2');
+    assert.equal(t.obj.state.softphone.current_call_log, 'C2');
+});
+
+test('old stale console cleanup never resets a newer SDK call or its tracked record', () => {
+    const t = setup();
+    t.obj.state.active_call = {...completed, status: 'Initiated'};
+    Object.assign(t.obj.state.softphone, {current_call_log: 'C2', in_call: true});
+    t.obj.state.workdesk_live_call_log = 'C2';
+    t.obj.state.workdesk_live_call = {name: 'C2', status: 'Connected'};
+    t.obj.reconcile_browser_softphone_call(completed);
+    assert.equal(t.obj.state.softphone.current_call_log, 'C2');
+    assert.equal(t.obj.state.softphone.in_call, true);
+    assert.equal(t.obj.state.workdesk_live_call.name, 'C2');
+    assert.equal(t.opened.length, 0);
+    assert.equal(t.timers.length, 0);
+});

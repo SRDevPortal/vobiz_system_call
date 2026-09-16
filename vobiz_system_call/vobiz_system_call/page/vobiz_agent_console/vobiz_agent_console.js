@@ -1926,7 +1926,18 @@ class VobizAgentConsole {
 
 	reconcile_browser_softphone_call(call = {}) {
 		const softphone = this.state.softphone;
-		if (!call.name || !this.is_terminal_status(call.status) || softphone.current_call_log !== call.name) return false;
+		if (!call.name || !this.is_terminal_status(call.status)) return false;
+		if (softphone.current_call_log !== call.name) {
+			// The SDK can clear first. Reconcile only the matching server snapshot;
+			// an older completion must never reset or hang up a newer SDK session.
+			if ((this.state.active_call || {}).name !== call.name) return false;
+			call = this.completed_call_context(call);
+			this.state.active_call = { last_call: call };
+			this.clear_tracked_live_call(call.name);
+			this.render_active_call();
+			this.maybe_prompt_workdesk_disposition(call);
+			return true;
+		}
 		call = this.completed_call_context(call);
 		const sdk = softphone.client && softphone.client.client;
 		let matchingSession = false;
@@ -3179,6 +3190,7 @@ class VobizAgentConsole {
 		if (!skipDispositionPrompt && !this.disposition_call_in_progress() && this.completed_call_contexts?.size) {
 			for (const call of Array.from(this.completed_call_contexts.values())) this.maybe_prompt_workdesk_disposition(call);
 		}
+		this.sync_post_call_disposition();
 	}
 
 	render_call_assets(call) {
@@ -3630,10 +3642,11 @@ class VobizAgentConsole {
 			static: true,
 			fields: [{ fieldname: 'details', fieldtype: 'HTML' }],
 			primary_action_label: __('Start Call'),
-			primary_action: () => this.handle_workdesk_primary_action(row)
+			primary_action: () => this.handle_workdesk_primary_action(row, this.consume_workdesk_call_intent(dialog.get_primary_btn()[0]))
 		});
 		this.state.active_workdesk_dialog = dialog;
 		dialog.$wrapper.addClass('vobiz-workdesk-modal');
+		this.bind_workdesk_call_intent(dialog.$wrapper);
 		dialog.get_close_btn().show();
 		dialog.$wrapper.on('hidden.bs.modal', () => {
 			if (this.state.active_workdesk_dialog !== dialog) return;
@@ -3697,7 +3710,7 @@ class VobizAgentConsole {
 			const tab = $(e.currentTarget).data('detail-tab');
 			this.load_workdesk_tab(row, context, tab, $body, render);
 		});
-		$body.on('click', '[data-workdesk-action]', (e) => this.handle_workdesk_action($(e.currentTarget).data('workdesk-action'), row, context, $body));
+		$body.on('click', '[data-workdesk-action]', (e) => this.handle_workdesk_action($(e.currentTarget).data('workdesk-action'), row, context, $body, e));
 		$body.on('change', '[data-workdesk-status]', (e) => this.save_workdesk_status(row, context, $(e.currentTarget)));
 		// Scroll does not bubble; capture it for dynamically rendered chat lists.
 		$body.get(0).addEventListener('scroll', (e) => {
@@ -3753,9 +3766,43 @@ class VobizAgentConsole {
 		this.update_workdesk_primary_action(row);
 	}
 
-	handle_workdesk_primary_action(row) {
+	bind_workdesk_call_intent($wrapper) {
+		const selector = '[data-workdesk-action="call"], .btn-modal-primary';
+		$wrapper[0].addEventListener('click', event => {
+			if (event.detail <= 1 || !event.target.closest(selector)) return;
+			// The second half of a double click must not act on the new label.
+			event.preventDefault();
+			event.stopImmediatePropagation();
+			this.workdesk_call_intents?.delete(event.target.closest(selector));
+		}, true);
+		$wrapper.on('pointerdown keydown', selector, (event) => {
+			if (event.type === 'keydown' && !['Enter', ' '].includes(event.key)) return;
+			if (event.repeat) return;
+			const button = event.currentTarget;
+			this.workdesk_call_intents = this.workdesk_call_intents || new WeakMap();
+			this.workdesk_call_intents.set(button, { call_log: button.getAttribute('data-call-log') || '' });
+		});
+		$wrapper.on('pointercancel blur', selector, event => this.workdesk_call_intents?.delete(event.currentTarget));
+	}
+
+	consume_workdesk_call_intent(button) {
+		const intent = this.workdesk_call_intents?.get(button);
+		this.workdesk_call_intents?.delete(button);
+		return intent || { call_log: button?.getAttribute('data-call-log') || '' };
+	}
+
+	handle_workdesk_primary_action(row, intent) {
 		const call = this.matching_active_call(row);
-		if (call && call.name && !this.is_terminal_status(call.status)) {
+		const active = call && call.name && !this.is_terminal_status(call.status);
+		if (intent) {
+			if (intent.call_log) {
+				// A Stop gesture cannot become Start or target a replacement call.
+				if (active && call.name === intent.call_log) return this.cancel_call_log(intent.call_log, row);
+				return Promise.resolve();
+			}
+			// Likewise, a Start gesture must not hang up a call arriving meanwhile.
+			if (active) return Promise.resolve();
+		} else if (active) {
 			return this.cancel_call_log(call.name, row);
 		}
 		this.state.selected = row;
@@ -3772,7 +3819,8 @@ class VobizAgentConsole {
 		$buttons
 			.toggleClass('btn-primary', !isActive)
 			.toggleClass('btn-danger', isActive)
-			.prop('disabled', false)
+			.prop('disabled', !isActive && Boolean(this.start_call_in_flight))
+			.attr('data-call-log', isActive ? call.name : '')
 			.html(isActive
 				? `<i class="fa fa-phone"></i> ${__('Stop Call')}`
 				: `<i class="fa fa-phone"></i> ${__('Start Call')}`);
@@ -3788,6 +3836,7 @@ class VobizAgentConsole {
 			.toggleClass('btn-success', !isActive)
 			.toggleClass('btn-danger', isActive)
 			.attr('data-call-log', isActive ? call.name : '')
+			.prop('disabled', !isActive && Boolean(this.start_call_in_flight))
 			.html(isActive
 				? `<i class="fa fa-phone"></i> ${__('Stop Call')}`
 				: `<i class="fa fa-phone"></i> ${__('Start Call')}`);
@@ -4725,10 +4774,12 @@ class VobizAgentConsole {
 		`;
 	}
 
-	handle_workdesk_action(action, row, context, $body) {
+	handle_workdesk_action(action, row, context, $body, event) {
 		const workdesk = context.workdesk || {};
 		if (action === 'call') {
-			return this.handle_workdesk_primary_action(row);
+			const intent = event ? this.consume_workdesk_call_intent(event.currentTarget) : undefined;
+			if (event?.detail > 1) return Promise.resolve();
+			return this.handle_workdesk_primary_action(row, intent);
 		} else if (action === 'open-lead') {
 			this.remember_workdesk_return(row);
 			frappe.set_route('Form', row.doctype, row.name);
@@ -5887,6 +5938,20 @@ class VobizAgentConsole {
 
 	start_call_for_row(row, patientPhone = null, browserReady = false) {
 		if (!row) return Promise.resolve();
+		// Only the first caller owns the result (especially manual versus auto-dial).
+		if (this.start_call_in_flight) return Promise.resolve(null);
+		// Own the entire operation, including microphone checks and number selection.
+		const request = Promise.resolve().then(() => this.perform_start_call_for_row(row, patientPhone, browserReady));
+		this.start_call_in_flight = request.finally(() => {
+			this.start_call_in_flight = null;
+			this.update_workdesk_primary_action(this.state.active_workdesk_row);
+		});
+		this.update_workdesk_primary_action(this.state.active_workdesk_row);
+		return this.start_call_in_flight;
+	}
+
+	perform_start_call_for_row(row, patientPhone = null, browserReady = false) {
+		if (!row) return Promise.resolve();
 		const softphone = this.state.softphone;
 		if (!browserReady) {
 			return Promise.resolve(softphone.config_promise).then(() => {
@@ -5897,10 +5962,10 @@ class VobizAgentConsole {
 						if (!softphone.registered || this.browser_softphone_reconnecting()) {
 							throw new Error(__('Wait for the softphone to reconnect before calling.'));
 						}
-						return this.start_call_for_row(row, patientPhone, true);
+						return this.perform_start_call_for_row(row, patientPhone, true);
 					});
 				}
-				return this.start_call_for_row(row, patientPhone, true);
+				return this.perform_start_call_for_row(row, patientPhone, true);
 			});
 		}
 		if (row.doctype === 'Patient' && !patientPhone) {
@@ -5914,7 +5979,7 @@ class VobizAgentConsole {
 				if (choices.length > 1) {
 					return this.select_patient_phone(row, choices);
 				}
-				return this.start_call_for_row(row, choices[0] || {
+				return this.perform_start_call_for_row(row, choices[0] || {
 					fieldname: row.phone_field,
 					number: row.phone
 				});
@@ -6014,11 +6079,12 @@ class VobizAgentConsole {
 				}],
 				primary_action_label: __('Start Call'),
 				primary_action: (values) => {
+					if (callStarted) return;
 					const selected = optionMap[values.patient_number];
 					if (!selected) return;
 					callStarted = true;
 					dialog.hide();
-					resolve(this.start_call_for_row(row, selected));
+					resolve(this.perform_start_call_for_row(row, selected));
 				}
 			});
 			dialog.$wrapper.on('hidden.bs.modal', () => {
