@@ -528,9 +528,18 @@ class VobizAgentConsole {
 				.vobiz-wa-message.outbound { background: #ecfdf5; justify-self: end; }
 				.vobiz-wa-message-meta { color: #6b7280; font-size: 11px; font-weight: 700; margin-bottom: 4px; }
 				.vobiz-wa-message-body { font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+				.vobiz-wa-delivery-status { align-items: center; color: #64748b; display: flex; font-size: 11px; gap: 4px; justify-content: flex-end; margin-top: 4px; }
+				.vobiz-wa-delivery-status svg { height: 12px; width: 18px; }
+				.vobiz-wa-delivery-status.is-read { color: #0369a1; }
+				.vobiz-wa-delivery-status.is-failed { color: #b91c1c; }
 				.vobiz-wa-media { display: block; margin-top: 6px; }
 				.vobiz-wa-image { border-radius: 8px; display: block; height: auto; max-height: 360px; max-width: 260px; object-fit: contain; width: auto; }
 				.vobiz-wa-media-link { align-items: center; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; display: inline-flex; gap: 8px; padding: 8px 10px; text-decoration: none; }
+				.vobiz-wa-window { align-items: center; background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; color: #78350f; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding: 10px 12px; font-size: 12px; }
+				.vobiz-wa-window span { flex: 1 1 220px; }
+				.vobiz-wa-window.is-open { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
+				.vobiz-wa-window.is-pending { background: #f8fafc; border-color: #e2e8f0; color: #475569; }
+				.vobiz-wa-icon-btn:disabled { opacity: .45; cursor: not-allowed; }
 				.vobiz-wa-composer { align-items: center; background: #fff; border: 1px solid #e5e7eb; border-radius: 18px; box-shadow: 0 1px 6px rgba(15, 23, 42, .06); display: grid; gap: 6px; grid-template-columns: 32px 32px 32px minmax(0, 1fr) 42px; margin-top: 12px; max-width: 100%; min-width: 0; overflow: visible; padding: 8px 10px; width: 100%; }
 				.vobiz-wa-icon-btn { align-items: center; background: transparent; border: 0; color: #111827; display: inline-flex; font-size: 17px; height: 32px; justify-content: center; min-width: 32px; padding: 0; width: 32px; }
 				.vobiz-wa-attach-wrap, .vobiz-wa-emoji-wrap { position: relative; }
@@ -665,6 +674,9 @@ class VobizAgentConsole {
 		$(document).on('visibilitychange.vobiz-agent-console', () => {
 			if (!document.hidden && this.is_console_visible()) {
 				this.start_console_heartbeat();
+				this.schedule_whatsapp_sync(0);
+			} else {
+				this.stop_whatsapp_sync();
 			}
 		});
 		$(document).on('vobiz_availability_changed.vobiz-agent-console', (event, data) => {
@@ -1456,9 +1468,13 @@ class VobizAgentConsole {
 	}
 
 	send_browser_window_presence(registered, claimIdle = false) {
+		const s = this.state.softphone;
+		const healthyCall = registered && s.registered && s.in_call && s.recovery_media_connected
+			&& !s.pending_end_call && !s.recovery_verification && !Object.keys(s.network_issues || {}).length;
 		const request = frappe.call({
 			method: 'vobiz_system_call.api.webrtc.browser_presence',
-			args: { tab_id: this.get_softphone_tab_id(), registered: registered ? 1 : 0, claim_idle: registered && claimIdle ? 1 : 0 },
+			args: { tab_id: this.get_softphone_tab_id(), registered: registered ? 1 : 0,
+				claim_idle: registered && claimIdle ? 1 : 0, call_log: healthyCall ? s.current_call_log : '' },
 			silent: true
 		});
 		return this.browser_request_with_timeout(request).then(r => {
@@ -1814,7 +1830,7 @@ class VobizAgentConsole {
 		return this.browser_request_with_timeout(frappe.call({
 			method: 'vobiz_system_call.api.webrtc.verify_browser_call',
 			args: {call_log: callLog}, silent: true
-		}), 15000).then(r => {
+		}), 30000).then(r => {
 			if (softphone.client !== vobiz || softphone.current_call_log !== callLog) return;
 			const call = r.message || {};
 			if (call.name !== callLog) return;
@@ -2272,6 +2288,7 @@ class VobizAgentConsole {
 	}
 
 	on_page_show() {
+		this.schedule_whatsapp_sync(0);
 		$(document).trigger('vobiz_refresh_availability');
 		this.state.restore_checked = false;
 		this.note_agent_activity();
@@ -2282,6 +2299,7 @@ class VobizAgentConsole {
 	}
 
 	on_page_hide() {
+		this.stop_whatsapp_sync();
 		this.stop_browser_microphone_test();
 		this.stop_console_heartbeat();
 	}
@@ -2421,13 +2439,26 @@ class VobizAgentConsole {
 		this.patient_routed_handler = (payload) => this.handle_patient_routed_call(payload || {});
 		this.call_disconnected_handler = (payload) => this.handle_call_disconnected(payload || {});
 		this.softphone_ownership_handler = (payload) => this.handle_softphone_ownership(payload || {});
+		this.whatsapp_message_handler = (payload) => this.handle_whatsapp_message(payload || {});
+		this.whatsapp_status_handler = (payload) => this.handle_whatsapp_status(payload || {});
 		frappe.realtime.on('vobiz_customer_callback', this.callback_handler);
 		frappe.realtime.on('vobiz_patient_routed_call', this.patient_routed_handler);
 		frappe.realtime.on('vobiz_call_disconnected', this.call_disconnected_handler);
 		frappe.realtime.on('vobiz_softphone_ownership', this.softphone_ownership_handler);
+		frappe.realtime.on('wa_chat_new_message', this.whatsapp_message_handler);
+		frappe.realtime.on('wa_chat_message_status_updated', this.whatsapp_status_handler);
 	}
 
 	unbind_realtime() {
+		this.stop_whatsapp_sync();
+		if (frappe.realtime && this.whatsapp_message_handler && frappe.realtime.off) {
+			frappe.realtime.off('wa_chat_new_message', this.whatsapp_message_handler);
+		}
+		this.whatsapp_message_handler = null;
+		if (frappe.realtime && this.whatsapp_status_handler && frappe.realtime.off) {
+			frappe.realtime.off('wa_chat_message_status_updated', this.whatsapp_status_handler);
+		}
+		this.whatsapp_status_handler = null;
 		if (frappe.realtime && this.callback_handler && frappe.realtime.off) {
 			frappe.realtime.off('vobiz_customer_callback', this.callback_handler);
 		}
@@ -3050,6 +3081,8 @@ class VobizAgentConsole {
 			}
 		});
 		dialog.$wrapper.on('hidden.bs.modal', () => {
+			if (this.state.active_workdesk_dialog !== dialog) return;
+			this.stop_whatsapp_sync();
 			if (this.auto_call_dialog === dialog) {
 				this.auto_call_dialog = null;
 			}
@@ -3604,6 +3637,8 @@ class VobizAgentConsole {
 		dialog.get_close_btn().show();
 		dialog.$wrapper.on('hidden.bs.modal', () => {
 			if (this.state.active_workdesk_dialog !== dialog) return;
+			this.close_whatsapp_media_viewer();
+			dialog.$wrapper.find('[data-wa-playback]').each((_, media) => { media.pause(); media.removeAttribute('src'); media.load(); });
 			this.state.active_workdesk_key = null;
 			this.state.active_workdesk_body = null;
 			this.state.active_workdesk_row = null;
@@ -3614,8 +3649,13 @@ class VobizAgentConsole {
 		});
 		dialog.show();
 		const $body = dialog.get_field('details').$wrapper;
+		$body.attr('data-wa-reference', '1').data('whatsapp-reference', {
+			reference_doctype: row.doctype,
+			reference_name: row.name
+		});
 		this.state.active_workdesk_body = $body;
 		const render = (tab) => {
+			this.stop_whatsapp_sync();
 			$body.find('[data-detail-tab]').removeClass('active');
 			$body.find(`[data-detail-tab="${tab}"]`).addClass('active');
 			const workdesk = context.workdesk || {};
@@ -3629,7 +3669,9 @@ class VobizAgentConsole {
 				$body.find('[data-detail-panel]').html(this.workdesk_vobiz_html(workdesk, context.history || []));
 			} else if (tab === 'whatsapp') {
 				$body.find('[data-detail-panel]').html(this.workdesk_whatsapp_html(workdesk));
+				this.initialize_whatsapp_window($body, workdesk.whatsapp || {});
 				setTimeout(() => this.scroll_whatsapp_to_bottom($body), 50);
+				this.schedule_whatsapp_sync(0);
 			} else {
 				$body.find('[data-detail-panel]').html(this.workdesk_lead_html(row, context));
 				this.render_workdesk_live_call();
@@ -3657,14 +3699,21 @@ class VobizAgentConsole {
 		});
 		$body.on('click', '[data-workdesk-action]', (e) => this.handle_workdesk_action($(e.currentTarget).data('workdesk-action'), row, context, $body));
 		$body.on('change', '[data-workdesk-status]', (e) => this.save_workdesk_status(row, context, $(e.currentTarget)));
-		$body.on('scroll', '[data-wa-chat-list]', (e) => {
-			const el = e.currentTarget;
+		// Scroll does not bubble; capture it for dynamically rendered chat lists.
+		$body.get(0).addEventListener('scroll', (e) => {
+			const el = e.target;
+			if (!el.matches('[data-wa-chat-list]')) return;
 			if (el.scrollTop <= 80) {
 				this.load_more_whatsapp_messages($(el));
 			}
-		});
+			const view = this.active_whatsapp_view();
+			if (view && view.element === el) this.mark_visible_whatsapp_read(view);
+		}, true);
 		$body.on('click', '[data-wa-loader]', (e) => this.load_more_whatsapp_messages($(e.currentTarget).closest('[data-wa-chat-list]')));
 		$body.on('click', '[data-wa-send]', () => this.send_workdesk_whatsapp($body));
+		$body.on('click', '[data-wa-image-view]', (event) => { event.preventDefault(); this.open_whatsapp_media_viewer($body, event.currentTarget); });
+		$body.on('click', '[data-wa-media-download]', (event) => this.prepare_whatsapp_media_download($body, event));
+		$body.on('click', '[data-wa-window-retry]', () => this.schedule_whatsapp_sync(0));
 		$body.on('click', '[data-wa-template]', () => this.open_workdesk_template_dialog($body));
 		$body.on('click', '[data-wa-attach]', (e) => {
 			e.stopPropagation();
@@ -3768,6 +3817,7 @@ class VobizAgentConsole {
 			}
 		}).then((r) => {
 			const data = r.message || {};
+			if (data.whatsapp) data.whatsapp.window_received_at = Date.now();
 			context.workdesk = Object.assign(context.workdesk || {}, data);
 			if (data.history) {
 				context.history = data.history;
@@ -4464,8 +4514,23 @@ class VobizAgentConsole {
 				<div class="vobiz-wa-message-meta">${frappe.utils.escape_html(meta)}</div>
 				${body ? `<div class="vobiz-wa-message-body">${frappe.utils.escape_html(body)}</div>` : ''}
 				${media}
+				${side === 'outbound' ? this.whatsapp_delivery_status_html(message.name, message.delivery_status) : ''}
 			</div>
 		`;
+	}
+
+	whatsapp_delivery_status_html(message_name, delivery_status) {
+		const status = String(delivery_status || 'Pending').toLowerCase();
+		const labels = { pending: __('Pending'), sent: __('Sent'), delivered: __('Delivered'), read: __('Read'), failed: __('Failed') };
+		const label = labels[status] || __('Unknown');
+		const state = labels[status] ? status : 'unknown';
+		let icon;
+		if (['sent', 'delivered', 'read'].includes(state)) {
+			icon = `<svg viewBox="0 0 18 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M1.2 6.4 4.6 9.8 11.7 2.2"/>${state !== 'sent' ? '<path d="M6.1 6.4 9.5 9.8 16.6 2.2"/>' : ''}</svg>`;
+		} else {
+			icon = `<i class="fa ${state === 'failed' ? 'fa-exclamation-circle' : 'fa-clock-o'}" aria-hidden="true"></i>`;
+		}
+		return `<span class="vobiz-wa-delivery-status is-${state}" data-wa-status-message="${frappe.utils.escape_html(message_name || '')}" data-wa-status="${state}" title="${frappe.utils.escape_html(label)}" aria-label="${frappe.utils.escape_html(label)}">${icon}<span>${frappe.utils.escape_html(label)}</span></span>`;
 	}
 
 	workdesk_whatsapp_message_body_text(message) {
@@ -4494,51 +4559,168 @@ class VobizAgentConsole {
 	}
 
 	workdesk_whatsapp_media_url(message) {
-		return message.display_media_url || message.media_url || message.attachment_url || '';
+		const url = String(message.display_media_url || message.media_url || message.attachment_url || '').trim();
+		return /^https?:\/\/\S+$/i.test(url) || /^\/(?:private\/)?files\/\S+$/.test(url) ? url : '';
 	}
 
 	workdesk_whatsapp_media_html(message) {
 		const url = this.workdesk_whatsapp_media_url(message);
 		if (!url) return '';
-		const contentType = String(message.content_type || '').toLowerCase();
-		const safeUrl = frappe.utils.escape_html(url);
-		const lowerUrl = String(url).toLowerCase();
-		const isImage = contentType === 'image' || /\.(png|jpe?g|gif|webp|bmp|svg)(\?|#|$)/.test(lowerUrl);
-		if (isImage) {
-			return `
-				<a class="vobiz-wa-media" href="${safeUrl}" target="_blank" rel="noopener">
-					<img class="vobiz-wa-image" src="${safeUrl}" alt="${__('WhatsApp image')}">
-				</a>
-			`;
+		const kind = String(message.media_content_type || message.content_type || '').toLowerCase();
+		const safe = frappe.utils.escape_html(url);
+		const is_image = ['image', 'sticker'].includes(kind) || /\.(png|jpe?g|gif|webp|bmp|svg|avif)(\?|#|$)/i.test(url);
+		const is_video = kind === 'video' || /\.(mp4|webm|mov)(\?|#|$)/i.test(url);
+		const is_audio = kind === 'audio' || /\.(mp3|ogg|oga|wav|m4a|aac)(\?|#|$)/i.test(url);
+		const download = `<a class="btn btn-link btn-xs" href="${safe}" data-wa-media-download download>${__('Download')}</a>`;
+		if (is_image) return `<a class="vobiz-wa-media" href="${safe}" data-wa-image-view data-wa-media-url="${safe}" aria-label="${__('View image')}" target="_blank" rel="noopener noreferrer"><img class="vobiz-wa-image" src="${safe}" alt="${__('WhatsApp image')}" loading="lazy"></a><div>${download}</div>`;
+		if (is_video || is_audio) {
+			const tag = is_video ? 'video' : 'audio';
+			return `<${tag} controls preload="none" data-wa-playback style="display:block;max-width:100%;width:${is_video ? '320' : '280'}px;${is_video ? 'max-height:260px;' : ''}" src="${safe}"></${tag}><div><a class="btn btn-link btn-xs" href="${safe}" target="_blank" rel="noopener noreferrer">${__('Open original')}</a>${download}</div>`;
 		}
-		return `
-			<a class="vobiz-wa-media vobiz-wa-media-link" href="${safeUrl}" target="_blank" rel="noopener">
-				<i class="fa fa-paperclip"></i>
-				<span>${frappe.utils.escape_html(message.content_type || __('Attachment'))}</span>
-			</a>
-		`;
+		return `<a class="vobiz-wa-media vobiz-wa-media-link" href="${safe}" target="_blank" rel="noopener noreferrer"><i class="fa fa-file-o"></i><span>${frappe.utils.escape_html(message.file_name || message.media_content_type || message.content_type || __('Attachment'))}</span></a><div>${download}</div>`;
+	}
+
+	whatsapp_media_proxy_url($body, message, download = false) {
+		const args = { message: String(message), ...$body.data('whatsapp-reference') };
+		if (download) args.download = 1;
+		return '/api/method/vobiz_click_to_call.api.console.get_whatsapp_message_media?'
+			+ Object.entries(args).filter(([, value]) => value != null && value !== '').map(([key, value]) => encodeURIComponent(key) + '=' + encodeURIComponent(value)).join('&');
+	}
+
+	prepare_whatsapp_media_download($body, event) {
+		const $link = $(event.currentTarget);
+		const message = $link.closest('[data-wa-message]').attr('data-wa-message');
+		if (message && /^https?:\/\//i.test($link.attr('href') || '')) {
+			$link.attr('href', this.whatsapp_media_proxy_url($body, message, true));
+		}
+	}
+
+	close_whatsapp_media_viewer() {
+		const viewer = this.whatsapp_media_viewer;
+		this.whatsapp_media_viewer = null;
+		if (viewer) viewer.dialog.hide();
+	}
+
+	open_whatsapp_media_viewer($body, clicked) {
+		const view = this.active_whatsapp_view();
+		if (!view || view.$body.get(0) !== $body.get(0)) return;
+		const items = [];
+		let selected = 0;
+		$body.find('[data-wa-image-view]').each((_, element) => {
+			const $link = $(element);
+			const url = this.workdesk_whatsapp_media_url({ media_url: $link.attr('data-wa-media-url') });
+			if (!url) return;
+			if (element === clicked) selected = items.length;
+			const $message = $link.closest('[data-wa-message]');
+			items.push({ url, name: $message.attr('data-wa-message'), caption: $message.find('.vobiz-wa-message-body').text() || __('Image') });
+		});
+		if (!items.length) return;
+		this.close_whatsapp_media_viewer();
+		const dialog = new frappe.ui.Dialog({
+			title: __('WhatsApp images'), size: 'large',
+			fields: [{ fieldname: 'viewer', fieldtype: 'HTML', options: `
+				<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+					<button class="btn btn-default btn-sm" type="button" data-wa-viewer-prev aria-label="${__('Previous image')}">${__('Previous')}</button>
+					<span data-wa-viewer-count></span>
+					<button class="btn btn-default btn-sm" type="button" data-wa-viewer-next aria-label="${__('Next image')}">${__('Next')}</button>
+					<button class="btn btn-default btn-sm" type="button" data-wa-viewer-zoom-out aria-label="${__('Zoom out')}">&minus;</button>
+					<button class="btn btn-default btn-sm" type="button" data-wa-viewer-reset title="${__('Fit image')}" aria-label="${__('Fit image')}">${__('Fit')}</button>
+					<button class="btn btn-default btn-sm" type="button" data-wa-viewer-zoom-in aria-label="${__('Zoom in')}">+</button>
+					<a class="btn btn-default btn-sm" data-wa-viewer-open target="_blank" rel="noopener noreferrer">${__('Open original')}</a>
+					<a class="btn btn-default btn-sm" data-wa-viewer-download download>${__('Download')}</a>
+				</div>
+				<div data-wa-viewer-status role="status" aria-live="polite"></div>
+				<div data-wa-viewer-stage style="height:60vh;overflow:auto;background:#f8fafc;border-radius:8px;"></div>
+				<div data-wa-viewer-caption style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px;"></div>` }]
+		});
+		const viewer = { dialog, items, index: selected, scale: 1 };
+		this.whatsapp_media_viewer = viewer;
+		const $root = dialog.$wrapper;
+		const $stage = $root.find('[data-wa-viewer-stage]');
+		const zoom = () => {
+			const $image = $stage.find('img');
+			const image = $image.get(0);
+			if (!image) return;
+			const width = image.naturalWidth || $stage.width() || 600;
+			const height = image.naturalHeight || width;
+			const fit = Math.min(width, $stage.width() || width, ($stage.height() || 500) * width / height);
+			$image.css({ width: fit * viewer.scale + 'px', maxWidth: 'none', height: 'auto' });
+			$root.find('[data-wa-viewer-zoom-out]').prop('disabled', viewer.scale <= 0.5);
+			$root.find('[data-wa-viewer-zoom-in]').prop('disabled', viewer.scale >= 4);
+			$root.find('[data-wa-viewer-reset]').text(Math.round(viewer.scale * 100) + '%');
+		};
+		const render = () => {
+			const item = items[viewer.index];
+			viewer.scale = 1;
+			$stage.empty();
+			$root.find('[data-wa-viewer-count]').text((viewer.index + 1) + ' / ' + items.length);
+			$root.find('[data-wa-viewer-prev], [data-wa-viewer-next]').prop('disabled', items.length < 2);
+			$root.find('[data-wa-viewer-caption]').text(item.caption);
+			$root.find('[data-wa-viewer-open]').attr('href', item.url);
+			$root.find('[data-wa-viewer-download]').attr('href', /^https?:\/\//i.test(item.url) && item.name ? this.whatsapp_media_proxy_url($body, item.name, true) : item.url);
+			$root.find('[data-wa-viewer-status]').text(__('Loading image...'));
+			const $image = $('<img>', { alt: item.caption, style: 'display:block;margin:0 auto;', referrerpolicy: 'no-referrer' });
+			let retried = false;
+			const current = () => this.whatsapp_media_viewer === viewer && $stage.find('img').get(0) === $image.get(0);
+			$image.on('load', () => { if (current()) { $root.find('[data-wa-viewer-status]').text(''); zoom(); } });
+			$image.on('error', () => {
+				if (!current()) return;
+				if (!retried && item.name && /^https?:\/\//i.test(item.url)) {
+					retried = true;
+					$image.attr('src', this.whatsapp_media_proxy_url($body, item.name));
+					return;
+				}
+				$image.hide();
+				$root.find('[data-wa-viewer-status]').text(__('Image could not be loaded. Try Open original or Download.'));
+			});
+			$stage.append($image);
+			$image.attr('src', item.url);
+			zoom();
+		};
+		const move = delta => { viewer.index = (viewer.index + delta + items.length) % items.length; render(); };
+		$root.on('click', '[data-wa-viewer-prev]', () => move(-1));
+		$root.on('click', '[data-wa-viewer-next]', () => move(1));
+		$root.on('click', '[data-wa-viewer-zoom-in]', () => { viewer.scale = Math.min(4, viewer.scale + 0.25); zoom(); });
+		$root.on('click', '[data-wa-viewer-zoom-out]', () => { viewer.scale = Math.max(0.5, viewer.scale - 0.25); zoom(); });
+		$root.on('click', '[data-wa-viewer-reset]', () => { viewer.scale = 1; zoom(); });
+		$root.on('keydown', event => {
+			if (!['Escape', 'ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+			event.preventDefault(); event.stopPropagation();
+			if (event.key === 'Escape') this.close_whatsapp_media_viewer();
+			else move(event.key === 'ArrowLeft' ? -1 : 1);
+		});
+		$root.on('hidden.bs.modal', () => { if (this.whatsapp_media_viewer === viewer) this.whatsapp_media_viewer = null; $stage.empty(); });
+		dialog.show();
+		render();
 	}
 
 	workdesk_whatsapp_composer_html() {
 		const emojis = ['😀', '😊', '🙏', '👍', '❤️', '😂', '🎉', '✅', '📞', '💊', '🩺', '💬', '🙌', '😇', '🤝', '⭐'];
 		return `
+			<div class="vobiz-wa-window is-pending" data-wa-window-banner role="status" aria-live="polite">
+				<span data-wa-window-text>${__('Checking the messaging window...')}</span>
+				<button class="btn btn-default btn-xs" type="button" data-wa-window-retry style="display:none">${__('Retry')}</button>
+				<button class="btn btn-default btn-xs" type="button" data-wa-template>${__('Use template')}</button>
+			</div>
 			<div class="vobiz-wa-composer">
 				<div class="vobiz-wa-attach-wrap">
-					<button class="vobiz-wa-icon-btn" type="button" data-wa-attach title="${__('Attach')}"><i class="fa fa-plus"></i></button>
+					<button class="vobiz-wa-icon-btn" type="button" data-wa-attach disabled title="${__('Attach')}"><i class="fa fa-plus"></i></button>
 					<div class="vobiz-wa-menu" data-wa-attach-menu>
 						<button type="button" data-wa-attach-action="image"><i class="fa fa-image"></i> ${__('Photo')}</button>
 						<button type="button" data-wa-attach-action="document"><i class="fa fa-file-text-o"></i> ${__('Document')}</button>
+						<button type="button" data-wa-attach-action="audio"><i class="fa fa-volume-up"></i> ${__('Audio')}</button>
+						<button type="button" data-wa-attach-action="sticker"><i class="fa fa-sticky-note-o"></i> ${__('Sticker')}</button>
 					</div>
 				</div>
 				<button class="vobiz-wa-icon-btn" type="button" data-wa-template title="${__('Template')}"><i class="fa fa-file-text-o"></i></button>
 				<div class="vobiz-wa-emoji-wrap">
-					<button class="vobiz-wa-icon-btn" type="button" data-wa-emoji title="${__('Emoji')}"><i class="fa fa-smile-o"></i></button>
+					<button class="vobiz-wa-icon-btn" type="button" data-wa-emoji disabled title="${__('Emoji')}"><i class="fa fa-smile-o"></i></button>
 					<div class="vobiz-wa-menu vobiz-wa-emoji-menu" data-wa-emoji-menu>
 						${emojis.map((emoji) => `<button type="button" data-wa-emoji-value="${emoji}">${emoji}</button>`).join('')}
 					</div>
 				</div>
-				<textarea class="form-control" data-wa-reply placeholder="${__('Type a message')}"></textarea>
-				<button class="vobiz-wa-send" type="button" data-wa-send title="${__('Send')}"><i class="fa fa-paper-plane"></i></button>
+				<textarea class="form-control" data-wa-reply disabled placeholder="${__('Type a message')}"></textarea>
+				<button class="vobiz-wa-send" type="button" data-wa-send disabled title="${__('Send')}"><i class="fa fa-paper-plane"></i></button>
 			</div>
 		`;
 	}
@@ -4643,8 +4825,312 @@ class VobizAgentConsole {
 		});
 	}
 
+	active_whatsapp_view() {
+		if (!this.is_console_visible() || document.hidden) return null;
+		const $body = this.state.active_workdesk_body;
+		if (!$body || !$body.length) return null;
+		const $list = $body.find('[data-wa-chat-list]').first();
+		const element = $list.get(0);
+		const conversation = $list.attr('data-conversation');
+		if (!element || !conversation || !document.documentElement.contains(element)) return null;
+		return { $body, $list, element, conversation };
+	}
+
+	is_current_whatsapp_view(view) {
+		const current = this.active_whatsapp_view();
+		return !!current && current.element === view.element && current.conversation === view.conversation;
+	}
+
+	stop_whatsapp_sync() {
+		if (this.whatsapp_attachment_dialog) this.whatsapp_attachment_dialog.hide();
+		this.close_whatsapp_media_viewer();
+		const $body = this.state && this.state.active_workdesk_body;
+		if ($body) $body.find('[data-wa-playback]').each((_, media) => { if (typeof media.pause === 'function') media.pause(); });
+		clearTimeout(this.whatsapp_window_timer);
+		this.whatsapp_window_timer = null;
+		clearTimeout(this.whatsapp_sync_timer);
+		this.whatsapp_sync_timer = null;
+		this.whatsapp_sync_request = null;
+		this.whatsapp_read_request = null;
+		this.whatsapp_status_priority = new Set();
+		this.whatsapp_status_offset = 0;
+	}
+
+	schedule_whatsapp_sync(delay = 10000) {
+		clearTimeout(this.whatsapp_sync_timer);
+		this.whatsapp_sync_timer = null;
+		if (!this.active_whatsapp_view()) return;
+		this.whatsapp_sync_timer = setTimeout(() => this.sync_inline_whatsapp(), delay);
+	}
+
+	handle_whatsapp_message(payload) {
+		const view = this.active_whatsapp_view();
+		if (!view || String(payload.conversation || '') !== view.conversation) return;
+		view.$list.data('wa-read-state', null);
+		// Fetch through the console's permission checks instead of trusting broadcast content.
+		this.schedule_whatsapp_sync(150);
+	}
+
+	handle_whatsapp_status(payload) {
+		const view = this.active_whatsapp_view();
+		if (!view || String(payload.conversation || '') !== view.conversation) return;
+		this.whatsapp_status_priority = this.whatsapp_status_priority || new Set();
+		if (payload.message) this.whatsapp_status_priority.add(String(payload.message));
+		this.schedule_whatsapp_sync(150);
+	}
+
+	whatsapp_status_message_names(view) {
+		const names = [];
+		view.$list.find('[data-wa-status-message]').each((_, el) => names.push(el.getAttribute('data-wa-status-message')));
+		if (!names.length) return [];
+		const visible = new Set(names);
+		const selected = new Set([...(this.whatsapp_status_priority || [])].filter(name => visible.has(name)).slice(0, 100));
+		this.whatsapp_status_priority = new Set();
+		let offset = (this.whatsapp_status_offset || 0) % names.length;
+		for (let count = 0; count < names.length && selected.size < 100; count++) {
+			selected.add(names[offset]);
+			offset = (offset + 1) % names.length;
+		}
+		this.whatsapp_status_offset = offset;
+		return [...selected];
+	}
+
+	update_whatsapp_message_statuses(view, statuses) {
+		const updates = new Map(statuses.map(row => [String(row.name), row.delivery_status]));
+		view.$list.find('[data-wa-status-message]').each((_, el) => {
+			const name = el.getAttribute('data-wa-status-message');
+			if (!updates.has(name)) return;
+			const status = String(updates.get(name) || 'Pending').toLowerCase();
+			if (el.getAttribute('data-wa-status') === status) return;
+			$(el).replaceWith(this.whatsapp_delivery_status_html(name, updates.get(name)));
+		});
+	}
+
+	initialize_whatsapp_window($body, wa) {
+		const view = this.active_whatsapp_view();
+		if (!view || view.$body.get(0) !== $body.get(0)) return;
+		// Use the initial chat response; guidance must not depend on incremental history polling.
+		wa.window_received_at = wa.window_received_at || Date.now();
+		if (wa.messaging_window) this.apply_whatsapp_window(view, wa.messaging_window, wa.window_received_at);
+		else this.whatsapp_window_check_failed(view);
+	}
+
+	whatsapp_window_check_failed(view) {
+		if (!this.is_current_whatsapp_view(view)) return;
+		const snapshot = view.$list.data('wa-window-state');
+		if (!snapshot || !snapshot.state) view.$list.data('wa-window-state', { state: null, failed: true });
+		this.render_whatsapp_window(view);
+	}
+
+	apply_whatsapp_window(view, state, requested_at = Date.now()) {
+		if (!this.is_current_whatsapp_view(view)) return;
+		// Compare server timestamps in the same timezone, then use elapsed client time.
+		// This avoids depending on the agent computer's timezone or clock setting.
+		const timestamp = value => Date.parse(String(value || '').replace(' ', 'T') + 'Z');
+		const remaining = state && state.can_send_free_form
+			? timestamp(state.free_form_expires_at) - timestamp(state.server_time) : 0;
+		view.$list.data('wa-window-state', {
+			state,
+			deadline: Number.isFinite(remaining) ? requested_at + remaining : 0
+		});
+		this.render_whatsapp_window(view);
+	}
+
+	whatsapp_window_guidance(snapshot) {
+		const state = snapshot && snapshot.state;
+		if (!state) return {
+			kind: snapshot && snapshot.failed ? 'error' : 'pending', can_send: false,
+			text: snapshot && snapshot.failed
+				? __('Could not check the messaging window. Retrying automatically. You can retry now or use an approved template.')
+				: __('Checking the messaging window. You can use an approved template while we check.')
+		};
+		if (state.can_send_free_form === true && snapshot.deadline > Date.now()) {
+			const label = state.reason === 'ctwa_72h'
+				? __('Click-to-WhatsApp messaging window open') : __('Messaging window open');
+			const expires = frappe.datetime.str_to_user(state.free_form_expires_at);
+			return { kind: 'open', can_send: true,
+				text: label + ' - ' + __('You can send normal messages, photos and documents until') + ' ' + expires + '.' };
+		}
+		return { kind: 'closed', can_send: false,
+			text: !state.last_customer_message_at
+				? __('No incoming message from this patient yet. Send an approved template to start the conversation. Normal messages become available after the patient replies.')
+				: __('Messaging window closed. Send an approved template to re-engage this patient. Normal messages become available after the patient replies.') };
+	}
+
+	render_whatsapp_window(view) {
+		if (!this.is_current_whatsapp_view(view)) return;
+		clearTimeout(this.whatsapp_window_timer);
+		this.whatsapp_window_timer = null;
+		const snapshot = view.$list.data('wa-window-state');
+		const guidance = this.whatsapp_window_guidance(snapshot);
+		const $banner = view.$body.find('[data-wa-window-banner]');
+		$banner.attr('class', 'vobiz-wa-window is-' + guidance.kind);
+		$banner.find('[data-wa-window-text]').text(guidance.text);
+		$banner.find('[data-wa-template]').toggle(!guidance.can_send);
+		$banner.find('[data-wa-window-retry]').toggle(guidance.kind === 'error');
+		view.$body.find('[data-wa-reply], [data-wa-attach], [data-wa-emoji]').prop('disabled', !guidance.can_send);
+		view.$body.find('[data-wa-send]').prop('disabled', !guidance.can_send || !!view.$list.data('wa-sending'));
+		view.$body.find('[data-wa-reply]').attr('placeholder', guidance.can_send
+			? __('Type a message') : __('Use an approved template to message this patient'));
+		if (!guidance.can_send) view.$body.find('[data-wa-attach-menu], [data-wa-emoji-menu]').removeClass('show');
+		if (guidance.can_send) {
+			this.whatsapp_window_timer = setTimeout(() => {
+				if (!this.is_current_whatsapp_view(view)) return;
+				this.render_whatsapp_window(view);
+				this.schedule_whatsapp_sync(0);
+			}, Math.min(Math.max(1, snapshot.deadline - Date.now()), 2147483647));
+		}
+	}
+
+	can_send_workdesk_whatsapp($body) {
+		const view = this.active_whatsapp_view();
+		if (!view || view.$body.get(0) !== $body.get(0)) return false;
+		const guidance = this.whatsapp_window_guidance(view.$list.data('wa-window-state'));
+		if (guidance.can_send) return true;
+		this.render_whatsapp_window(view);
+		this.schedule_whatsapp_sync(0);
+		frappe.show_alert({ message: guidance.text, indicator: 'orange' });
+		return false;
+	}
+
+	update_whatsapp_unread_count(conversation, count) {
+		let changed = false;
+		for (const row of this.state.queue || []) {
+			if (String(row.whatsapp_conversation || '') !== String(conversation)) continue;
+			if (Number(row.whatsapp_unread_count || 0) === count) continue;
+			row.whatsapp_unread_count = count;
+			changed = true;
+		}
+		if (changed) this.render_queue();
+	}
+
+	async mark_visible_whatsapp_read(view) {
+		if (!this.is_current_whatsapp_view(view)) return;
+		const snapshot = view.$list.data('wa-read-state');
+		if (!snapshot || !snapshot.read_version || !snapshot.unread_count) return;
+		if (view.element.scrollHeight - view.element.scrollTop - view.element.clientHeight > 96) return;
+		if (this.whatsapp_read_request && this.whatsapp_read_request.element === view.element) return;
+		const request = { element: view.element, snapshot };
+		this.whatsapp_read_request = request;
+		try {
+			const response = await frappe.call({
+				method: 'vobiz_click_to_call.api.console.mark_whatsapp_read',
+				type: 'POST',
+				args: {
+					...view.$body.data('whatsapp-reference'),
+					conversation: view.conversation,
+					read_version: snapshot.read_version
+				},
+				freeze: false,
+				silent: true
+			});
+			if (this.whatsapp_read_request !== request || !this.is_current_whatsapp_view(view)) return;
+			const result = response.message || {};
+			if (!result.success) return;
+			if (result.marked_read && view.$list.data('wa-read-state') === snapshot) {
+				view.$list.data('wa-read-state', { ...snapshot, unread_count: 0 });
+				this.update_whatsapp_unread_count(view.conversation, 0);
+				const notifications = window.wa_chat_hub && window.wa_chat_hub.notifications;
+				if (notifications && notifications.refresh_count) notifications.refresh_count();
+			} else {
+				this.schedule_whatsapp_sync(150);
+			}
+		} catch (err) {
+			// Keep the unread state and retry after the next successful message refresh.
+		} finally {
+			if (this.whatsapp_read_request === request) this.whatsapp_read_request = null;
+		}
+	}
+
+	async sync_inline_whatsapp() {
+		const view = this.active_whatsapp_view();
+		if (!view) return;
+		if (view.$list.attr('data-loading') === '1') {
+			this.schedule_whatsapp_sync(150);
+			return;
+		}
+		if (this.whatsapp_sync_request && this.whatsapp_sync_request.element === view.element) {
+			this.whatsapp_sync_request.pending = true;
+			return;
+		}
+		const request = { element: view.element, pending: false, started_at: Date.now() };
+		this.whatsapp_sync_request = request;
+		let has_more = false;
+		try {
+			const after_message = view.$list.find('[data-wa-message]').last().attr('data-wa-message') || '';
+			const response = await frappe.call({
+				method: 'vobiz_click_to_call.api.console.get_whatsapp_messages',
+				args: {
+					...view.$body.data('whatsapp-reference'),
+					conversation: view.conversation,
+					limit: 100,
+					after_message,
+					status_message_names: JSON.stringify(this.whatsapp_status_message_names(view))
+				},
+				freeze: false,
+				silent: true
+			});
+			if (this.whatsapp_sync_request !== request || !this.is_current_whatsapp_view(view)) return;
+			if (view.$list.attr('data-loading') === '1') {
+				request.pending = true;
+				return;
+			}
+			const page = response.message || {};
+			if (!page.success) throw new Error('WhatsApp refresh failed');
+			if (page.messaging_window) this.apply_whatsapp_window(view, page.messaging_window, request.started_at);
+			else this.whatsapp_window_check_failed(view);
+			this.append_live_whatsapp_messages(view, page.messages || []);
+			this.update_whatsapp_message_statuses(view, page.message_statuses || []);
+			if (!after_message) {
+				view.$list.attr('data-before', page.next_before || '');
+				view.$list.attr('data-has-more', page.has_more ? '1' : '0');
+			}
+			has_more = !!page.has_more_after;
+			view.$list.data('wa-read-state', has_more ? null : {
+				read_version: page.read_version,
+				unread_count: Number(page.unread_count || 0)
+			});
+			this.update_whatsapp_unread_count(view.conversation, Number(page.unread_count || 0));
+			if (!has_more) this.mark_visible_whatsapp_read(view);
+		} catch (err) {
+			if (this.whatsapp_sync_request === request) this.whatsapp_window_check_failed(view);
+		} finally {
+			if (this.whatsapp_sync_request === request) {
+				this.whatsapp_sync_request = null;
+				this.schedule_whatsapp_sync(has_more || request.pending ? 150 : 10000);
+			}
+		}
+	}
+
+	append_live_whatsapp_messages(view, messages) {
+		const { $list, element } = view;
+		const at_bottom = element.scrollHeight - element.scrollTop - element.clientHeight <= 96;
+		const known = new Set();
+		$list.find('[data-wa-message]').each((_, el) => known.add(el.getAttribute('data-wa-message')));
+		let pinned_top = null;
+		const pin_to_bottom = () => {
+			element.scrollTop = element.scrollHeight;
+			pinned_top = element.scrollTop;
+		};
+		let appended = false;
+		for (const message of messages) {
+			const name = String(message.name || '');
+			if (!name || known.has(name)) continue;
+			known.add(name);
+			const $message = $(this.workdesk_whatsapp_message_html(message));
+			$list.find('.vobiz-empty').remove();
+			$list.append($message);
+			appended = true;
+			$message.find('img').one('load', () => {
+				if (at_bottom && element.scrollTop === pinned_top && this.is_current_whatsapp_view(view)) pin_to_bottom();
+			});
+		}
+		if (appended && at_bottom) pin_to_bottom();
+	}
+
 	refresh_inline_whatsapp($body, conversation) {
 		frappe.call('vobiz_click_to_call.api.console.get_whatsapp_messages', {
+			...$body.data('whatsapp-reference'),
 			conversation,
 			limit: VOBIZ_WHATSAPP_PAGE_SIZE
 		}).then((r) => {
@@ -4667,6 +5153,8 @@ class VobizAgentConsole {
 				$body.find('.vobiz-workdesk-card').append(this.workdesk_whatsapp_composer_html());
 			}
 			this.scroll_whatsapp_to_bottom($body);
+			this.initialize_whatsapp_window($body, page);
+			this.schedule_whatsapp_sync(0);
 		});
 	}
 
@@ -4683,6 +5171,7 @@ class VobizAgentConsole {
 		$list.attr('data-loading', '1');
 		$list.find('[data-wa-loader]').text(__('Loading older messages...'));
 		frappe.call('vobiz_click_to_call.api.console.get_whatsapp_messages', {
+			...$list.closest('[data-wa-reference]').data('whatsapp-reference'),
 			conversation,
 			limit: VOBIZ_WHATSAPP_PAGE_SIZE,
 			before
@@ -4705,6 +5194,7 @@ class VobizAgentConsole {
 	}
 
 	send_workdesk_whatsapp($body) {
+		if (!this.can_send_workdesk_whatsapp($body)) return;
 		const $list = $body.find('[data-wa-chat-list]').first();
 		const conversation = $list.attr('data-conversation');
 		const $input = $body.find('[data-wa-reply]').first();
@@ -4712,16 +5202,26 @@ class VobizAgentConsole {
 		if (!conversation || !body) return;
 
 		const $button = $body.find('[data-wa-send]').first();
+		$list.data('wa-sending', true);
 		$button.prop('disabled', true);
 		frappe.call({
 			method: 'vobiz_click_to_call.api.console.send_whatsapp_reply',
-			args: { conversation, body },
+			args: { conversation, body, ...$body.data('whatsapp-reference') },
 			type: 'POST'
 		}).then((r) => {
+			if (!r.message || !r.message.success) {
+				frappe.msgprint({ title: __('Send failed'), indicator: 'red',
+					message: frappe.utils.escape_html(((r.message || {}).result || {}).error || __('Message could not be sent. Your draft has been kept.')) });
+				this.schedule_whatsapp_sync(0);
+				return;
+			}
 			$input.val('');
 			this.refresh_inline_whatsapp($body, conversation);
 		}).always(() => {
-			$button.prop('disabled', false);
+			$list.data('wa-sending', false);
+			const view = this.active_whatsapp_view();
+			if (view && view.element === $list.get(0)) this.render_whatsapp_window(view);
+			this.schedule_whatsapp_sync(0);
 		});
 	}
 
@@ -4737,68 +5237,119 @@ class VobizAgentConsole {
 		input.setSelectionRange(next, next);
 	}
 
+	whatsapp_attachment_error(file, kind) {
+		if (!file) return __('Choose a file first.');
+		if (file.size === 0) return __('File is empty.');
+		const mime = String(file.type || '').toLowerCase().split(';')[0];
+		if (kind === 'image' && !mime.startsWith('image/')) return __('Only image files are supported here.');
+		if (kind === 'audio') {
+			const supported = ['audio/aac', 'audio/x-aac', 'audio/mpeg', 'audio/mp3', 'audio/mp4', 'audio/x-m4a', 'audio/amr', 'audio/ogg', 'audio/x-ogg'];
+			const generic = ['', 'application/octet-stream', 'application/ogg'].includes(mime);
+			if (!supported.includes(mime) && !(generic && /\.(aac|mp3|m4a|amr|ogg|opus)$/i.test(file.name))) return __('Choose MP3, AAC, M4A, AMR or OGG/Opus audio.');
+			if (file.size > 16 * 1024 * 1024) return __('Audio must be 16 MB or smaller.');
+		}
+		if (kind === 'sticker') {
+			if (mime !== 'image/webp' && !(['', 'application/octet-stream'].includes(mime) && /\.webp$/i.test(file.name))) return __('Choose a WebP sticker.');
+			if (file.size > 500 * 1024) return __('Stickers must be 500 KB or smaller.');
+		}
+		return '';
+	}
+
+	setup_whatsapp_attachment_preview(dialog, kind) {
+		let object_url = null;
+		const $stage = dialog.$wrapper.find('[data-wa-attachment-preview]');
+		const release = () => {
+			$stage.find('audio').each((_, media) => { media.pause(); media.removeAttribute('src'); media.load(); });
+			$stage.empty();
+			if (object_url) URL.revokeObjectURL(object_url);
+			object_url = null;
+		};
+		dialog.$wrapper.on('change', 'input[type="file"]', event => {
+			release();
+			const file = event.currentTarget.files[0];
+			if (!file) return;
+			const error = this.whatsapp_attachment_error(file, kind);
+			if (error) { $stage.text(error); return; }
+			try { object_url = URL.createObjectURL(file); }
+			catch (err) { $stage.text(__('Preview is unavailable in this browser.')); return; }
+			const $media = kind === 'audio'
+				? $('<audio>', { controls: true, preload: 'metadata', style: 'width:100%;margin-top:12px' })
+				: $('<img>', { alt: __('Sticker preview'), style: 'display:block;max-width:100%;max-height:240px;margin:12px auto;object-fit:contain' });
+			$media.one('error', () => $('<div>', { class: 'text-muted', text: __('This file cannot be previewed in your browser.') }).appendTo($stage));
+			$media.attr('src', object_url).appendTo($stage);
+		});
+		dialog.$wrapper.one('hidden.bs.modal', () => {
+			dialog.wa_attachment_closed = true;
+			release();
+			if (this.whatsapp_attachment_dialog === dialog) this.whatsapp_attachment_dialog = null;
+		});
+	}
+
 	open_workdesk_attachment_dialog($body, kind) {
+		if (!this.can_send_workdesk_whatsapp($body)) return;
 		const conversation = $body.find('[data-wa-chat-list]').first().attr('data-conversation');
 		if (!conversation) {
 			frappe.show_alert({ message: __('No WhatsApp conversation selected.'), indicator: 'orange' });
 			return;
 		}
-
-		const is_image = kind === 'image';
-		const input_id = is_image ? 'vobiz-wa-image-upload' : 'vobiz-wa-document-upload';
-		const accept = is_image
-			? 'image/*'
-			: '.pdf,.txt,.doc,.docx,.xls,.xlsx,.ppt,.pptx,application/pdf,text/plain,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation';
+		const config = {
+			image: { title: __('Send Photo'), type: 'Image', accept: 'image/*' },
+			document: { title: __('Send Document'), type: 'Document', accept: '.pdf,.txt,.doc,.docx,.xls,.xlsx,.ppt,.pptx,application/pdf,text/plain,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation' },
+			audio: { title: __('Send Audio'), type: 'Audio', accept: '.mp3,.aac,.m4a,.amr,.ogg,.opus,audio/mpeg,audio/aac,audio/mp4,audio/amr,audio/ogg', help: __('MP3, AAC, M4A, AMR or OGG/Opus. Maximum 16 MB.') },
+			sticker: { title: __('Send Sticker'), type: 'Sticker', accept: '.webp,image/webp', help: __('WebP, 512 x 512 pixels. Maximum 100 KB for static or 500 KB for animated stickers.') },
+		}[kind];
+		if (!config) return;
+		const preview = ['audio', 'sticker'].includes(kind);
+		const input_id = `vobiz-wa-${kind}-upload`;
+		const reference = { ...$body.data('whatsapp-reference') };
+		let sending = false;
 		const dialog = new frappe.ui.Dialog({
-			title: is_image ? __('Send Photo') : __('Send Document'),
+			title: config.title,
 			fields: [
 				{
-					fieldname: 'file_upload',
-					fieldtype: 'HTML',
-					options: `<input type="file" class="form-control" id="${input_id}" accept="${accept}" />`
+					fieldname: 'file_upload', fieldtype: 'HTML',
+					options: `<label for="${input_id}">${__('Choose a file')}</label><input type="file" class="form-control" id="${input_id}" accept="${config.accept}" />${preview ? `<p class="text-muted" style="margin-top:8px">${frappe.utils.escape_html(config.help)}</p><div data-wa-attachment-preview aria-live="polite"></div>` : ''}`
 				},
-				{
-					fieldname: 'caption',
-					fieldtype: 'Small Text',
-					label: is_image ? __('Caption') : __('File Name / Caption')
-				}
+				...(!preview ? [{ fieldname: 'caption', fieldtype: 'Small Text', label: kind === 'image' ? __('Caption') : __('File Name / Caption') }] : [])
 			],
 			primary_action_label: __('Upload & Send'),
-			primary_action: (values) => {
+			primary_action: (values = {}) => {
+				if (sending || !this.can_send_workdesk_whatsapp($body)) return;
 				const file_input = dialog.$wrapper.find(`#${input_id}`).get(0);
 				const file = file_input && file_input.files && file_input.files[0];
-				if (!file) {
-					frappe.show_alert({ message: __('Choose a file first.'), indicator: 'orange' });
-					return;
-				}
-				if (is_image && (!file.type || !file.type.startsWith('image/'))) {
-					frappe.show_alert({ message: __('Only image files are supported here.'), indicator: 'orange' });
-					return;
-				}
-
+				const error = this.whatsapp_attachment_error(file, kind);
+				if (error) { frappe.show_alert({ message: error, indicator: 'orange' }); return; }
+				sending = true;
+				if (file_input) file_input.disabled = true;
 				dialog.get_primary_btn().prop('disabled', true).text(__('Uploading...'));
-				this.upload_workdesk_whatsapp_file(conversation, file, is_image)
-					.then((upload) => this.send_workdesk_whatsapp_media($body, conversation, {
-						body: values.caption || '',
-						content_type: is_image ? 'Image' : 'Document',
-						media_url: upload.file_url || upload.media_url,
-						display_media_url: upload.file_url || upload.media_url,
-						file_name: upload.file_name || file.name,
-						file_size: upload.file_size || ''
-					}))
-					.then(() => dialog.hide())
-					.catch((err) => {
-						frappe.msgprint({
-							title: __('Send failed'),
-							message: (err && err.message) || __('Could not upload and send file.'),
-							indicator: 'red'
+				return this.upload_workdesk_whatsapp_file(conversation, file, kind, reference)
+					.then((upload) => {
+						if (dialog.wa_attachment_closed) return;
+						if ($body.find('[data-wa-chat-list]').first().attr('data-conversation') !== conversation) throw new Error(__('The selected conversation changed. Reopen the attachment dialog.'));
+						return this.send_workdesk_whatsapp_media($body, conversation, {
+							body: preview ? '' : values.caption || '', content_type: config.type,
+							media_url: upload.provider_file_url || upload.media_url,
+							display_media_url: upload.file_url || upload.media_url,
+							attachment_file: upload.file, file_name: upload.file_name || file.name,
+							file_size: upload.file_size || ''
 						});
 					})
+					.then(() => dialog.hide())
+					.catch((err) => {
+						frappe.msgprint({ title: __('Send failed'), message: frappe.utils.escape_html((err && err.message) || __('Could not upload and send file.')), indicator: 'red' });
+					})
 					.finally(() => {
+						sending = false;
+						if (file_input) file_input.disabled = false;
 						dialog.get_primary_btn().prop('disabled', false).text(__('Upload & Send'));
 					});
 			}
 		});
+		if (preview) {
+			if (this.whatsapp_attachment_dialog) this.whatsapp_attachment_dialog.hide();
+			this.whatsapp_attachment_dialog = dialog;
+			this.setup_whatsapp_attachment_preview(dialog, kind);
+		}
 		dialog.show();
 	}
 
@@ -4810,6 +5361,7 @@ class VobizAgentConsole {
 		}
 
 		frappe.call('vobiz_click_to_call.api.console.get_whatsapp_templates', {
+			...$body.data('whatsapp-reference'),
 			conversation
 		}).then((r) => {
 			const response = r.message || {};
@@ -4820,6 +5372,146 @@ class VobizAgentConsole {
 			}
 			this.show_workdesk_template_dialog($body, conversation, templates);
 		});
+	}
+
+	template_variable_slots(template, section) {
+		if (section === 'header' && ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(String(template.header_format || '').toUpperCase())) return [];
+		const supplied = Array.isArray(template[section + '_variables']) ? template[section + '_variables'] : [];
+		const text = String(template[section + '_preview'] || '');
+		const indices = new Set();
+		for (const slot of supplied) if (Number.isInteger(Number(slot.index)) && Number(slot.index) > 0) indices.add(Number(slot.index));
+		for (const match of text.matchAll(/\{\{\s*(\d+)\s*\}\}/g)) if (Number(match[1]) > 0) indices.add(Number(match[1]));
+		for (let index = 1; index <= Number(template[section + '_variable_count'] || 0); index++) indices.add(index);
+		return [...indices].sort((a, b) => a - b).map(index => {
+			const source = supplied.find(slot => Number(slot.index) === index) || {};
+			const placeholder = '{{' + index + '}}';
+			const position = text.indexOf(placeholder);
+			return { index, placeholder, section,
+				context: source.context || (position < 0 ? placeholder : text.slice(Math.max(0, position - 35), position + placeholder.length + 35)) };
+		});
+	}
+
+	template_variable_fields_html(template) {
+		const escape = frappe.utils.escape_html;
+		const sections = ['header', 'body'].map(section => {
+			const slots = this.template_variable_slots(template, section);
+			if (!slots.length) return '';
+			const title = section === 'header' ? __('Header variables') : __('Message variables');
+			return `<fieldset style="margin:12px 0;border:0;padding:0"><legend style="font-size:14px;margin-bottom:8px">${escape(title)}</legend>${slots.map(slot => `
+				<div class="form-group">
+					<label style="display:block">${escape(section === 'header' ? __('Header') : __('Message'))} ${escape(slot.placeholder)} <span class="text-danger" aria-hidden="true">*</span>
+						<input type="text" class="form-control" data-wa-template-variable="${section}_${slot.index}" aria-required="true" autocomplete="off" placeholder="${escape(__('Enter a value'))}" />
+					</label>
+					<div class="text-muted" style="font-size:12px;white-space:pre-wrap">${escape(slot.context)}</div>
+				</div>`).join('')}</fieldset>`;
+		}).join('');
+		return sections || `<div class="text-muted">${escape(__('This template has no variables to fill.'))}</div>`;
+	}
+
+	read_template_variables(dialog, template, section) {
+		return this.template_variable_slots(template, section).map(slot =>
+			String(dialog.$wrapper.find(`[data-wa-template-variable="${section}_${slot.index}"]`).val() || '').trim());
+	}
+
+	validate_template_variables(dialog, template) {
+		const missing = [];
+		let $first;
+		for (const section of ['header', 'body']) {
+			for (const slot of this.template_variable_slots(template, section)) {
+				const $input = dialog.$wrapper.find(`[data-wa-template-variable="${section}_${slot.index}"]`);
+				const empty = !String($input.val() || '').trim();
+				$input.attr('aria-invalid', empty ? 'true' : 'false');
+				if (empty) {
+					missing.push((section === 'header' ? __('Header') : __('Message')) + ' ' + slot.placeholder);
+					$first = $first || $input;
+				}
+			}
+		}
+		if (!missing.length) return true;
+		dialog.$wrapper.find('[data-wa-template-variable-errors]').text(__('Fill all required variables:') + ' ' + missing.join(', ')).show();
+		$first.trigger('focus');
+		return false;
+	}
+
+	setup_template_image_preview(dialog, get_template) {
+		const $preview = dialog.$wrapper.find('[data-wa-template-image-preview]');
+		const $stage = $preview.find('[data-wa-template-image-stage]');
+		const $status = $preview.find('[data-wa-template-image-status]');
+		let object_url = null, selected_file = null, revision = 0, closed = false;
+		const release = () => {
+			if (object_url) URL.revokeObjectURL(object_url);
+			object_url = null;
+			selected_file = null;
+		};
+		const update = () => {
+			if (closed) return;
+			const current = ++revision;
+			const template = get_template();
+			const is_image = String(template.header_format || '').toUpperCase() === 'IMAGE';
+			$preview.toggle(is_image);
+			$stage.empty();
+			$status.text('');
+			if (!is_image) { release(); return; }
+			const input = dialog.$wrapper.find('[data-wa-template-image]').get(0);
+			const file = input && input.files && input.files[0];
+			const custom_url = String((dialog.get_value && dialog.get_value('header_values')) || '').trim();
+			$preview.find('[data-wa-template-image-reset]').toggle(!!file || !!custom_url);
+			$preview.find('[data-wa-template-image-source]').text(file
+				? __('Selected replacement:') + ' ' + file.name
+				: custom_url ? __('Replacement image URL') : __('Approved template image'));
+			let url;
+			if (file) {
+				if (!String(file.type || '').startsWith('image/')) {
+					release();
+					$status.text(__('Choose an image file for this template.'));
+					return;
+				}
+				if (file !== selected_file) {
+					release();
+					try { object_url = URL.createObjectURL(file); selected_file = file; }
+					catch (err) { $status.text(__('Could not preview this file. Choose another image.')); return; }
+				}
+				url = object_url;
+			} else {
+				release();
+				url = custom_url || String(template.header_media_url || '').trim();
+				if (!url) {
+					$status.text(__('No approved image is available. Choose a replacement image or enter an image URL.'));
+					return;
+				}
+				if (!/^https?:\/\/\S+$/i.test(url) && !/^\/(?:private\/)?files\/\S+$/.test(url)) {
+					$status.text(__('Enter a valid public image URL beginning with https:// or http://.'));
+					return;
+				}
+			}
+			$status.text(__('Loading image preview...'));
+			const $image = $('<img>', {
+				alt: __('Template header image preview'), referrerpolicy: 'no-referrer',
+				style: 'display:block;max-width:100%;max-height:300px;width:auto;height:auto;object-fit:contain;border-radius:8px;margin:8px 0;'
+			});
+			$image.one('load', () => {
+				if (!closed && current === revision) $status.text('');
+			}).one('error', () => {
+				if (closed || current !== revision) return;
+				$image.hide();
+				$status.text(__('Image preview could not be loaded. Check the image URL or choose a replacement image.'));
+			});
+			$stage.append($image);
+			$image.attr('src', url);
+		};
+		const reset = () => {
+			revision++;
+			release();
+			dialog.$wrapper.find('[data-wa-template-image]').val('');
+			const clearing = dialog.set_value('header_values', '');
+			update();
+			if (clearing && clearing.then) clearing.then(update);
+		};
+		dialog.$wrapper.on('change', '[data-wa-template-image]', update);
+		dialog.$wrapper.on('input change', '[data-fieldname="header_values"] textarea, [data-fieldname="header_values"] input', update);
+		dialog.$wrapper.on('click', '[data-wa-template-image-reset]', reset);
+		dialog.$wrapper.on('hidden.bs.modal', () => { closed = true; revision++; release(); $stage.empty(); });
+		return { update, reset };
 	}
 
 	show_workdesk_template_dialog($body, conversation, templates) {
@@ -4838,65 +5530,141 @@ class VobizAgentConsole {
 						<div class="vobiz-template-send">
 							<label>${__('Template')}</label>
 							<select class="form-control" data-wa-template-select>${options}</select>
+							<div data-wa-template-variables></div>
+							<div class="text-muted" data-wa-template-progress></div>
+							<div class="text-danger" role="alert" data-wa-template-variable-errors style="display:none"></div>
+							<label style="margin-top:12px">${__('Preview')}</label>
+							<div data-wa-template-image-preview style="display:none;border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;">
+								<div class="text-muted" data-wa-template-image-source></div>
+								<div data-wa-template-image-stage></div>
+								<div class="text-muted" role="status" data-wa-template-image-status></div>
+								<button class="btn btn-default btn-xs" type="button" data-wa-template-image-reset style="display:none">${__('Use approved image')}</button>
+							</div>
 							<div class="vobiz-template-preview" data-wa-template-preview></div>
 						</div>
 					`
 				},
 				{
-					fieldname: 'header_values',
-					fieldtype: 'Small Text',
-					label: __('Header Values'),
-					description: __('One value per line, only if the template has header variables.')
+					fieldname: 'header_image',
+					fieldtype: 'HTML',
+					hidden: 1,
+					options: `<label>${__('Header Image (optional replacement)')}</label><input type="file" class="form-control" data-wa-template-image accept="image/*" />`
 				},
 				{
-					fieldname: 'body_values',
+					fieldname: 'header_values',
 					fieldtype: 'Small Text',
-					label: __('Body Values'),
-					description: __('One value per line for {{1}}, {{2}}, etc.')
+					hidden: 1,
+					label: __('Header Media URL'),
+					description: __('Leave blank to use the approved template media, or enter a public media URL.')
 				},
 				{
 					fieldname: 'followup_body',
 					fieldtype: 'Small Text',
 					label: __('Message After Template'),
-					description: __('Optional normal message to send after the approved template.')
+					read_only: !this.whatsapp_window_guidance($body.find('[data-wa-chat-list]').first().data('wa-window-state')).can_send,
+					description: __('Only available while the messaging window is open. Sending a template does not open the window; the patient must reply first.')
 				}
 			],
 			primary_action_label: __('Send Template'),
-			primary_action: (values) => {
+			primary_action: async (values) => {
 				const index = parseInt(dialog.$wrapper.find('[data-wa-template-select]').val(), 10) || 0;
 				const template = templates[index] || {};
+				if (!this.validate_template_variables(dialog, template)) return;
+				const body_values = this.read_template_variables(dialog, template, 'body');
+				const text_header_values = this.read_template_variables(dialog, template, 'header');
 				dialog.get_primary_btn().prop('disabled', true).text(__('Sending...'));
-				frappe.call({
-					method: 'vobiz_click_to_call.api.console.send_whatsapp_template',
-					args: {
-						conversation,
-						template_name: template.name,
-						language_code: template.language_code,
-						header_values: values.header_values || '',
-						body_values: values.body_values || '',
-						followup_body: values.followup_body || '',
-						body_preview: this.render_template_text(template.body_preview || '', values.body_values || ''),
-						template_category: template.category || ''
-					},
-					type: 'POST'
-				}).then(() => {
-					dialog.hide();
+				try {
+					const media_header = ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(String(template.header_format || '').toUpperCase());
+					let header_values = media_header ? (values.header_values || '') : text_header_values;
+					if (['IMAGE', 'VIDEO', 'DOCUMENT'].includes(String(template.header_format || '').toUpperCase()) && header_values) {
+						header_values = [header_values.trim()];
+					}
+					if (String(template.header_format || '').toUpperCase() === 'IMAGE') {
+						const input = dialog.$wrapper.find('[data-wa-template-image]').get(0);
+						const file = input && input.files && input.files[0];
+						if (file) {
+							if (!String(file.type || '').startsWith('image/')) throw new Error(__('Choose an image file for this template.'));
+							const upload = await this.upload_workdesk_whatsapp_file(
+								conversation, file, true, $body.data('whatsapp-reference')
+							);
+							header_values = [upload.provider_file_url || upload.media_url];
+						}
+					}
+					const response = await frappe.call({
+						method: 'vobiz_click_to_call.api.console.send_whatsapp_template',
+						args: {
+							...$body.data('whatsapp-reference'),
+							conversation,
+							template_name: template.name,
+							language_code: template.language_code,
+							header_values,
+							body_values,
+							followup_body: values.followup_body || '',
+							body_preview: this.render_template_text(template.body_preview || '', body_values),
+							template_category: template.category || ''
+						},
+						type: 'POST'
+					});
+					const result = response.message || {};
 					this.refresh_inline_whatsapp($body, conversation);
-				}).always(() => {
+					if (!result.success || (result.result || {}).sent === false) {
+						throw new Error((result.result || {}).error || __('Template could not be sent.'));
+					}
+					if (result.followup_error) frappe.msgprint({
+						title: __('Template sent; follow-up not sent'), indicator: 'orange',
+						message: frappe.utils.escape_html(result.followup_error)
+					});
+					dialog.hide();
+				} catch (err) {
+					frappe.msgprint({
+						title: __('Send failed'),
+						message: frappe.utils.escape_html((err && err.message) || __('Template could not be sent.')),
+						indicator: 'red'
+					});
+				} finally {
 					dialog.get_primary_btn().prop('disabled', false).text(__('Send Template'));
-				});
+				}
 			}
+		});
+		const image_preview = this.setup_template_image_preview(dialog, () => {
+			const index = parseInt(dialog.$wrapper.find('[data-wa-template-select]').val(), 10) || 0;
+			return templates[index] || {};
 		});
 		const update_preview = () => {
 			const index = parseInt(dialog.$wrapper.find('[data-wa-template-select]').val(), 10) || 0;
 			const template = templates[index] || {};
-			dialog.$wrapper.find('[data-wa-template-preview]').html(this.workdesk_template_preview_html(template));
-			dialog.set_value('header_values', '');
-			dialog.set_value('body_values', '');
+			const body_values = this.read_template_variables(dialog, template, 'body');
+			const header_values = this.read_template_variables(dialog, template, 'header');
+			const all_values = [...header_values, ...body_values];
+			dialog.$wrapper.find('[data-wa-template-progress]').text(all_values.length
+				? `${all_values.filter(Boolean).length} / ${all_values.length} ${__('required values filled')}` : '');
+			dialog.$wrapper.find('[data-wa-template-variable-errors]').hide().text('');
+			dialog.$wrapper.find('[data-wa-template-variable]').attr('aria-invalid', 'false');
+			dialog.$wrapper.find('[data-wa-template-preview]').html(this.workdesk_template_preview_html({
+				...template,
+				header_preview: this.render_template_text(template.header_preview || '', header_values),
+				body_preview: this.render_template_text(template.body_preview || '', body_values)
+			}));
+		};
+		const select_template = () => {
+			const index = parseInt(dialog.$wrapper.find('[data-wa-template-select]').val(), 10) || 0;
+			const template = templates[index] || {};
+			dialog.$wrapper.find('[data-wa-template-variables]').html(this.template_variable_fields_html(template));
+			const header_format = String(template.header_format || '').toUpperCase();
+			const media_header = ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(header_format);
+			dialog.set_df_property('header_image', 'hidden', header_format !== 'IMAGE');
+			dialog.set_df_property('header_values', 'hidden', !media_header);
+			dialog.set_df_property('header_values', 'label', __('Header Media URL'));
+			dialog.set_df_property('header_values', 'description', media_header
+				? __('Leave blank to use the approved template media, or enter a public media URL.')
+				: __('One value per line, only if the template has header variables.'));
+			image_preview.reset();
+			update_preview();
 		};
 		dialog.show();
-		dialog.$wrapper.on('change', '[data-wa-template-select]', update_preview);
-		update_preview();
+		dialog.$wrapper.on('change', '[data-wa-template-select]', select_template);
+		dialog.$wrapper.on('input', '[data-wa-template-variable]', update_preview);
+		select_template();
 	}
 
 	workdesk_template_preview_html(template) {
@@ -4917,42 +5685,69 @@ class VobizAgentConsole {
 		`;
 	}
 
-	render_template_text(text, values_text) {
-		const values = String(values_text || '').replace(/,/g, '\n').split('\n').map((row) => row.trim()).filter(Boolean);
-		let output = String(text || '');
-		values.forEach((value, index) => {
-			const pattern = new RegExp(`\\{\\{${index + 1}\\}\\}`, 'g');
-			output = output.replace(pattern, value);
+	render_template_text(text, values_input) {
+		const values = Array.isArray(values_input) ? values_input : String(values_input || '').split('\n');
+		return String(text || '').replace(/\{\{\s*(\d+)\s*\}\}/g, (placeholder, number) => {
+			const value = values[Number(number) - 1];
+			return value == null || !String(value).trim() ? placeholder : String(value).trim();
 		});
-		return output;
 	}
 
-	upload_workdesk_whatsapp_file(conversation, file, is_image) {
+	upload_workdesk_whatsapp_file(conversation, file, kind, reference = {}) {
 		const formData = new FormData();
 		formData.append('conversation', conversation);
 		formData.append('file', file);
-		const method = is_image
-			? 'wa_chat_hub.api.runtime.upload_image_for_send'
-			: 'wa_chat_hub.api.runtime.upload_document_for_send';
+		formData.append('kind', typeof kind === 'boolean' ? (kind ? 'image' : 'document') : kind);
+		Object.entries(reference || {}).forEach(([key, value]) => {
+			if (value) formData.append(key, value);
+		});
+		const method = 'vobiz_click_to_call.api.console.upload_whatsapp_media';
 
 		return fetch(`/api/method/${method}`, {
 			method: 'POST',
 			headers: { 'X-Frappe-CSRF-Token': frappe.csrf_token },
 			body: formData
-		}).then((response) => response.json()).then((data) => {
-			if (data.exc || (data.message && data.message.success === false)) {
-				throw new Error((data.message && data.message.message) || data._server_messages || __('Upload failed.'));
+		}).then(async (response) => {
+			const data = await response.json();
+			if (!response.ok) {
+				throw new Error(this.whatsapp_upload_error(data));
 			}
-			return (data.message || {}).result || {};
+			return data;
+		}).then((data) => {
+			if (data.exc || (data.message && data.message.success === false)) {
+				throw new Error(this.whatsapp_upload_error(data));
+			}
+			const upload = (data.message || {}).result || {};
+			if (!(upload.provider_file_url || upload.media_url)) {
+				throw new Error(__('Upload did not return a hosted media URL.'));
+			}
+			return upload;
 		});
 	}
 
+	whatsapp_upload_error(data) {
+		try {
+			const messages = JSON.parse(data._server_messages || '[]');
+			if (messages.length) {
+				const first = typeof messages[0] === 'string' ? JSON.parse(messages[0]) : messages[0];
+				if (first.message) return first.message;
+			}
+		} catch (e) {
+			// Fall back to the API message when the server response is not structured.
+		}
+		return (data.message && data.message.message) || __('Upload failed.');
+	}
+
 	send_workdesk_whatsapp_media($body, conversation, payload) {
+		if (!this.can_send_workdesk_whatsapp($body)) return Promise.reject(new Error(__('Use an approved template to message this patient.')));
 		return frappe.call({
-			method: 'wa_chat_hub.api.runtime.send_reply',
-			args: { conversation, ...payload },
+			method: 'vobiz_click_to_call.api.console.send_whatsapp_media',
+			args: { ...$body.data('whatsapp-reference'), conversation, ...payload },
 			type: 'POST'
-		}).then(() => {
+		}).then((response) => {
+			if (!response.message || !response.message.success) {
+				throw new Error(((response.message || {}).result || {}).error || __('Media could not be sent.'));
+			}
 			this.refresh_inline_whatsapp($body, conversation);
 		});
 	}
@@ -5093,11 +5888,17 @@ class VobizAgentConsole {
 	start_call_for_row(row, patientPhone = null, browserReady = false) {
 		if (!row) return Promise.resolve();
 		const softphone = this.state.softphone;
-		if (!browserReady && softphone.config_promise) {
-			return softphone.config_promise.then(() => {
+		if (!browserReady) {
+			return Promise.resolve(softphone.config_promise).then(() => {
 				if ((softphone.config || {}).call_device === 'Browser Softphone') {
 					if (softphone.current_call_log) throw new Error(__('Finish the current call first.'));
-					return this.connect_browser_softphone().then(() => this.start_call_for_row(row, patientPhone, true));
+					return this.connect_browser_softphone().then(() => this.check_browser_microphone(false)).then(ready => {
+						if (!ready) throw new Error(__('Connect a microphone and allow microphone access before calling.'));
+						if (!softphone.registered || this.browser_softphone_reconnecting()) {
+							throw new Error(__('Wait for the softphone to reconnect before calling.'));
+						}
+						return this.start_call_for_row(row, patientPhone, true);
+					});
 				}
 				return this.start_call_for_row(row, patientPhone, true);
 			});
@@ -5698,7 +6499,7 @@ class VobizAgentConsole {
 		}
 		const endpoint = isBrowser ? 'vobiz_system_call.api.webrtc.cancel_browser_call' : 'vobiz_click_to_call.api.call.cancel_call';
 		const request = frappe.call(endpoint, { call_log });
-		return (isBrowser ? this.browser_request_with_timeout(request) : Promise.resolve(request)).then(() => {
+		return (isBrowser ? this.browser_request_with_timeout(request, 30000) : Promise.resolve(request)).then(() => {
 			const statusRequest = frappe.call({
 				method: 'vobiz_click_to_call.api.call.get_call_status',
 				args: { call_log, sync_provider: 0 }

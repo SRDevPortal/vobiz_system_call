@@ -46,6 +46,26 @@ class BrowserOwnershipTests(unittest.TestCase):
         ownership.presence_heartbeat("old-window")
         return ownership.use_here("new-window")["transfer_token"]
 
+    def test_only_registered_owner_can_refresh_matching_call_heartbeat(self):
+        ownership.presence_heartbeat("owner-window")
+        self.mapping.current_call_log = "CALL"
+        ownership.presence_heartbeat("owner-window", call_log="CALL")
+        self.assertEqual(self.get("vsc:active-call:CALL"), "owner-window")
+        ownership.presence_heartbeat("other-window", call_log="CALL")
+        self.assertEqual(self.get("vsc:active-call:CALL"), "owner-window")
+        ownership.presence_heartbeat("owner-window", call_log="WRONG-CALL")
+        self.assertIsNone(self.get("vsc:active-call:CALL"))
+
+    def test_unregistered_or_expired_media_cannot_keep_recovery_deferred(self):
+        ownership.presence_heartbeat("owner-window")
+        self.mapping.current_call_log = "CALL"
+        ownership.presence_heartbeat("owner-window", call_log="CALL")
+        self.now += 91
+        self.assertIsNone(self.get("vsc:active-call:CALL"))
+        ownership.presence_heartbeat("owner-window", call_log="CALL")
+        ownership.presence_heartbeat("owner-window", registered=0)
+        self.assertIsNone(self.get("vsc:active-call:CALL"))
+
     def test_second_window_gets_use_here_state_without_claiming(self):
         self.assertTrue(ownership.presence_heartbeat("old-window")["registered"])
         self.assertEqual(ownership.presence_heartbeat("new-window")["ownership"], "other_window")

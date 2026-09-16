@@ -219,10 +219,13 @@ def finish_provider_pending_if_expired(call_log, expected_uuid=None):
 
 
 def enqueue_reconcile(name):
+    from vobiz_click_to_call.services.recovery_policy import due
+    if not due(name):
+        return
     try:
         frappe.enqueue(
             "vobiz_system_call.api.lifecycle.reconcile_call",
-            call_log=name, queue="short", timeout=120, enqueue_after_commit=True,
+            call_log=name, queue="short", timeout=240, enqueue_after_commit=True,
             job_id="vsc-reconcile-" + name, deduplicate=True,
         )
     except Exception:
@@ -250,33 +253,11 @@ def provider_outcome(cdr, answered=False):
     return None
 
 def find_recovery_cdr(client, snapshot):
-    """Bounded fallback when the provider ignores its call_uuid search filter."""
-    from vobiz_click_to_call.services.cdr import extract_cdr_rows
-
-    uuid = snapshot["call_uuid"]
-    response = client.search_cdrs({"call_uuid": uuid})
-    match = next((r for r in extract_cdr_rows(response)
-                  if str(r.get("uuid") or r.get("call_uuid") or "") == uuid), None)
-    if match:
-        return match
-    customer = str(snapshot.get("customer_number") or "").lstrip("+")
-    if not customer:
-        return None
-    params = {"from_number" if snapshot.get("direction") == "Incoming" else "to_number": customer,
-              "per_page": 50}
-    if snapshot.get("direction") == "Outgoing":
-        username = context(snapshot).get("endpoint_username")
-        if username:
-            params["from_number"] = username
-    for page in (1, 2):
-        response = client.search_cdrs(dict(params, page=page))
-        match = next((r for r in extract_cdr_rows(response)
-                      if str(r.get("uuid") or r.get("call_uuid") or "") == uuid), None)
-        if match:
-            return match
-        if not (response.get("pagination") or {}).get("has_next"):
-            break
-    return None
+    from vobiz_click_to_call.services.cdr import lookup_cdr
+    # Keep the authenticated UUID distinct from a browser-reported candidate.
+    target = frappe._dict(snapshot, recording_call_uuid=None, request_uuid=None,
+                          a_leg_uuid=None, b_leg_uuid=None)
+    return lookup_cdr(client, target)
 
 
 def browser_recovery_uuid(row):
@@ -339,7 +320,6 @@ def reconcile_missing_browser_id(snapshot, recovery_lookup=False):
     if not settings.enabled:
         return
     client = VobizClient(settings)
-    client.timeout = 3
     # Check final evidence first: an already-ended call needs no further DELETE.
     try:
         cdr = find_recovery_cdr(client, dict(snapshot, call_uuid=uuid))
@@ -370,12 +350,36 @@ def reconcile_missing_browser_id(snapshot, recovery_lookup=False):
         frappe.log_error(title="Vobiz browser fallback retry pending", message=frappe.get_traceback())
 
 
+def healthy_browser_call(row):
+    """A fresh media heartbeat only defers a lookup; it never ends a call."""
+    if (not is_browser_call(row) or context(row).get("agent_cancelled")
+            or has_browser_terminal_event(row) or row.call_status in PROVIDER_PENDING_STATUSES):
+        return False
+    tab = frappe.cache().get_value("vsc:active-call:" + row.name, expires=True)
+    return bool(tab and tab == presence(row.user))
+
+
 def reconcile_call(call_log, recovery_lookup=False):
+    from vobiz_click_to_call.services import recovery_policy
+    # Terminal callbacks never wait for this guard; they can release immediately.
+    with recovery_policy.attempt(call_log) as allowed:
+        if allowed:
+            return _reconcile_call(call_log, recovery_lookup=recovery_lookup)
+
+
+def _reconcile_call(call_log, recovery_lookup=False):
     """Expire unissued calls; release provider calls only after matching terminal CDR."""
     mapping, row = lock_call(call_log)
     if row.status in TERMINAL:
         release_locked(mapping, row)
         frappe.db.commit()
+        from vobiz_click_to_call.services.recovery_policy import clear
+        clear(call_log)
+        return
+    if not recovery_lookup and healthy_browser_call(row):
+        frappe.db.commit()
+        from vobiz_click_to_call.services.recovery_policy import clear
+        clear(call_log)
         return
     if not row.call_uuid:
         if browser_recovery_uuid(row):
@@ -399,8 +403,6 @@ def reconcile_call(call_log, recovery_lookup=False):
             and snapshot["status"] not in TERMINAL):
         try:
             cancel_client = VobizClient(settings)
-            if is_browser_call(snapshot):
-                cancel_client.timeout = 3
             cancel_client.hangup_call(snapshot["call_uuid"], allow_missing=True)
         except Exception:
             # A failed DELETE must not prevent a terminal CDR from releasing the agent.
@@ -411,13 +413,7 @@ def reconcile_call(call_log, recovery_lookup=False):
     # Query the exact provider UUID; do not constrain incoming calls with outgoing From/To.
     try:
         client = VobizClient(settings)
-        if recovery_lookup or is_browser_call(snapshot):
-            client.timeout = 3
-            cdr = find_recovery_cdr(client, snapshot)
-        else:
-            response = client.search_cdrs({"call_uuid": snapshot["call_uuid"]})
-            cdr = next((r for r in extract_cdr_rows(response)
-                        if str(r.get("uuid") or r.get("call_uuid") or "") == snapshot["call_uuid"]), None)
+        cdr = find_recovery_cdr(client, snapshot)
     except Exception:
         if finish_provider_pending_if_expired(call_log, snapshot["call_uuid"]):
             return
@@ -458,6 +454,8 @@ def finish_reconciled_call(snapshot, cdr, missing_id=False):
                 break
     frappe.db.set_value("Vobiz Call Log", call_log, values)
     frappe.db.commit()
+    from vobiz_click_to_call.services.recovery_policy import clear
+    clear(call_log)
 
 
 def recover_calls():

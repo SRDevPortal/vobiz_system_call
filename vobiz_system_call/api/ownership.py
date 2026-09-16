@@ -53,12 +53,14 @@ def grant(user, tab_id, cache):
     return {"ownership": "granted", "registered": True}
 
 
-def presence_heartbeat(tab_id, registered=1, claim_idle=0):
+def presence_heartbeat(tab_id, registered=1, claim_idle=0, call_log=None):
     with locked_browser(tab_id) as (user, mapping, cache):
         owner = current_owner(user, cache)
         if not frappe.utils.cint(registered):
             if lifecycle.presence(user) == tab_id:
                 cache.delete_value("vsc:presence:" + user)
+                if mapping.current_call_log:
+                    cache.delete_value("vsc:active-call:" + mapping.current_call_log)
             return {"registered": False}
         pending = cache.get_value(transfer_key(user), expires=True)
         if pending:
@@ -86,6 +88,12 @@ def presence_heartbeat(tab_id, registered=1, claim_idle=0):
             return {"registered": False, "ownership": "active_call"}
         cache.set_value(owner_key(user), tab_id)
         lifecycle.set_presence(user, tab_id)
+        if mapping.current_call_log:
+            key = "vsc:active-call:" + mapping.current_call_log
+            if call_log and call_log == mapping.current_call_log:
+                cache.set_value(key, tab_id, expires_in_sec=90)
+            else:
+                cache.delete_value(key)
         return {"registered": True, "ownership": "granted"}
 
 

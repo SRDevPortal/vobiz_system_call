@@ -9,3 +9,5 @@ The only JavaScript change resolves the log-upload promise immediately when the
 selected endpoint is absent or whitespace. SIP, media and call behavior are unchanged.
 
 Original SHA256: b59866701281028c32b07c1a8345fa4d89e2218f04f7dc533a2dfe2b65be8170
+
+Local reliability patch (2026-09-16): VobizLogStorage keeps only the newest 65,536 characters; malformed stored JSON is discarded. Blocked storage and quota failures are contained within the SDK logger. A quota failure removes only VobizLogStorage and retries one 4,096-character entry. Logging never aborts call setup. See tests/test_sdk_logging.cjs.

@@ -59,7 +59,10 @@ def get_browser_softphone_registrar(settings=None) -> str:
 
 def get_browser_softphone_sdk_url(settings=None) -> str:
     settings = settings or get_settings()
-    return (settings.get("browser_softphone_sdk_url") or DEFAULT_BROWSER_SOFTPHONE_SDK_URL).strip()
+    url = (settings.get("browser_softphone_sdk_url") or DEFAULT_BROWSER_SOFTPHONE_SDK_URL).strip()
+    if url.split("?", 1)[0] == DEFAULT_BROWSER_SOFTPHONE_SDK_URL:
+        url += ("&" if "?" in url else "?") + "v=bounded-logs-20260916"
+    return url
 
 
 def get_inbound_callback_token(settings=None) -> str:

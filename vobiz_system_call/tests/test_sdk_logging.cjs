@@ -20,3 +20,37 @@ for (const jwt of [false, true]) {
     assert.equal(result, "log upload disabled: no endpoint");
   });
 }
+
+function logStore(storage) {
+  const begin = source.indexOf('class t{constructor(){this.TAG="VobizLogStorage"');
+  const finish = source.indexOf('e.default=t,t.instance=null', begin);
+  assert.ok(begin >= 0 && finish > begin);
+  const context = {window: {localStorage: storage}};
+  vm.createContext(context);
+  vm.runInContext(source.slice(begin, finish) + ';this.store = new t();', context);
+  return context.store;
+}
+
+test('SDK diagnostic history stays bounded and preserves unrelated storage', () => {
+  const values = new Map([['desk-session', 'keep']]);
+  const store = logStore({getItem: k => values.get(k), setItem: (k, v) => values.set(k, v), removeItem: k => values.delete(k)});
+  for (let i = 0; i < 100; i++) store.setData('time', 'info', 'x'.repeat(2000));
+  assert.equal(JSON.parse(values.get('VobizLogStorage')).length, 65536);
+  assert.equal(values.get('desk-session'), 'keep');
+});
+
+test('quota-full and blocked storage never throw into call handling', () => {
+  let removals = [];
+  const store = logStore({getItem() {throw Error('SecurityError');},
+    setItem() {throw Error('QuotaExceededError');}, removeItem(k) {removals.push(k);}});
+  assert.doesNotThrow(() => store.setData('time', 'info', 'call event'));
+  assert.deepEqual(removals, ['VobizLogStorage']);
+  assert.equal(store.getData(), '');
+});
+
+test('invalid previous log JSON is replaced by a valid bounded entry', () => {
+  let value = '{broken-json';
+  const store = logStore({getItem: () => value, setItem: (k, v) => {value = v;}});
+  store.setData('time', 'info', 'new-event');
+  assert.match(JSON.parse(value), /new-event/);
+});

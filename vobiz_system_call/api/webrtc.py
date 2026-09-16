@@ -81,9 +81,9 @@ def get_provider_answer_url():
 
 
 @frappe.whitelist(methods=["POST"])
-def browser_presence(tab_id: str, registered: int = 1, claim_idle: int = 0):
+def browser_presence(tab_id: str, registered: int = 1, claim_idle: int = 0, call_log: str | None = None):
     from vobiz_system_call.api.ownership import presence_heartbeat
-    return presence_heartbeat(tab_id, registered, claim_idle=claim_idle)
+    return presence_heartbeat(tab_id, registered, claim_idle=claim_idle, call_log=call_log)
 
 
 
@@ -114,7 +114,6 @@ def verify_browser_call(call_log: str):
     active = False
     try:
         client = VobizClient(get_settings())
-        client.timeout = 3
         response = client.retrieve_live_call(uuid)
         for data in (response, response.get("data")):
             if not isinstance(data, dict):
@@ -129,7 +128,7 @@ def verify_browser_call(call_log: str):
         pass
     if not active:
         try:
-            lifecycle.reconcile_call(call_log, recovery_lookup=True)
+            lifecycle.enqueue_reconcile(call_log)
         except Exception:
             pass  # Keep the UI in checking state; the bounded browser retry tries again.
     frappe.db.commit()
@@ -246,8 +245,6 @@ def cancel_browser_call(call_log: str):
     try:
         if uuid:
             client = VobizClient(get_settings())
-            if lifecycle.is_browser_call(row):
-                client.timeout = 3
             client.hangup_call(uuid, allow_missing=True)
     finally:
         lifecycle.enqueue_reconcile(call_log)

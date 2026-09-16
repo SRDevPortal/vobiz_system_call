@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,6 +24,14 @@ def row(**values):
 class BrowserSafetyTests(unittest.TestCase):
     def setUp(self):
         self.patches = []
+        from vobiz_click_to_call.services import recovery_policy
+        # Cooldown/concurrency behavior has its own recovery-policy tests.
+        self.replace(recovery_policy, "attempt", lambda *a, **kw: nullcontext(True))
+        self.replace(recovery_policy, "clear", MagicMock())
+        self.replace(recovery_policy, "due", lambda *a, **kw: True)
+        cache = MagicMock()
+        cache.get_value.return_value = None
+        self.replace(frappe, "cache", lambda: cache)
         self.replace(frappe, "local", SimpleNamespace(flags=frappe._dict(in_test=False), request=None))
         self.replace(frappe.utils, "now", lambda: "2026-09-08 10:05:00")
         self.replace(frappe.utils, "now_datetime", lambda: datetime(2026, 9, 8, 10, 5))
@@ -1009,14 +1018,14 @@ class BrowserSafetyTests(unittest.TestCase):
         from vobiz_click_to_call.services import client
         current = row(call_uuid="provider-uuid")
         self.replace(frappe, "get_doc", lambda *args: current)
-        provider = MagicMock()
+        provider = MagicMock(timeout=20)
         self.replace(client, "VobizClient", lambda *args: provider)
-        reconcile = self.replace(lifecycle, "reconcile_call", MagicMock())
+        reconcile = self.replace(lifecycle, "enqueue_reconcile", MagicMock())
         for uuid, expected in [("unrelated", "unknown"), ("provider-uuid", "active")]:
             provider.retrieve_live_call.return_value = {"data": {"call_uuid": uuid, "call_status": "in-progress"}}
             self.assertEqual(webrtc.verify_browser_call("CALL-1")["provider_state"], expected)
-        self.assertEqual(provider.timeout, 3)
-        reconcile.assert_called_once_with("CALL-1", recovery_lookup=True)
+        self.assertEqual(provider.timeout, 20)
+        reconcile.assert_called_once_with("CALL-1")
 
     def test_recovery_not_found_or_provider_errors_do_not_prove_termination(self):
         from vobiz_click_to_call.services import client
@@ -1042,7 +1051,7 @@ class BrowserSafetyTests(unittest.TestCase):
     def test_recovery_finds_exact_cdr_when_uuid_filter_is_ignored(self):
         provider = MagicMock()
         provider.search_cdrs.side_effect = [
-            {"data": [{"uuid": "unrelated", "end_time": "2026-09-08 10:01:00"}]},
+            {"data": [{"uuid": "unrelated", "end_time": "2026-09-08 10:01:00"}], "pagination": {"has_next": True}},
             {"data": [{"uuid": "provider-uuid", "end_time": "2026-09-08 10:02:00"}]},
         ]
         current = row(call_uuid="provider-uuid", direction="Outgoing", customer_number="+919873090386",
@@ -1050,7 +1059,7 @@ class BrowserSafetyTests(unittest.TestCase):
         result = lifecycle.find_recovery_cdr(provider, current)
         self.assertEqual(result["uuid"], "provider-uuid")
         params = provider.search_cdrs.call_args.args[0]
-        self.assertEqual(params, {"from_number": "agent-endpoint", "to_number": "919873090386", "page": 1, "per_page": 50})
+        self.assertEqual(params, {"search": "provider-uuid", "to_number": "919873090386", "page": 2, "per_page": 50, "start_date": "2026-09-07", "end_date": "2026-09-09"})
 
     def test_recovery_cdr_scan_is_bounded_and_incoming_filters_use_caller(self):
         provider = MagicMock()
@@ -1058,8 +1067,8 @@ class BrowserSafetyTests(unittest.TestCase):
                                            "pagination": {"has_next": True}}
         current = row(call_uuid="provider-uuid", direction="Incoming", customer_number="+919873090386")
         self.assertIsNone(lifecycle.find_recovery_cdr(provider, current))
-        self.assertEqual(provider.search_cdrs.call_count, 3)
-        self.assertEqual(provider.search_cdrs.call_args.args[0], {"from_number": "919873090386", "page": 2, "per_page": 50})
+        self.assertEqual(provider.search_cdrs.call_count, 2)
+        self.assertEqual(provider.search_cdrs.call_args.args[0], {"search": "provider-uuid", "from_number": "919873090386", "page": 2, "per_page": 50, "start_date": "2026-09-07", "end_date": "2026-09-09"})
 
     def test_recovery_final_cdr_clears_call_even_when_hangup_callback_was_missed(self):
         from vobiz_click_to_call.services import client, settings
@@ -1075,6 +1084,10 @@ class BrowserSafetyTests(unittest.TestCase):
         def finish(mapping, record, event, reason, status):
             record.status = status
         self.replace(lifecycle, "finish_locked", finish)
+        result = webrtc.verify_browser_call("CALL-1")
+        self.assertEqual(result["provider_state"], "unknown")
+        provider.search_cdrs.assert_not_called()
+        lifecycle.reconcile_call("CALL-1")
         result = webrtc.verify_browser_call("CALL-1")
         self.assertEqual(result, {"name": "CALL-1", "status": "Completed", "provider_state": "ended"})
         provider.hangup_call.assert_not_called()
@@ -1219,6 +1232,26 @@ class BrowserSafetyTests(unittest.TestCase):
         mapping = row(current_call_log="NEW-CALL")
         lifecycle.release_locked(mapping, current)
         self.db.set_value.assert_not_called()
+
+    def test_healthy_media_heartbeat_skips_provider_but_cancel_does_not(self):
+        from vobiz_click_to_call.services import client
+        current = row(call_uuid="provider-id")
+        self.replace(lifecycle, "lock_call", lambda *a: (frappe._dict(), current))
+        cache = frappe.cache()
+        cache.get_value.side_effect = lambda key, **kw: "owner-tab"
+        provider = self.replace(client, "VobizClient", MagicMock())
+        lifecycle.reconcile_call(current.name)
+        provider.assert_not_called()
+        current.request_json = json.dumps(dict(lifecycle.context(current), agent_cancelled=True))
+        self.assertFalse(lifecycle.healthy_browser_call(current))
+
+    def test_stale_or_different_window_heartbeat_cannot_defer_recovery(self):
+        current = row(call_uuid="provider-id")
+        cache = frappe.cache()
+        cache.get_value.side_effect = lambda key, **kw: "old-tab" if "active-call" in key else "new-tab"
+        self.assertFalse(lifecycle.healthy_browser_call(current))
+        cache.get_value.side_effect = lambda *a, **kw: None
+        self.assertFalse(lifecycle.healthy_browser_call(current))
 
 
 if __name__ == "__main__":
