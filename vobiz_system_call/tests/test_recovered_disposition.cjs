@@ -113,3 +113,70 @@ test('automatic reconciliation preserves AI, auto-dial and excluded-reference di
         assert.equal(t.timers.length, 0, scenario);
     }
 });
+
+test('Bharat sparse completion followed by full completion opens disposition exactly once', () => {
+    const t = setup();
+    t.obj.handle_call_disconnected({name: 'C1', status: 'Completed'});
+    assert.equal(t.obj.state.softphone.current_call_log, '');
+    t.obj.handle_call_disconnected(completed);
+    t.obj.handle_call_disconnected(completed);
+    assert.equal(t.timers.length, 1);
+    t.timers.shift()();
+    assert.equal(t.opened.length, 1);
+    assert.equal(t.opened[0][0].reference_name, 'LEAD1');
+});
+
+test('missing context is recovered by exact ID after the SDK has already been cleared', async () => {
+    const t = setup();
+    t.obj.state.active_call = {name: 'C1', status: 'Connected'};
+    t.obj.handle_call_disconnected({name: 'C1', status: 'Completed'});
+    assert.equal(t.opened.length, 0);
+    await t.timers.shift()();
+    await flush();
+    t.timers.shift()();
+    assert.equal(t.opened.length, 1);
+    assert.equal(t.opened[0][0].name, 'C1');
+    assert.equal(t.opened[0][1].name, 'LEAD1');
+});
+
+test('full update still works after cleanup and a console refresh without last_call', () => {
+    const t = setup();
+    t.obj.state.active_call = {name: 'C1', status: 'Connected'};
+    t.obj.handle_call_disconnected({name: 'C1', status: 'Completed'});
+    t.obj.state.active_call = {mapping: 'agent'};
+    t.obj.handle_call_disconnected(completed);
+    // First timer is status recovery, second is the independently delivered full event.
+    t.timers.pop()();
+    assert.equal(t.opened.length, 1);
+    assert.equal(t.opened[0][0].reference_name, 'LEAD1');
+});
+
+test('a late terminal notification cannot clear or interrupt a newer active call', () => {
+    const t = setup();
+    t.obj.completed_call_contexts = new Map([['C1', completed]]);
+    t.obj.state.softphone.current_call_log = 'C2';
+    t.obj.state.active_call = {name: 'C2', status: 'Connected', last_call: completed};
+    t.obj.handle_call_disconnected(completed);
+    assert.equal(t.obj.state.active_call.name, 'C2');
+    assert.equal(t.obj.state.softphone.current_call_log, 'C2');
+    assert.equal(t.timers.length, 0);
+    // Once idle, rendering drains the preserved completion independently of call cleanup.
+    t.obj.state.softphone.current_call_log = '';
+    t.obj.state.softphone.in_call = false;
+    t.obj.state.active_call = {};
+    t.obj.render_active_call();
+    t.timers.shift()();
+    assert.equal(t.opened.length, 1);
+});
+
+test('transient status failure retries instead of losing disposition', async () => {
+    const t = setup(); let requests = 0;
+    t.obj.load = () => {};
+    t.ctx.frappe.call = () => ++requests === 1 ? Request.reject(Error('offline')) : Request.resolve({message: completed});
+    t.obj.watch_browser_call_disposition('C1');
+    await t.timers.shift()();
+    assert.equal(t.obj.browser_disposition_watchers.has('C1'), true);
+    await t.timers.shift()();
+    t.timers.shift()();
+    assert.equal(t.opened.length, 1);
+});

@@ -1796,9 +1796,24 @@ class VobizAgentConsole {
 		return this.confirm_end_call(callLog, this.state.softphone.current_customer);
 	}
 
+	completed_call_context(call) {
+		const active = this.state.active_call || {};
+		const pending = this.completed_call_contexts || (this.completed_call_contexts = new Map());
+		const merged = {};
+		for (const source of [pending.get(call.name), this.state.workdesk_live_call, active.last_call, active, call]) {
+			if (source?.name !== call.name) continue;
+			for (const [key, value] of Object.entries(source)) {
+				if (value !== undefined && value !== null) merged[key] = value;
+			}
+		}
+		pending.set(call.name, merged);
+		return merged;
+	}
+
 	reconcile_browser_softphone_call(call = {}) {
 		const softphone = this.state.softphone;
 		if (!call.name || !this.is_terminal_status(call.status) || softphone.current_call_log !== call.name) return false;
+		call = this.completed_call_context(call);
 		const sdk = softphone.client && softphone.client.client;
 		let matchingSession = false;
 		try {
@@ -3024,6 +3039,9 @@ class VobizAgentConsole {
 		}
 		this.render_call_assets(active.name ? active : last);
 		this.render_workdesk_live_call();
+		if (!skipDispositionPrompt && !this.disposition_call_in_progress() && this.completed_call_contexts?.size) {
+			for (const call of Array.from(this.completed_call_contexts.values())) this.maybe_prompt_workdesk_disposition(call);
+		}
 	}
 
 	render_call_assets(call) {
@@ -3287,15 +3305,22 @@ class VobizAgentConsole {
 	}
 
 	handle_call_disconnected(payload = {}) {
-		this.reconcile_browser_softphone_call(payload);
-		if (payload.name && payload.direction === 'Incoming' && this.is_terminal_status(payload.status)) {
-			this.watch_browser_call_disposition(payload.name);
-		}
+		if (!payload.name || !this.is_terminal_status(payload.status)) return;
 		const active = this.state.active_call || {};
-		if (!payload.name || active.name !== payload.name || !this.is_terminal_status(payload.status)) return;
-		const call = Object.assign({}, active, payload);
-		this.state.active_call = { last_call: call };
-		this.render_active_call();
+		const known = this.state.softphone.current_call_log === payload.name || active.name === payload.name
+			|| active.last_call?.name === payload.name || this.state.workdesk_live_call_log === payload.name
+			|| this.completed_call_contexts?.has(payload.name);
+		if (!known) {
+			if (payload.direction === 'Incoming') this.watch_browser_call_disposition(payload.name);
+			return;
+		}
+		const call = this.completed_call_context(payload);
+		if (this.reconcile_browser_softphone_call(call)) return;
+		if (active.name === call.name || (!active.name && active.last_call?.name === call.name)) {
+			this.state.active_call = { last_call: call };
+			this.render_active_call(true);
+		}
+		this.maybe_prompt_workdesk_disposition(call);
 	}
 
 	render_header_active_call(active = {}) {
@@ -5494,15 +5519,24 @@ class VobizAgentConsole {
 			if (this.is_terminal_status(call.status)) {
 				this.browser_disposition_watchers.delete(callLog);
 				const currentCall = this.state.softphone.current_call_log || (this.state.active_call || {}).name;
-				if (call.name !== callLog || (currentCall && currentCall !== callLog)) return;
+				if (call.name !== callLog) return;
+				call.disposition_reference_checked = true;
+				if (currentCall && currentCall !== callLog) {
+					this.completed_call_context(call);
+					return;
+				}
 				if (call.name === callLog) this.reconcile_browser_softphone_call(call);
-				this.maybe_prompt_workdesk_disposition(call);
+				this.maybe_prompt_workdesk_disposition(Object.assign({}, call, {disposition_reference_checked: true}));
 				this.load();
 				return;
 			}
 			if (++attempts < 60) setTimeout(check, 2000);
 			else this.browser_disposition_watchers.delete(callLog);
-		}).catch(() => { this.browser_disposition_watchers.delete(callLog); });
+		}).catch(() => {
+			// A transient network error must not discard the completed call's disposition.
+			if (++attempts < 60) setTimeout(check, 2000);
+			else this.browser_disposition_watchers.delete(callLog);
+		});
 		setTimeout(check, 500);
 	}
 
@@ -5636,9 +5670,16 @@ class VobizAgentConsole {
 
 	maybe_prompt_workdesk_disposition(call) {
 		if (!call || !call.name || !this.is_terminal_status(call.status)) return;
+		call = this.completed_call_context(call);
 		this.post_call_disposition?.waiting_for_end.delete(call.name);
 		this.sync_post_call_disposition();
 		if (!this.is_disposition_call_current(call.name)) return;
+		if ((!call.reference_doctype || !call.reference_name) && call.direction !== 'Incoming') {
+			// Compatibility with old workers sending only name/status during deployment.
+			if (!call.disposition_reference_checked) this.watch_browser_call_disposition(call.name);
+			else this.completed_call_contexts.delete(call.name);
+			return;
+		}
 		if (call.direction === 'Incoming' && !call.reference_name && !call.incoming_reference_checked) {
 			this.incoming_disposition_pending = this.incoming_disposition_pending || new Set();
 			if (this.incoming_disposition_pending.has(call.name)) return;
@@ -5649,13 +5690,18 @@ class VobizAgentConsole {
 				.finally(() => this.incoming_disposition_pending.delete(call.name));
 			return;
 		}
-		if (this.should_skip_post_call_disposition(call, { doctype: call.reference_doctype })) return;
-		if (this.state.ai_disposition_enabled) return;
-		if (this.state.disposition_prompted_call_log === call.name) return;
-		if (this.state.active_disposition_call_log === call.name) return;
+		if (this.should_skip_post_call_disposition(call, { doctype: call.reference_doctype })
+			|| this.state.ai_disposition_enabled || this.state.disposition_prompted_call_log === call.name
+			|| this.state.active_disposition_call_log === call.name) {
+			this.completed_call_contexts.delete(call.name);
+			return;
+		}
 		const session = this.state.auto_dial || {};
 		const autoCallLog = ((session.current || {}).call_log) || '';
-		if (session.running && (session.awaiting_disposition || autoCallLog === call.name)) return;
+		if (session.running && (session.awaiting_disposition || autoCallLog === call.name)) {
+			this.completed_call_contexts.delete(call.name);
+			return;
+		}
 
 		const selected = this.state.active_workdesk_row || this.state.selected || {};
 		const row = (
@@ -5671,8 +5717,10 @@ class VobizAgentConsole {
 		if ((!row.doctype || !row.name) && call.direction !== 'Incoming') return;
 
 		this.state.disposition_prompted_call_log = call.name;
+		this.completed_call_contexts.delete(call.name);
 		setTimeout(() => {
 			if (!this.is_disposition_call_current(call.name)) {
+				this.completed_call_context(call);
 				if (this.state.disposition_prompted_call_log === call.name) this.state.disposition_prompted_call_log = null;
 				return;
 			}
@@ -5687,6 +5735,7 @@ class VobizAgentConsole {
 
 	open_post_call_disposition_dialog(call, row, on_done, options = {}) {
 		if (options.check_current_call && !this.is_disposition_call_current(call.name)) {
+			this.completed_call_context(call);
 			if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
 			if (this.state.disposition_prompted_call_log === call.name) this.state.disposition_prompted_call_log = null;
 			return;

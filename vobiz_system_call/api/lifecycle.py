@@ -124,11 +124,11 @@ def finish_locked(mapping, row, event, reason="", status=None):
         from vobiz_click_to_call.services.disposition import update_reference_call_metrics
         update_reference_call_metrics(row.reference_doctype, row.reference_name)
     from vobiz_ai.api.call_log import sync_linked_summaries
-    sync_linked_summaries(frappe.get_doc("Vobiz Call Log", row.name))
+    completed = frappe.get_doc("Vobiz Call Log", row.name)
+    sync_linked_summaries(completed)
     if is_browser_call(row) or context(row).get("incoming_mobile_bridge"):
-        frappe.publish_realtime("vobiz_call_disconnected", {
-            "name": row.name, "status": result, "direction": row.direction,
-        }, user=row.user, after_commit=True)
+        from vobiz_click_to_call.services.realtime import publish_call_disconnected
+        publish_call_disconnected(completed)
     return result
 
 

@@ -77,17 +77,21 @@ class BrowserSafetyTests(unittest.TestCase):
         from vobiz_ai.api import call_log
         self.replace(lifecycle, "release_locked", MagicMock())
         self.replace(call_log, "sync_linked_summaries", MagicMock())
-        self.replace(frappe, "get_doc", MagicMock())
+        get_doc = self.replace(frappe, "get_doc", MagicMock())
         publish = self.replace(frappe, "publish_realtime", MagicMock())
         for direction in ("Incoming", "Outgoing"):
             with self.subTest(direction=direction):
                 publish.reset_mock()
                 call_row = row(direction=direction)
+                completed = row(status="Completed", direction=direction,
+                                reference_doctype="CRM Lead", reference_name="LEAD1")
+                get_doc.return_value = completed
                 result = lifecycle.finish_locked(None, call_row, "provider-hangup", status="Completed")
                 self.assertEqual(result, "Completed")
-                publish.assert_called_once_with("vobiz_call_disconnected", {
-                    "name": "CALL-1", "status": "Completed", "direction": direction,
-                }, user="agent@example.test", after_commit=True)
+                from vobiz_click_to_call.services.realtime import call_completion_payload
+                publish.assert_called_once_with("vobiz_call_disconnected", call_completion_payload(completed),
+                                                user="agent@example.test", after_commit=True)
+                self.assertEqual(publish.call_args.args[1]["reference_name"], "LEAD1")
         publish.reset_mock()
         lifecycle.finish_locked(None, row(status="Completed", direction="Outgoing"), "provider-hangup")
         publish.assert_not_called()
