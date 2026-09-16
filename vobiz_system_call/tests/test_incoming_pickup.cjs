@@ -34,6 +34,33 @@ test('Pickup waits for the incoming invite to be linked to its server call',()=>
  const t=setup();Object.assign(t.c.state.softphone,{incoming_call_uuid:'SDK-UNLINKED',incoming_pending:true});let answers=0;t.sdk.answer=()=>answers++;
  t.c.answer_browser_softphone();assert.equal(answers,0);assert.equal(t.c.browser_incoming_waiting(),false);
 });
+test('incoming Workdesk updates to Stop immediately and targets the current call before polling',async()=>{
+ const t=setup(),row={doctype:'CRM Lead',name:'LEAD1'};
+ t.c.state.active_call={last_call:{name:'OLD',status:'Completed',reference_doctype:row.doctype,reference_name:row.name}};
+ const updates=[];t.c.render_workdesk_live_call=()=>updates.push(t.c.matching_active_call(row));
+ t.ctx.frappe.call=()=>Request.resolve({message:{call_log:'NEW',status:'Agent Ringing',direction:'Incoming',reference_doctype:row.doctype,reference_name:row.name,customer_number:'customer'}});
+ t.c.browser_softphone_incoming('DID',{}, {callUUID:'SDK-NEW'},'Customer');await flush();
+ assert.equal(t.c.matching_active_call(row).name,'NEW');
+ assert.equal(t.c.matching_active_call(row).status,'Agent Ringing');
+ t.c.answer_browser_softphone('NEW');
+ assert.notEqual(t.c.matching_active_call(row).status,'Connected','Pickup click alone does not confirm connection');
+ t.handlers.onCallAnswered({callUUID:'SDK-NEW'});
+ assert.equal(updates.at(-1).status,'Connected','Workdesk redraws on the matching SDK confirmation');
+ let ended;t.c.cancel_call_log=id=>{ended=id;};t.c.start_call_for_row=()=>assert.fail('Must not start a second call');
+ t.c.handle_workdesk_primary_action(row);assert.equal(ended,'NEW');
+ assert.equal(t.c.matching_active_call({doctype:'CRM Lead',name:'OTHER'}),null);
+});
+test('late or terminal Workdesk context cannot restore an ended call or replace a newer one',()=>{
+ const t=setup();t.ring('C2');t.c.render_workdesk_live_call=()=>{};
+ const current={name:'C2',status:'Ringing',reference_doctype:'CRM Lead',reference_name:'L2'};
+ t.c.track_browser_workdesk_call(current);
+ t.c.track_browser_workdesk_call({...current,name:'C1',reference_name:'L1'});
+ assert.equal(t.c.state.workdesk_live_call.name,'C2');
+ t.c.track_browser_workdesk_call({...current,status:'Completed'});
+ assert.equal(t.c.state.workdesk_live_call.status,'Ringing');
+ t.c.clear_tracked_live_call('C2');t.c.confirmed_terminal_calls=new Set(['C2']);
+ t.c.track_browser_workdesk_call(current);assert.equal(t.c.state.workdesk_live_call,null);
+});
 test('incoming call during the disposition opening animation hides the form after shown',()=>{
  const t=setup();t.open();const d=t.dialogs[0];let hides=0;
  d.hide=()=>{hides++;if(hides===1)return;d.visible=false;d.events['hidden.bs.modal']();};

@@ -163,7 +163,11 @@ def get_incoming_call(caller: str, tab_id: str):
                 and _number(mapping.caller_id) != _number(row.did_number))):
         frappe.throw(_("Incoming call does not match the routed call."))
     frappe.db.commit()
-    return {"call_log": row.name, "call_uuid": row.call_uuid, "customer_number": row.customer_number}
+    return {
+        "call_log": row.name, "call_uuid": row.call_uuid, "customer_number": row.customer_number,
+        "status": row.status, "direction": row.direction,
+        "reference_doctype": row.reference_doctype, "reference_name": row.reference_name,
+    }
 
 
 @frappe.whitelist(methods=["POST"])

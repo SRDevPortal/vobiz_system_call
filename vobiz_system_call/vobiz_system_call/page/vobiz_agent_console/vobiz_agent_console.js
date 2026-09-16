@@ -794,6 +794,7 @@ class VobizAgentConsole {
 			}));
 			const call = response.message || {};
 			if (!stillCurrent() || call.name !== callLog) return;
+			this.track_browser_workdesk_call(call);
 			if (!call.reference_doctype || !call.reference_name) {
 				frappe.msgprint(__('This caller is not linked to a customer record yet. You can still pick up the call.'));
 				return;
@@ -1333,6 +1334,7 @@ class VobizAgentConsole {
 			softphone.in_call = true;
 			softphone.started_at = new Date();
 			this.state.call_started_at = softphone.started_at;
+			this.track_browser_workdesk_call({ ...call, name: call.call_log });
 			this.start_timer();
 			this.render_browser_softphone();
 			this.render_queue();
@@ -1402,7 +1404,7 @@ class VobizAgentConsole {
 		softphone.status = status;
 		softphone.in_call = Boolean(inCall);
 		if (softphone.current_call_log && (this.state.workdesk_live_call || {}).name === softphone.current_call_log) {
-			this.state.workdesk_live_call.status = status;
+			this.state.workdesk_live_call.status = inCall && softphone.incoming_answered ? 'Connected' : status;
 			this.render_workdesk_live_call();
 		}
 		this.render_browser_softphone();
@@ -3917,9 +3919,26 @@ class VobizAgentConsole {
 		`;
 	}
 
+	track_browser_workdesk_call(call) {
+		const softphone = this.state.softphone;
+		if (!call.name || call.name !== softphone.current_call_log
+			|| !call.reference_doctype || !call.reference_name
+			|| this.is_terminal_status(call.status) || this.confirmed_terminal_calls?.has(call.name)) return;
+		this.state.workdesk_live_call_log = call.name;
+		this.state.workdesk_live_call = { ...call, status: softphone.incoming_answered ? 'Connected' : (call.status || 'Ringing') };
+		this.render_workdesk_live_call();
+	}
+
 	matching_active_call(row) {
 		const active = this.state.active_call || {};
 		const tracked = this.state.workdesk_live_call || {};
+		// The authenticated incoming invite already identifies the customer. Do
+		// not let a previous call's completed snapshot override this live call.
+		if (tracked.name && tracked.name === this.state.softphone.current_call_log
+			&& !this.is_terminal_status(tracked.status) && !this.confirmed_terminal_calls?.has(tracked.name)
+			&& tracked.reference_doctype === row.doctype && tracked.reference_name === row.name) {
+			return tracked;
+		}
 		if (
 			active.name &&
 			active.reference_doctype === row.doctype &&

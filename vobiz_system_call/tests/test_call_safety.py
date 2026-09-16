@@ -343,12 +343,16 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(lifecycle, "presence", lambda _: "tab")
         self.replace(webrtc, "get_system_call_profile", lambda: {"current_call_log": "INBOUND"})
         incoming = row(name="INBOUND", direction="Incoming", status="Ringing", customer_number="+919876545966",
+                       reference_doctype="CRM Lead", reference_name="LEAD-INBOUND",
                        normalized_customer_number="+919876545966", did_number="+911234565565")
         mapping = row(current_call_log="INBOUND", caller_id=incoming.did_number)
         self.replace(lifecycle, "lock_call", lambda _: (mapping, incoming))
         result = webrtc.get_incoming_call("sip:911234565565@registrar.vobiz.ai", "tab")
         self.assertEqual(result["call_log"], "INBOUND")
         self.assertEqual(result["customer_number"], incoming.customer_number)
+        self.assertEqual(result["reference_doctype"], "CRM Lead")
+        self.assertEqual(result["reference_name"], "LEAD-INBOUND")
+        self.assertEqual(result["status"], "Ringing")
         for address in ["+911234565565@registrar.vobiz.ai", "911234565565@registrar.vobiz.ai", "sips:+911234565565@registrar.vobiz.ai"]:
             self.assertEqual(webrtc.get_incoming_call(address, "tab")["call_log"], "INBOUND")
         for invalid in ["agent@registrar.vobiz.ai", "sip:+911234565565@", "+911234565565@registrar.vobiz.ai@evil", ""]:
