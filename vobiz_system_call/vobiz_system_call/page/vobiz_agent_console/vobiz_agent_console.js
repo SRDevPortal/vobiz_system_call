@@ -535,10 +535,6 @@ class VobizAgentConsole {
 				.vobiz-wa-media { display: block; margin-top: 6px; }
 				.vobiz-wa-image { border-radius: 8px; display: block; height: auto; max-height: 360px; max-width: 260px; object-fit: contain; width: auto; }
 				.vobiz-wa-media-link { align-items: center; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; display: inline-flex; gap: 8px; padding: 8px 10px; text-decoration: none; }
-				.vobiz-wa-window { align-items: center; background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; color: #78350f; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; padding: 10px 12px; font-size: 12px; }
-				.vobiz-wa-window span { flex: 1 1 220px; }
-				.vobiz-wa-window.is-open { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
-				.vobiz-wa-window.is-pending { background: #f8fafc; border-color: #e2e8f0; color: #475569; }
 				.vobiz-wa-icon-btn:disabled { opacity: .45; cursor: not-allowed; }
 				.vobiz-wa-composer { align-items: center; background: #fff; border: 1px solid #e5e7eb; border-radius: 18px; box-shadow: 0 1px 6px rgba(15, 23, 42, .06); display: grid; gap: 6px; grid-template-columns: 32px 32px 32px minmax(0, 1fr) 42px; margin-top: 12px; max-width: 100%; min-width: 0; overflow: visible; padding: 8px 10px; width: 100%; }
 				.vobiz-wa-icon-btn { align-items: center; background: transparent; border: 0; color: #111827; display: inline-flex; font-size: 17px; height: 32px; justify-content: center; min-width: 32px; padding: 0; width: 32px; }
@@ -3796,6 +3792,14 @@ class VobizAgentConsole {
 		dialog.$wrapper.addClass('vobiz-workdesk-modal');
 		this.bind_workdesk_call_intent(dialog.$wrapper);
 		dialog.get_close_btn().show();
+		dialog.$wrapper.on('shown.bs.modal', () => {
+			if (this.state.active_workdesk_dialog !== dialog) return;
+			const view = this.active_whatsapp_view();
+			if (!view) return;
+			// A fast chat response can render before Bootstrap attaches the modal.
+			// Start live updates once its backdrop transition has completed.
+			this.schedule_whatsapp_sync(0);
+		});
 		dialog.$wrapper.on('hidden.bs.modal', () => {
 			if (this.state.active_workdesk_dialog !== dialog) return;
 			this.close_whatsapp_media_viewer();
@@ -3830,7 +3834,6 @@ class VobizAgentConsole {
 				$body.find('[data-detail-panel]').html(this.workdesk_vobiz_html(workdesk, context.history || []));
 			} else if (tab === 'whatsapp') {
 				$body.find('[data-detail-panel]').html(this.workdesk_whatsapp_html(workdesk));
-				this.initialize_whatsapp_window($body, workdesk.whatsapp || {});
 				setTimeout(() => this.scroll_whatsapp_to_bottom($body), 50);
 				this.schedule_whatsapp_sync(0);
 			} else {
@@ -3874,7 +3877,6 @@ class VobizAgentConsole {
 		$body.on('click', '[data-wa-send]', () => this.send_workdesk_whatsapp($body));
 		$body.on('click', '[data-wa-image-view]', (event) => { event.preventDefault(); this.open_whatsapp_media_viewer($body, event.currentTarget); });
 		$body.on('click', '[data-wa-media-download]', (event) => this.prepare_whatsapp_media_download($body, event));
-		$body.on('click', '[data-wa-window-retry]', () => this.schedule_whatsapp_sync(0));
 		$body.on('click', '[data-wa-template]', () => this.open_workdesk_template_dialog($body));
 		$body.on('click', '[data-wa-attach]', (e) => {
 			e.stopPropagation();
@@ -4014,7 +4016,6 @@ class VobizAgentConsole {
 			}
 		}).then((r) => {
 			const data = r.message || {};
-			if (data.whatsapp) data.whatsapp.window_received_at = Date.now();
 			context.workdesk = Object.assign(context.workdesk || {}, data);
 			if (data.history) {
 				context.history = data.history;
@@ -4894,14 +4895,9 @@ class VobizAgentConsole {
 	workdesk_whatsapp_composer_html() {
 		const emojis = ['😀', '😊', '🙏', '👍', '❤️', '😂', '🎉', '✅', '📞', '💊', '🩺', '💬', '🙌', '😇', '🤝', '⭐'];
 		return `
-			<div class="vobiz-wa-window is-pending" data-wa-window-banner role="status" aria-live="polite">
-				<span data-wa-window-text>${__('Checking the messaging window...')}</span>
-				<button class="btn btn-default btn-xs" type="button" data-wa-window-retry style="display:none">${__('Retry')}</button>
-				<button class="btn btn-default btn-xs" type="button" data-wa-template>${__('Use template')}</button>
-			</div>
 			<div class="vobiz-wa-composer">
 				<div class="vobiz-wa-attach-wrap">
-					<button class="vobiz-wa-icon-btn" type="button" data-wa-attach disabled title="${__('Attach')}"><i class="fa fa-plus"></i></button>
+					<button class="vobiz-wa-icon-btn" type="button" data-wa-attach title="${__('Attach')}"><i class="fa fa-plus"></i></button>
 					<div class="vobiz-wa-menu" data-wa-attach-menu>
 						<button type="button" data-wa-attach-action="image"><i class="fa fa-image"></i> ${__('Photo')}</button>
 						<button type="button" data-wa-attach-action="document"><i class="fa fa-file-text-o"></i> ${__('Document')}</button>
@@ -4911,13 +4907,13 @@ class VobizAgentConsole {
 				</div>
 				<button class="vobiz-wa-icon-btn" type="button" data-wa-template title="${__('Template')}"><i class="fa fa-file-text-o"></i></button>
 				<div class="vobiz-wa-emoji-wrap">
-					<button class="vobiz-wa-icon-btn" type="button" data-wa-emoji disabled title="${__('Emoji')}"><i class="fa fa-smile-o"></i></button>
+					<button class="vobiz-wa-icon-btn" type="button" data-wa-emoji title="${__('Emoji')}"><i class="fa fa-smile-o"></i></button>
 					<div class="vobiz-wa-menu vobiz-wa-emoji-menu" data-wa-emoji-menu>
 						${emojis.map((emoji) => `<button type="button" data-wa-emoji-value="${emoji}">${emoji}</button>`).join('')}
 					</div>
 				</div>
-				<textarea class="form-control" data-wa-reply disabled placeholder="${__('Type a message')}"></textarea>
-				<button class="vobiz-wa-send" type="button" data-wa-send disabled title="${__('Send')}"><i class="fa fa-paper-plane"></i></button>
+				<textarea class="form-control" data-wa-reply placeholder="${__('Type a message')}"></textarea>
+				<button class="vobiz-wa-send" type="button" data-wa-send title="${__('Send')}"><i class="fa fa-paper-plane"></i></button>
 			</div>
 		`;
 	}
@@ -5045,8 +5041,6 @@ class VobizAgentConsole {
 		this.close_whatsapp_media_viewer();
 		const $body = this.state && this.state.active_workdesk_body;
 		if ($body) $body.find('[data-wa-playback]').each((_, media) => { if (typeof media.pause === 'function') media.pause(); });
-		clearTimeout(this.whatsapp_window_timer);
-		this.whatsapp_window_timer = null;
 		clearTimeout(this.whatsapp_sync_timer);
 		this.whatsapp_sync_timer = null;
 		this.whatsapp_sync_request = null;
@@ -5105,91 +5099,9 @@ class VobizAgentConsole {
 		});
 	}
 
-	initialize_whatsapp_window($body, wa) {
-		const view = this.active_whatsapp_view();
-		if (!view || view.$body.get(0) !== $body.get(0)) return;
-		// Use the initial chat response; guidance must not depend on incremental history polling.
-		wa.window_received_at = wa.window_received_at || Date.now();
-		if (wa.messaging_window) this.apply_whatsapp_window(view, wa.messaging_window, wa.window_received_at);
-		else this.whatsapp_window_check_failed(view);
-	}
-
-	whatsapp_window_check_failed(view) {
-		if (!this.is_current_whatsapp_view(view)) return;
-		const snapshot = view.$list.data('wa-window-state');
-		if (!snapshot || !snapshot.state) view.$list.data('wa-window-state', { state: null, failed: true });
-		this.render_whatsapp_window(view);
-	}
-
-	apply_whatsapp_window(view, state, requested_at = Date.now()) {
-		if (!this.is_current_whatsapp_view(view)) return;
-		// Compare server timestamps in the same timezone, then use elapsed client time.
-		// This avoids depending on the agent computer's timezone or clock setting.
-		const timestamp = value => Date.parse(String(value || '').replace(' ', 'T') + 'Z');
-		const remaining = state && state.can_send_free_form
-			? timestamp(state.free_form_expires_at) - timestamp(state.server_time) : 0;
-		view.$list.data('wa-window-state', {
-			state,
-			deadline: Number.isFinite(remaining) ? requested_at + remaining : 0
-		});
-		this.render_whatsapp_window(view);
-	}
-
-	whatsapp_window_guidance(snapshot) {
-		const state = snapshot && snapshot.state;
-		if (!state) return {
-			kind: snapshot && snapshot.failed ? 'error' : 'pending', can_send: false,
-			text: snapshot && snapshot.failed
-				? __('Could not check the messaging window. Retrying automatically. You can retry now or use an approved template.')
-				: __('Checking the messaging window. You can use an approved template while we check.')
-		};
-		if (state.can_send_free_form === true && snapshot.deadline > Date.now()) {
-			const label = state.reason === 'ctwa_72h'
-				? __('Click-to-WhatsApp messaging window open') : __('Messaging window open');
-			const expires = frappe.datetime.str_to_user(state.free_form_expires_at);
-			return { kind: 'open', can_send: true,
-				text: label + ' - ' + __('You can send normal messages, photos and documents until') + ' ' + expires + '.' };
-		}
-		return { kind: 'closed', can_send: false,
-			text: !state.last_customer_message_at
-				? __('No incoming message from this patient yet. Send an approved template to start the conversation. Normal messages become available after the patient replies.')
-				: __('Messaging window closed. Send an approved template to re-engage this patient. Normal messages become available after the patient replies.') };
-	}
-
-	render_whatsapp_window(view) {
-		if (!this.is_current_whatsapp_view(view)) return;
-		clearTimeout(this.whatsapp_window_timer);
-		this.whatsapp_window_timer = null;
-		const snapshot = view.$list.data('wa-window-state');
-		const guidance = this.whatsapp_window_guidance(snapshot);
-		const $banner = view.$body.find('[data-wa-window-banner]');
-		$banner.attr('class', 'vobiz-wa-window is-' + guidance.kind);
-		$banner.find('[data-wa-window-text]').text(guidance.text);
-		$banner.find('[data-wa-template]').toggle(!guidance.can_send);
-		$banner.find('[data-wa-window-retry]').toggle(guidance.kind === 'error');
-		view.$body.find('[data-wa-reply], [data-wa-attach], [data-wa-emoji]').prop('disabled', !guidance.can_send);
-		view.$body.find('[data-wa-send]').prop('disabled', !guidance.can_send || !!view.$list.data('wa-sending'));
-		view.$body.find('[data-wa-reply]').attr('placeholder', guidance.can_send
-			? __('Type a message') : __('Use an approved template to message this patient'));
-		if (!guidance.can_send) view.$body.find('[data-wa-attach-menu], [data-wa-emoji-menu]').removeClass('show');
-		if (guidance.can_send) {
-			this.whatsapp_window_timer = setTimeout(() => {
-				if (!this.is_current_whatsapp_view(view)) return;
-				this.render_whatsapp_window(view);
-				this.schedule_whatsapp_sync(0);
-			}, Math.min(Math.max(1, snapshot.deadline - Date.now()), 2147483647));
-		}
-	}
-
 	can_send_workdesk_whatsapp($body) {
 		const view = this.active_whatsapp_view();
-		if (!view || view.$body.get(0) !== $body.get(0)) return false;
-		const guidance = this.whatsapp_window_guidance(view.$list.data('wa-window-state'));
-		if (guidance.can_send) return true;
-		this.render_whatsapp_window(view);
-		this.schedule_whatsapp_sync(0);
-		frappe.show_alert({ message: guidance.text, indicator: 'orange' });
-		return false;
+		return !!view && view.$body.get(0) === $body.get(0) && !view.$list.data('wa-sending');
 	}
 
 	update_whatsapp_unread_count(conversation, count) {
@@ -5252,7 +5164,7 @@ class VobizAgentConsole {
 			this.whatsapp_sync_request.pending = true;
 			return;
 		}
-		const request = { element: view.element, pending: false, started_at: Date.now() };
+		const request = { element: view.element, pending: false };
 		this.whatsapp_sync_request = request;
 		let has_more = false;
 		try {
@@ -5276,8 +5188,6 @@ class VobizAgentConsole {
 			}
 			const page = response.message || {};
 			if (!page.success) throw new Error('WhatsApp refresh failed');
-			if (page.messaging_window) this.apply_whatsapp_window(view, page.messaging_window, request.started_at);
-			else this.whatsapp_window_check_failed(view);
 			this.append_live_whatsapp_messages(view, page.messages || []);
 			this.update_whatsapp_message_statuses(view, page.message_statuses || []);
 			if (!after_message) {
@@ -5292,7 +5202,7 @@ class VobizAgentConsole {
 			this.update_whatsapp_unread_count(view.conversation, Number(page.unread_count || 0));
 			if (!has_more) this.mark_visible_whatsapp_read(view);
 		} catch (err) {
-			if (this.whatsapp_sync_request === request) this.whatsapp_window_check_failed(view);
+			// Preserve the draft and retry through the normal live-update schedule.
 		} finally {
 			if (this.whatsapp_sync_request === request) {
 				this.whatsapp_sync_request = null;
@@ -5352,7 +5262,6 @@ class VobizAgentConsole {
 				$body.find('.vobiz-workdesk-card').append(this.workdesk_whatsapp_composer_html());
 			}
 			this.scroll_whatsapp_to_bottom($body);
-			this.initialize_whatsapp_window($body, page);
 			this.schedule_whatsapp_sync(0);
 		});
 	}
@@ -5418,8 +5327,7 @@ class VobizAgentConsole {
 			this.refresh_inline_whatsapp($body, conversation);
 		}).always(() => {
 			$list.data('wa-sending', false);
-			const view = this.active_whatsapp_view();
-			if (view && view.element === $list.get(0)) this.render_whatsapp_window(view);
+			$button.prop('disabled', false);
 			this.schedule_whatsapp_sync(0);
 		});
 	}
@@ -5759,9 +5667,7 @@ class VobizAgentConsole {
 				{
 					fieldname: 'followup_body',
 					fieldtype: 'Small Text',
-					label: __('Message After Template'),
-					read_only: !this.whatsapp_window_guidance($body.find('[data-wa-chat-list]').first().data('wa-window-state')).can_send,
-					description: __('Only available while the messaging window is open. Sending a template does not open the window; the patient must reply first.')
+					label: __('Message After Template')
 				}
 			],
 			primary_action_label: __('Send Template'),
@@ -5938,7 +5844,7 @@ class VobizAgentConsole {
 	}
 
 	send_workdesk_whatsapp_media($body, conversation, payload) {
-		if (!this.can_send_workdesk_whatsapp($body)) return Promise.reject(new Error(__('Use an approved template to message this patient.')));
+		if (!this.can_send_workdesk_whatsapp($body)) return Promise.reject(new Error(__('This chat is not ready to send another message.')));
 		return frappe.call({
 			method: 'vobiz_click_to_call.api.console.send_whatsapp_media',
 			args: { ...$body.data('whatsapp-reference'), conversation, ...payload },
