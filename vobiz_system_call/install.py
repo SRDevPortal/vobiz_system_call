@@ -121,7 +121,7 @@ def ensure_patch_fields():
                     "no_copy": 1,
                     "insert_after": "browser_softphone_endpoint_uri",
                     "depends_on": "eval:doc.browser_softphone_enabled",
-                    "description": "Outgoing browser calls only. Keep the customer connected while the agent reconnects, with a 120-second recovery window after connection loss is detected. Applies to new calls. Requires running call recovery services on the server.",
+                    "description": "Outgoing browser calls only. Keep the customer connected for a 60-second reconnect window after connection loss is detected. Uses existing Frappe default/short workers and scheduler. Actual disconnection can be later due to scheduling or queue delays. Applies to new calls.",
                 },
                 {
                     "fieldname": "browser_softphone_username",

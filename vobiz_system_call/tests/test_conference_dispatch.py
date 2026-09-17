@@ -7,7 +7,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -174,30 +173,57 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.cache.zscore(self.cache.make_key(jobs.URGENT), "CALL"), 1005)
 
     def test_old_probe_cannot_report_a_stalled_queue_as_healthy(self):
-        self.cache.set_value(jobs.DISPATCHER_HEARTBEAT, 1000)
+        self.cache.set_value(jobs.SCHEDULER_HEARTBEAT, 1000)
         jobs.worker_probe(jobs.NORMAL_QUEUE, 900)
         jobs.worker_probe(jobs.URGENT_QUEUE, 1000)
         self.assertFalse(jobs.health()["ready"])
         jobs.worker_probe(jobs.NORMAL_QUEUE, 1000)
         self.assertTrue(jobs.health()["ready"])
-        self.now = 1016
+        self.now = 1061
+        self.assertTrue(jobs.health()["ready"])  # Normal minute scheduler gap is healthy.
+        self.now = 1151
         self.assertFalse(jobs.health()["ready"])
 
-    def test_one_running_worker_is_not_enough(self):
-        self.cache.set_value(jobs.DISPATCHER_HEARTBEAT, 1000)
+    def test_proof_for_one_queue_does_not_prove_the_other_queue_is_healthy(self):
+        self.cache.set_value(jobs.SCHEDULER_HEARTBEAT, 1000)
         jobs.worker_probe(jobs.NORMAL_QUEUE, 1000)
         self.assertFalse(jobs.health()["ready"])
 
-    def test_tick_checks_both_workers_without_touching_regular_erp_queues(self):
+    def test_tick_uses_only_existing_default_and_short_workers(self):
+        self.assertEqual(jobs.NORMAL_QUEUE, "default")
+        self.assertEqual(jobs.URGENT_QUEUE, "short")
         jobs.tick()
         probes = [c for c in self.enqueued.call_args_list if c.args[0].endswith("worker_probe")]
         self.assertEqual({c.kwargs["queue"] for c in probes}, {jobs.NORMAL_QUEUE, jobs.URGENT_QUEUE})
         for call in probes:
             self.assertEqual(call.kwargs["queue_name"], call.kwargs["queue"])
             self.assertEqual(call.kwargs["sent_at"], 1000)
-        self.assertEqual(self.cache.get_value(jobs.DISPATCHER_HEARTBEAT), 1000)
+        self.assertEqual(self.cache.get_value(jobs.SCHEDULER_HEARTBEAT), 1000)
         # Merely enqueueing the probes does not make the workers healthy.
         self.assertFalse(jobs.health()["ready"])
+
+    def test_existing_scheduler_sweep_updates_health_without_a_daemon(self):
+        from vobiz_system_call.api import conference
+        with patch.object(jobs.time, "sleep", side_effect=AssertionError("must not occupy a worker waiting")):
+            conference.sweep()
+        self.assertEqual(self.cache.get_value(jobs.SCHEDULER_HEARTBEAT), 1000)
+        self.assertFalse(jobs.health()["ready"])
+        for queue in ("default", "short"):
+            jobs.worker_probe(queue, 1000)
+        self.assertTrue(jobs.health()["ready"])
+
+    def test_scheduler_heartbeat_alone_does_not_accept_a_late_worker_probe(self):
+        self.cache.set_value(jobs.SCHEDULER_HEARTBEAT, 1000)
+        jobs.worker_probe("default", 960)  # Fresh arrival, but 40 seconds in queue.
+        jobs.worker_probe("short", 1000)
+        self.assertFalse(jobs.health()["ready"])
+
+    def test_routine_dispatch_does_not_jump_ahead_of_existing_erp_jobs(self):
+        jobs.enqueue("CALL", urgent=True)
+        self.add(jobs.WATCH, 1)
+        jobs.dispatch_due()
+        for call in self.enqueued.call_args_list:
+            self.assertFalse(call.kwargs.get("at_front", False))
 
     def test_full_normal_queue_cannot_block_500_urgent_calls_or_urgent_probe(self):
         self.add(jobs.URGENT, 500)
@@ -239,7 +265,8 @@ class DispatchTests(unittest.TestCase):
         worker.work(burst=True, logging_level="WARNING")
         self.assertEqual(normal.count, 500)
         self.assertEqual(urgent.count, 0)
-        self.assertEqual(self.cache.get_value(jobs.PROBE_PREFIX + jobs.URGENT_QUEUE), 1000)
+        self.assertEqual(self.cache.get_value(jobs.PROBE_PREFIX + jobs.URGENT_QUEUE),
+                         {"sent_at": 1000, "completed_at": 1000})
 
 
 if __name__ == "__main__":

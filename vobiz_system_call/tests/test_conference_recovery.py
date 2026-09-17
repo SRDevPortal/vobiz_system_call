@@ -85,25 +85,28 @@ class ConferenceTests(unittest.TestCase):
         self.assertFalse(c.enabled(self.row.user))
         frappe.db.get_value.assert_not_called()
 
-    def test_routes_and_rooms_are_unique_and_grace_is_120(self):
+    def test_routes_and_rooms_are_unique_and_grace_is_60(self):
         original = c.state(self.row)
         c.prepare(self.row, c.get_settings())
         fresh = c.state(self.row)
         self.assertNotEqual(original["room"], fresh["room"])
         self.assertNotEqual(original["route"], fresh["route"])
-        self.assertEqual(fresh["deadline"], 1120)
+        self.assertEqual(fresh["deadline"], 1060)
         self.assertEqual(self.response["conference_generation"], 1)
+        self.assertEqual(self.response["recovery_seconds"], 60)
 
     def test_new_calls_require_timeout_sweep_and_conference_worker(self):
         from frappe.utils import background_jobs
         from vobiz_system_call.api import conference_jobs as jobs
         self.replace(background_jobs, "get_queues_timeout", lambda: {c.QUEUE: 120, jobs.URGENT_QUEUE: 120})
-        self.cache.get_value.return_value = 999
+        self.cache.get_value.side_effect = lambda key, **kw: (999 if key == jobs.SCHEDULER_HEARTBEAT
+            else {"sent_at": 998, "completed_at": 999})
         c.assert_ready()
-        self.cache.get_value.return_value = 800
+        self.cache.get_value.side_effect = lambda key, **kw: (800 if key == jobs.SCHEDULER_HEARTBEAT
+            else {"sent_at": 998, "completed_at": 999})
         with self.assertRaises(ValueError):
             c.assert_ready()
-        self.cache.get_value.side_effect = lambda key, **kw: 999 if key == jobs.DISPATCHER_HEARTBEAT else None
+        self.cache.get_value.side_effect = lambda key, **kw: 999 if key == jobs.SCHEDULER_HEARTBEAT else None
         with self.assertRaises(ValueError):
             c.assert_ready()
 
@@ -288,7 +291,7 @@ class ConferenceTests(unittest.TestCase):
         c.apply_member(self.value, "agent", 1, AGENT, "exit", 1000)
         c.apply_member(self.value, "agent", 1, AGENT, "enter", 1001)
         self.assertTrue(c.current_leg(self.value)["exited"])
-        self.assertEqual(self.value["deadline"], 1120)
+        self.assertEqual(self.value["deadline"], 1060)
 
     def test_old_generation_exit_cannot_interrupt_new_agent(self):
         self.value["generation"] = 2
@@ -307,7 +310,31 @@ class ConferenceTests(unittest.TestCase):
         self.issued()
         c.browser_event(self.mapping, self.row, "onCallTerminated", "", "sdk-id", 1)
         self.assertEqual(self.row.status, "Initiated")
-        self.assertEqual(c.state(self.row)["deadline"], 1120)
+        self.assertEqual(c.state(self.row)["deadline"], 1060)
+        self.finish.assert_not_called()
+
+    def test_repeated_disconnect_events_cannot_extend_the_60_second_window(self):
+        self.issued()
+        c.browser_event(self.mapping, self.row, "onCallTerminated", "", "sdk-id", 1)
+        self.assertEqual(c.state(self.row)["deadline"], 1060)
+        self.replace(c.time, "time", lambda: 1030)
+        c.browser_event(self.mapping, self.row, "onCallFailed", "", "sdk-id", 1)
+        self.assertEqual(c.state(self.row)["deadline"], 1060)
+        self.finish.assert_not_called()
+
+    def test_rejoin_is_allowed_before_60_seconds_but_refused_at_deadline(self):
+        self.issued()
+        self.value["deadline"] = 1060
+        self.value["legs"]["1"]["exited"] = True
+        c.save(self.row, self.value)
+        self.replace(c, "live_customer", lambda *a: True)
+        self.replace(c.time, "time", lambda: 1059)
+        self.assertIn("destination", self.recover())
+        self.replace(c.time, "time", lambda: 1060)
+        result = self.recover()
+        self.assertTrue(result["ending"])
+        self.assertNotIn("destination", result)
+        self.client.make_call.assert_not_called()
         self.finish.assert_not_called()
 
     def test_old_browser_generation_is_ignored(self):

@@ -1,7 +1,7 @@
-"""Isolated conference dispatch. No provider I/O runs in the deadline process.
+"""Conference recovery on standard Frappe queues and the existing scheduler.
 
-Run ``bench --site SITE execute ...conference_jobs.run`` under a supervisor.
-The ordinary Frappe scheduler remains a fallback, not the deadline authority.
+The minute sweep dispatches due work without sleeping or doing provider I/O.
+Call events and explicit End Call enqueue immediately between scheduled sweeps.
 """
 from __future__ import annotations
 
@@ -9,17 +9,18 @@ import time
 
 import frappe
 
-NORMAL_QUEUE = "vobiz_conference"
-URGENT_QUEUE = "vobiz_conference_end"
+NORMAL_QUEUE = "default"
+URGENT_QUEUE = "short"
 WATCH = "vsc:conference-watch"
 DEADLINES = "vsc:conference-deadlines"
 URGENT = "vsc:conference-urgent"
-DISPATCHER_HEARTBEAT = "vsc:conference-dispatcher-v2"
-PROBE_PREFIX = "vsc:conference-probe-v2:"
+SCHEDULER_HEARTBEAT = "vsc:conference-scheduler-v3"
+PROBE_PREFIX = "vsc:conference-probe-v3:"
 BATCH_SIZE = 1000
 RETRY_SECONDS = 5
 PROBE_INTERVAL = 10
 MAX_PROBE_AGE = 30
+MAX_HEARTBEAT_AGE = 150  # The existing scheduler runs the sweep every minute.
 
 # Earlier work must never be postponed by a delayed ordinary callback.
 _WATCH = """
@@ -91,8 +92,9 @@ def enqueue(name, urgent=False, after_commit=True):
 def worker_probe(queue_name, sent_at):
     if queue_name not in (NORMAL_QUEUE, URGENT_QUEUE):
         return
-    # Store SEND time: an old probe delayed in a queue cannot prove readiness.
-    frappe.cache().set_value(PROBE_PREFIX + queue_name, float(sent_at), expires_in_sec=60)
+    # Arrival freshness alone is insufficient: measure how long this job waited.
+    frappe.cache().set_value(PROBE_PREFIX + queue_name,
+        {"sent_at": float(sent_at), "completed_at": time.time()}, expires_in_sec=180)
 
 
 def health():
@@ -108,9 +110,17 @@ def health():
         except (TypeError, ValueError):
             return False
 
-    result = {"dispatcher": fresh(DISPATCHER_HEARTBEAT, 15)}
+    result = {"scheduler": fresh(SCHEDULER_HEARTBEAT, MAX_HEARTBEAT_AGE)}
     for queue in (NORMAL_QUEUE, URGENT_QUEUE):
-        result[queue] = queue in configured and fresh(PROBE_PREFIX + queue, MAX_PROBE_AGE)
+        probe = cache.get_value(PROBE_PREFIX + queue, expires=True)
+        try:
+            sent = float(probe["sent_at"])
+            completed = float(probe["completed_at"])
+            healthy = (0 <= completed - sent <= MAX_PROBE_AGE
+                       and 0 <= now - completed <= MAX_HEARTBEAT_AGE)
+        except (TypeError, KeyError, ValueError):
+            healthy = False
+        result[queue] = queue in configured and healthy
     result["ready"] = all(result.values())
     return result
 
@@ -162,7 +172,7 @@ def tick():
                 # An overloaded ordinary queue must not prevent urgent dispatch.
                 frappe.logger("vobiz_conference").exception("Conference probe failed for %s", queue)
     frappe.db.commit()
-    cache.set_value(DISPATCHER_HEARTBEAT, time.time(), expires_in_sec=20)
+    cache.set_value(SCHEDULER_HEARTBEAT, time.time(), expires_in_sec=180)
     return result
 
 
@@ -189,7 +199,7 @@ def rebuild_active():
 
 
 def run():
-    """Dedicated supervised CLI process; never expose this as an HTTP method."""
+    """Legacy dispatcher compatibility only; new deployments use the scheduler."""
     while True:
         started = time.monotonic()
         try:

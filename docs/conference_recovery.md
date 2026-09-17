@@ -21,10 +21,10 @@ enabled in their Vobiz User Mapping use the existing flow.
 - `stayAlone=true` and `endConferenceOnExit=false` keep the remaining member
   connected. Each browser rejoin is matched to its call token, generation,
   endpoint, owner window, and current mapping.
-- The reconnect window is **120 seconds from detected agent loss**. Membership
+- The reconnect window is **60 seconds from detected agent loss**. Membership
   exit, a browser failure report, or an exact final browser-leg CDR can detect
   that loss. Detection and background scheduling add latency; this is not an
-  exact 120-second carrier disconnect guarantee. The browser cannot report
+  exact 60-second carrier disconnect guarantee. The browser cannot report
   while offline. The provider call/conference time limit remains an additional
   ceiling (Vobiz Settings `max_call_duration`, default 3600 seconds, capped at
   14400 seconds).
@@ -46,138 +46,114 @@ enabled in their Vobiz User Mapping use the existing flow.
   or declare termination. This mode requires working provider callbacks and
   CDR access, just like ordinary verified termination.
 
-## Deployment and activation
+## Deployment and activation — existing Frappe workers
 
-The new code is in `vobiz_system_call`. Migration adds the **Enable Call Recovery**
-checkbox to the Browser Softphone section of Vobiz User Mapping. It defaults to
-off. Existing unrelated local edits in other apps are
-not part of this feature.
+This mode uses the standard queues already provided by Frappe:
+- `default`: customer origination and routine recovery checks.
+- `short`: End Call cleanup, expired reconnect deadlines and confirmed customer-end cleanup.
+- The existing Frappe scheduler invokes `conference.sweep` every minute.
+  The sweep does bounded Redis/SQL work and enqueues jobs; it does not sleep or
+  make provider network requests.
 
-1. Back up the apps and site configuration. Deploy the app, build its assets,
-   and run site migration to install the scheduler hook:
+No custom queues or separate conference dispatcher are required. The agent's
+**Enable Call Recovery** checkbox remains opt-in and defaults to off. This code
+does not enable any agent, start processes, or change worker allocation.
+
+1. Back up and deploy `vobiz_system_call` through the normal app deployment.
+   Run migration, then restart the site's web and existing workers so they all
+   use the same code:
 
    ```bash
-   bench build --app vobiz_system_call
    bench --site SITE migrate
    bench --site SITE clear-cache
    ```
 
-2. Merge these entries into the existing `workers` object in
-   `sites/common_site_config.json`, preserving all other queues:
+   Migration updates the mapping description to the 60-second reconnect window
+   and registers the existing minute scheduler hook. No custom worker entries
+   need to be added to `common_site_config.json`.
 
-   ```json
-   "vobiz_conference": {"timeout": 120, "background_workers": 1},
-   "vobiz_conference_end": {"timeout": 120, "background_workers": 1}
-   ```
-
-   Start separately supervised workers for these queues:
+2. Ensure the existing Frappe scheduler and normal workers are operating.
+   In Scheduled Job Type, `vobiz_system_call.api.conference.sweep` must not be
+   stopped. Enabling the scheduler does not start a missing OS process:
 
    ```bash
-   bench worker --queue vobiz_conference
-   bench worker --queue vobiz_conference_end
+   bench --site SITE enable-scheduler
+   bench doctor
    ```
 
-   Use your normal process manager for persistent production services. Do not
-   combine these queues on one worker, or mix them with short/default/long.
-   The worker counts above are a startup example, NOT capacity sizing for
-   400–500 agents. Reserve CPU/memory and measure queue latency, provider API
-   latency/limits and database load before choosing production worker counts.
-   Separate hosts can isolate CPU/memory but still share SQL and Redis load.
-
-3. Start a dedicated dispatcher for each site as a supervised CLI process:
-
-   ```bash
-   bench --site SITE execute vobiz_system_call.api.conference_jobs.run
-   ```
-
-   This command stays running. It is not an HTTP endpoint or a one-time setup
-   command. Configure automatic restart and log rotation in Supervisor/systemd.
-   It dispatches every second when idle, claims up to 1000 entries per index per
-   pass, and performs no provider network requests. Batches can take longer
-   under load. Recovery deadlines and End Call retries go to the urgent queue;
-   ordinary checks/customer origination use the normal conference queue.
-   Claimed work remains indexed with a retry lease if the dispatcher crashes.
-
-   Keep the ordinary site scheduler running too. Its existing minute sweep is
-   a backup, and does not make the dedicated dispatcher appear healthy.
-   The dispatcher also rebuilds active-call timers from User Mapping in bounded
-   batches once a minute. Configure Redis persistence: cleanup for calls already
-   released from their mappings still depends on retained queue/watch data.
-
-   After workers have consumed their probes, verify:
+   After at least one scheduled sweep and completion of the worker probes:
 
    ```bash
    bench --site SITE execute vobiz_system_call.api.conference_jobs.health
    bench --site SITE execute vobiz_system_call.api.conference.assert_ready
    ```
 
-   Health must show `ready: true`; assert_ready must not raise an error.
-   Both queues must execute a probe sent within 30 seconds, and the dispatcher
-   heartbeat must be no older than 15 seconds. Old delayed probes cannot reopen
-   admission. These checks reject NEW recovery calls; they never cancel existing
-   calls or falsely confirm a hangup. Monitor queue age and service failures:
-   preflight cannot prevent a later outage or guarantee a hard carrier deadline.
+   Health should report `scheduler`, `default`, `short` and `ready` as true.
+   The sweep heartbeat and completed probes expire after 150 seconds of
+   inactivity. Each probe must have waited no more than 30 seconds to execute.
+   An old delayed probe cannot make an overloaded queue appear healthy.
+   Only NEW recovery calls are refused when health fails; ongoing cleanup and
+   direct End Call remain available. Preflight cannot prevent a later outage.
 
-4. Open **Vobiz User Mapping**, select the agent, and expand **Browser Softphone**.
-   Check **Enable Call Recovery** and save. Any mapped browser agent can be
-   enabled this way by a user with permission to edit mappings; no site-config
-   change is needed. Start with a small pilot. The setting affects new outgoing
-   browser calls only. Incoming and Mobile Bridge calls keep their existing flow.
+3. In **Vobiz User Mapping → Browser Softphone**, enable **Enable Call Recovery**
+   for one test agent. The endpoint and Vobiz Settings must belong to the same
+   provider account, and the provider callback URL must stay online when the
+   agent loses internet.
 
-   When this field is first installed, any enabled legacy pilot allowlist is
-   copied into the mapping checkboxes once. Later migrations do not overwrite
-   choices made in the UI. The old `vsc_conference_recovery` and
-   `vsc_conference_recovery_users` site-config values no longer control new calls.
+4. Test ordinary calling, disconnect/rejoin before the deadline, remaining offline
+   beyond the deadline, End Call, recordings and disposition before expanding.
+   Start with 5 agents, then 25, then 100, then the rest only if each stage passes.
+   Monitor existing ERP queue delays, CPU, database load and Vobiz concurrency/CPS.
 
-   The endpoint must already use the app's authenticated WebRTC answer URL.
-   Its SIP account and Vobiz Settings REST credentials must belong to the same
-   Vobiz account. The webhook URL must remain reachable while the agent loses
-   internet. Refresh the agent page after deployment.
+### Timing and shared-worker limitations
 
-5. Validate an ordinary outgoing call, browser disconnect/rejoin, customer
-   hangup during recovery, End Call, recording playback, disposition, and the
-   full timeout on the target site's provider account before expanding users.
-   This changes call topology and adds conference/browser-leg usage; confirm
-   billing and provider concurrency capacity before a broader rollout.
+The 60-second window starts when agent loss is detected, not necessarily the
+instant physical connectivity disappears. A rejoin received after the stored
+deadline is refused, and cleanup is requested. A browser that stays offline
+cannot send further requests, so cleanup is dispatched by the next scheduled
+sweep. Its nominal cadence is one minute; Frappe's scheduler tick and worker
+backlogs can add further delay. **This is not a guarantee of disconnection at
+exactly 60 seconds.** Workers do not sleep for 60 seconds waiting for a call.
 
-   Do not enable this across production merely because the code is deployed.
-   Run the local dispatch/conference tests and then a controlled live pilot.
-   Roll out 5 → 25 → 100 → remaining agents only after each stage passes:
-   no duplicate customer origination, no premature disposition, correct End Call,
-   full recordings, no significant ordinary ERP latency regression, and queue
-   probe ages consistently inside the readiness threshold. Test mass disconnect,
-   worker/process restart, provider timeouts and recovery after Redis interruption.
-   Real account concurrency and call-start limits must support the test load.
+End Call persists intent, attempts the exact customer hangup directly, and queues
+cleanup on `short`. Termination/disposition still require verified call-end
+evidence. Standard `short` workers also handle other ERP jobs, so cleanup can
+wait behind those jobs; there is no reserved worker or preemption. Jobs use FIFO
+rather than moving mass recovery work ahead of unrelated ERP jobs.
 
-To disable new conference calls for an agent, uncheck **Enable Call Recovery**
-in their User Mapping and save. Keep the
-code, callbacks, queue worker, and sweep running until existing conference calls
-and their cleanup jobs are finished. Do not remove them while a customer leg
-may still be connected.
+Up to 1000 due entries per index can be claimed per sweep. Retry leases retain
+work if enqueueing fails or a scheduler job stops, and active mapped calls are
+rebuilt in bounded batches after cache loss. Claims beyond a batch wait for a
+later sweep. Redis persistence is still required for historical pending cleanup
+whose mapping has already been released. A fresh health check is not capacity
+certification for 400–500 real calls.
 
-### Upgrading from the original conference worker
+### Upgrading from dedicated conference workers
 
-Pause new recovery calls using the mapping checkbox and let active calls/cleanup
-finish before upgrading services. The old single-worker heartbeat no longer
-admits new recovery calls. Install both worker services and the dispatcher,
-restart the web/worker processes to load the new code, verify health, then enable
-one test mapping. No mapping is enabled or disabled automatically by this change.
+Disable new recovery calls and drain existing conference calls/cleanup before
+switching deployed processes to this version. Existing jobs may remain in the old
+`vobiz_conference` / `vobiz_conference_end` queues: do not stop their old consumers
+until those queues and active jobs are drained. New jobs use `default` / `short`.
+The old `conference_jobs.run` entry point is retained for compatibility but is
+no longer required; stop that extra process once the normal scheduler has taken
+over and its health checks pass.
 
-To roll back, disable new recovery calls, retain the new services until their
-cleanup work finishes, then restore the backed-up code/configuration. Do not
-remove the urgent worker while it has pending termination jobs.
+Existing stored deadlines are not rewritten by deployment. Newly calculated
+reconnect windows are 60 seconds. Repeated disconnect notifications do not extend
+the deadline. Disabling a mapping affects new calls; keep standard workers,
+callbacks and the scheduler running until existing recovery calls are finished.
 
-### Automated scale checks (not real-call capacity certification)
+### Automated checks
 
-`test_conference_dispatch.py` starts a temporary isolated Redis on a Unix socket.
-It verifies 500 simultaneous deadlines, a 1500-entry backlog, concurrent dispatch,
-crash retry leases, queue failure, late probes and restoration of 500 active-call
-timers. ERP SQL and provider operations in these tests are simulated. Conference
-contract tests verify exact-call termination, no duplicate origination, no release
-on an unconfirmed hangup, and stale deadline protection. These tests do not measure
-500 live calls, carrier audio, provider throttling or production database capacity.
+`test_conference_dispatch.py` starts isolated Redis and verifies 500 simultaneous
+deadlines, concurrent dispatch, claim retries, failed queues, late health probes,
+and rebuilding 500 active-call timers. A real RQ worker consumes the standard
+`short` queue while 500 `default` jobs remain waiting. Conference tests exercise
+60-second expiry, rejoin races, End Call, no duplicate customer origination and
+no premature disposition. SQL/provider operations are simulated; this is not a
+500-live-call or production-performance test.
 
-## Local validation — 17 September 2026
+## Historical live-call validation — 17 September 2026 (original 120-second mode)
 
 Backup and private evidence:
 `/home/jagmohan/.codex-work/conference-resume-20260917-065433`.

@@ -30,8 +30,8 @@ KEY = "conference_recovery"
 REGISTRY = "vsc:conference-watch"
 HEARTBEAT = "vsc:conference-sweep-heartbeat"
 WORKER_HEARTBEAT = "vsc:conference-worker-heartbeat"
-QUEUE = "vobiz_conference"
-GRACE_SECONDS = 120
+QUEUE = "default"
+GRACE_SECONDS = 60
 MAX_AGENT_LEGS = 64
 
 
@@ -52,10 +52,10 @@ def state(row):
 
 
 def assert_ready():
-    """Require the dedicated dispatcher and both queues, including queue latency."""
+    """Require the existing scheduler and standard queues, including queue latency."""
     from vobiz_system_call.api import conference_jobs
     if not conference_jobs.health()["ready"]:
-        frappe.throw(_("Call recovery is unavailable or busy. Ask your administrator to check the conference dispatcher and both call workers."))
+        frappe.throw(_("Call recovery is unavailable or busy. Ask your administrator to check the Frappe scheduler and default/short workers."))
 
 
 def prepare(row, settings):
@@ -141,9 +141,9 @@ def enqueue(name, urgent=False):
 
 
 def sweep():
-    # Compatibility/backup only. This cannot fake dedicated-dispatcher health.
+    # Uses the existing minute scheduler; no additional dispatcher is required.
     from vobiz_system_call.api import conference_jobs
-    conference_jobs.dispatch_due()
+    conference_jobs.tick()
 
 
 def worker_heartbeat():
