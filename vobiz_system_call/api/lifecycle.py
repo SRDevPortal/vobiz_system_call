@@ -370,6 +370,10 @@ def reconcile_call(call_log, recovery_lookup=False):
 def _reconcile_call(call_log, recovery_lookup=False):
     """Expire unissued calls; release provider calls only after matching terminal CDR."""
     mapping, row = lock_call(call_log)
+    from vobiz_system_call.api import conference
+    if conference.state(row):
+        frappe.db.commit()
+        return conference.reconcile(call_log)
     if row.status in TERMINAL:
         release_locked(mapping, row)
         frappe.db.commit()

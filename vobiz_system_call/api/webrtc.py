@@ -67,8 +67,23 @@ def get_browser_softphone_config():
         "password": password if not missing else "",
         "endpoint_uri": get_profile_endpoint_uri(profile, settings),
         "caller_id": get_caller_id(settings, profile),
+        "recovery_call": _conference_resume_call(profile),
         # Never disclose the shared provider callback credential to the browser.
     }
+
+
+def _conference_resume_call(profile):
+    from vobiz_system_call.api import conference
+    name = (profile or {}).get("current_call_log")
+    if not name:
+        return None
+    row = frappe.db.get_value("Vobiz Call Log", name,
+                              ["name", "user", "status", "request_json", "customer_number"], as_dict=True)
+    if (row and row.user == frappe.session.user and conference.state(row)
+            and row.status not in lifecycle.TERMINAL):
+        return {"name": row.name, "customer_number": row.customer_number,
+                "conference_generation": conference.state(row)["generation"]}
+    return None
 
 
 @frappe.whitelist()
@@ -170,7 +185,7 @@ def get_incoming_call(caller: str, tab_id: str):
 
 
 @frappe.whitelist(methods=["POST"])
-def update_browser_softphone_call(call_log: str, event: str, status=None, reason=None, call_uuid=None):
+def update_browser_softphone_call(call_log: str, event: str, status=None, reason=None, call_uuid=None, conference_generation=0):
     _login()
     mapping, row = lifecycle.lock_call(call_log)
     if row.user != frappe.session.user and "System Manager" not in frappe.get_roles():
@@ -184,6 +199,9 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
         frappe.db.commit()
         return {"status": row.status}
     sdk_uuid = _provider_uuid({"CallUUID": call_uuid})
+    from vobiz_system_call.api import conference
+    if conference.state(row):
+        return conference.browser_event(mapping, row, event, reason, sdk_uuid, conference_generation)
     # SDK IDs can identify a different leg; they must never overwrite the authenticated provider ID.
     if event in TERMINAL_EVENTS:
         if (row.call_uuid or row.get("recording_call_uuid") or sdk_uuid
@@ -227,6 +245,9 @@ def cancel_browser_call(call_log: str):
     mapping, row = lifecycle.lock_call(call_log)
     if row.user != frappe.session.user and "System Manager" not in frappe.get_roles():
         frappe.throw(_("Not permitted."))
+    from vobiz_system_call.api import conference
+    if conference.state(row):
+        return conference.cancel(mapping, row)
     if row.status in lifecycle.TERMINAL:
         lifecycle.release_locked(mapping, row)
         frappe.db.commit()
@@ -418,6 +439,7 @@ def _replace_dial_number_with_user(xml, call_log, endpoint):
 
 
 def _answer_sdk_outbound(raw_from, raw_to, payload):
+    from vobiz_system_call.api import conference
     destination = _number(raw_to)
     uuid = _provider_uuid(payload)
     if not destination or not uuid:
@@ -435,6 +457,12 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
         frappe.db.rollback()
         return _xml_response(_hangup_xml())
     mapping, row = lifecycle.lock_call(mapping.current_call_log)
+    if conference.state(row):
+        return conference.answer_agent(raw_from, raw_to, payload)
+    if conference.browser_route(payload):
+        # A delayed conference invite must never enter the ordinary Dial path.
+        frappe.db.commit()
+        return _xml_response(_hangup_xml())
     if (not lifecycle.is_browser_call(row) or row.direction != "Outgoing" or destination != _number(row.customer_number)
             or row.status in lifecycle.TERMINAL
             or (row.call_uuid and row.call_uuid != uuid)

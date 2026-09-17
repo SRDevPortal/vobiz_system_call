@@ -21,17 +21,21 @@ override_whitelisted_methods = {
 app_include_js = [
     # Keep the URL version in sync with the console cache version in this asset.
     # Otherwise browsers can retain the pre-identity script across page reloads.
-	"/assets/vobiz_system_call/js/vobiz_system_call.js?v=20260916.5",
+	"/assets/vobiz_system_call/js/vobiz_system_call.js?v=20260917.1",
 ]
 
 before_uninstall = "vobiz_system_call.install.before_uninstall"
 
 scheduler_events = {
-    "cron": {"* * * * *": ["vobiz_system_call.api.lifecycle.recover_calls"]},
+    "cron": {"* * * * *": [
+        "vobiz_system_call.api.lifecycle.recover_calls",
+        "vobiz_system_call.api.conference.sweep",
+    ]},
 }
 
 
 doc_events = {
+    "Vobiz Call Log": {"on_update": "vobiz_system_call.api.conference.on_call_update"},
     "Vobiz User Mapping": {"validate": "vobiz_system_call.api.device.validate_mapping"},
     "Vobiz Settings": {"validate": "vobiz_system_call.api.device.validate_settings"},
 }

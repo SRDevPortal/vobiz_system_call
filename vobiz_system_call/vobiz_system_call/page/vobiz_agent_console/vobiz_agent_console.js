@@ -1223,6 +1223,17 @@ class VobizAgentConsole {
 			softphone.ownership_blocked = false;
 			softphone.registering = false;
 			softphone.registered = true;
+			softphone.conference_login_required = false;
+			const resume = (softphone.config || {}).recovery_call;
+			if (resume && resume.name && !softphone.current_call_log) {
+				softphone.current_call_log = resume.name;
+				softphone.current_destination = resume.customer_number || '';
+				softphone.conference_recovery = true;
+				softphone.conference_generation = resume.conference_generation;
+				softphone.recovery_verification = {call_log: resume.name};
+				softphone.in_call = true;
+				softphone.status = __('Reconnecting');
+			}
 			if (!softphone.in_call && !softphone.current_call_log && !softphone.incoming_pending) softphone.status = __('Registered');
 			softphone.error = '';
 			this.render_browser_softphone();
@@ -1244,6 +1255,16 @@ class VobizAgentConsole {
 		});
 		on('onLoginFailed', (reason) => this.browser_softphone_failed(reason || __('Softphone login failed.')));
 		on('onLogout', () => {
+			const recovering = this.state.softphone;
+			if (recovering.conference_recovery && recovering.current_call_log && !recovering.ownership_blocked) {
+				recovering.registered = false;
+				recovering.conference_login_required = true;
+				recovering.conference_session_ended = true;
+				recovering.recovery_verification = {call_log: recovering.current_call_log};
+				this.set_browser_network_issue('signaling', true);
+				this.render_browser_softphone();
+				return;
+			}
 			this.stop_browser_network_monitor();
 			this.stop_browser_softphone_audio();
 			const softphone = this.state.softphone;
@@ -1272,9 +1293,12 @@ class VobizAgentConsole {
 			if (!this.matches_browser_call_event(callInfo)) return;
 			const softphone = this.state.softphone;
 			softphone.incoming_answering = false;
-			softphone.incoming_answered = true;
+			softphone.incoming_answered = !softphone.conference_recovery;
+			if (softphone.conference_recovery && softphone.muted) {
+				try { client.mute(); } catch (_) {}
+			}
 			softphone.incoming_call_uuid = '';
-			this.browser_softphone_status(__('In Call'), true);
+			this.browser_softphone_status(softphone.conference_recovery ? __('Connecting customer') : __('In Call'), true);
 			this.attach_browser_softphone_audio();
 			this.sync_browser_softphone_event('onCallAnswered', callInfo).catch(() => this.load());
 		});
@@ -1416,7 +1440,9 @@ class VobizAgentConsole {
 		softphone.status = status;
 		softphone.in_call = Boolean(inCall);
 		if (softphone.current_call_log && (this.state.workdesk_live_call || {}).name === softphone.current_call_log) {
-			this.state.workdesk_live_call.status = inCall && softphone.incoming_answered ? 'Connected' : status;
+			// Joining a conference confirms only the browser leg. Keep the
+			// customer's server status until its own answer/completion arrives.
+			if (!softphone.conference_recovery) this.state.workdesk_live_call.status = inCall && softphone.incoming_answered ? 'Connected' : status;
 			this.render_workdesk_live_call();
 		}
 		this.render_browser_softphone();
@@ -1428,6 +1454,17 @@ class VobizAgentConsole {
 		if (!this.matches_browser_call_event(callInfo)) return;
 		const callLog = softphone.current_call_log;
 		if (!callLog) return;
+		if (softphone.conference_recovery) {
+			softphone.conference_join_started_at = 0;
+			softphone.conference_session_ended = true;
+			softphone.recovery_verification = {call_log: callLog};
+			this.set_browser_network_issue('media', true);
+			this.sync_browser_softphone_event(event, callInfo, callLog).catch(() => {});
+			// Only customer termination may open disposition. Keep the logical
+			// call and its End Call control while replacing the browser leg.
+			this.render_browser_softphone();
+			return;
+		}
 		this.set_browser_network_issue('media', false);
 		this.sync_browser_softphone_event(event, callInfo, callLog).then(() => {
 			this.watch_browser_call_disposition(callLog);
@@ -1448,6 +1485,7 @@ class VobizAgentConsole {
 		if (!softphone.current_call_log) return false;
 		const uuid = this.extract_call_uuid(this.normalize_browser_softphone_event(callInfo));
 		if (uuid && softphone.sdk_call_uuid && uuid !== softphone.sdk_call_uuid) return false;
+		if (uuid && (softphone.conference_retired_uuids || []).includes(uuid)) return false;
 		if (uuid) softphone.sdk_call_uuid = uuid;
 		return true;
 	}
@@ -1773,7 +1811,7 @@ class VobizAgentConsole {
 		} catch (_) {} // A session may end between the SDK accessors.
 		const issues = softphone.network_issues || {};
 		const mediaLostAt = Math.min(...['offline', 'media'].filter(key => issues[key] !== undefined).map(key => issues[key]));
-		if (softphone.current_call_log && Date.now() - mediaLostAt >= VOBIZ_NETWORK_RECOVERY_MS
+		if (!softphone.conference_recovery && softphone.current_call_log && Date.now() - mediaLostAt >= VOBIZ_NETWORK_RECOVERY_MS
 			&& !softphone.pending_end_call) {
 			// A server-only failure must never end healthy audio. Only sustained
 			// browser/media loss exhausts this grace period.
@@ -1790,13 +1828,14 @@ class VobizAgentConsole {
 				});
 			}
 		}
-		if (this.browser_presence_check || (!force && !this.browser_softphone_reconnecting()
+		if (this.browser_presence_check || (!force && !softphone.conference_recovery && !this.browser_softphone_reconnecting()
 			&& Date.now() - this.browser_presence_checked_at < 25000)) return;
 		const check = {};
 		this.browser_presence_check = check;
 		return this.send_browser_presence().then(() => {
 			if (softphone.client !== vobiz || this.browser_presence_check !== check) return;
 			this.set_browser_network_issue('server', false);
+			if (softphone.conference_recovery) return this.recover_conference_call(vobiz);
 			if (softphone.recovery_verification) return this.verify_recovered_browser_call(vobiz);
 			return this.refresh_browser_softphone_call(this.state.active_call || {});
 		}).catch(err => {
@@ -1816,6 +1855,87 @@ class VobizAgentConsole {
 				this.browser_presence_check = null;
 				this.browser_presence_checked_at = Date.now();
 			}
+		});
+	}
+
+	recover_conference_call(vobiz) {
+		const s = this.state.softphone;
+		const callLog = s.current_call_log;
+		if (!callLog || !s.conference_recovery || s.client !== vobiz || s.pending_end_call || s.conference_end_requested === callLog
+			|| this.conference_recovery_check || Date.now() < (s.conference_next_check || 0)) return Promise.resolve();
+		// Allow the initial SIP/ICE negotiation to complete before asking the
+		// server whether an old browser leg needs replacing.
+		if (s.conference_join_started_at && Date.now() - s.conference_join_started_at < 12000) return Promise.resolve();
+		const sdk = vobiz.client;
+		let uuid = '', alive = false, media = false;
+		try {
+			uuid = typeof sdk.getCallUUID === 'function' ? (sdk.getCallUUID() || '') : '';
+			const peer = uuid && typeof sdk.getPeerConnection === 'function' && sdk.getPeerConnection();
+			const pc = peer && (peer.pc || peer);
+			alive = Boolean(uuid && !s.conference_session_ended);
+			media = Boolean(alive && pc && ['connected', 'completed'].includes(pc.iceConnectionState));
+		} catch (_) {}
+		const check = {};
+		this.conference_recovery_check = check;
+		return this.browser_request_with_timeout(frappe.call({
+			method: 'vobiz_system_call.api.conference.recover', type: 'POST', silent: true,
+			args: {call_log: callLog, tab_id: this.get_softphone_tab_id(), sdk_uuid: uuid,
+				media_connected: media ? 1 : 0, session_alive: alive ? 1 : 0, generation: s.conference_generation}
+		}), 12000).then(r => {
+			if (s.current_call_log !== callLog || s.client !== vobiz) return;
+			const call = r.message || {};
+			if (call.name !== callLog) return;
+			if (this.is_terminal_status(call.status)) {
+				this.reconcile_browser_softphone_call(call);
+				this.load();
+				return;
+			}
+			if (s.pending_end_call || s.conference_end_requested === callLog) return;
+			if (s.conference_login_required && !s.registered && !s.ownership_blocked &&
+				!call.ending && Date.now() >= (s.conference_login_after || 0)) {
+				s.conference_login_after = Date.now() + 15000;
+				try { sdk.login(s.config.username, s.config.password); } catch (_) {}
+			}
+			if (call.ending) {
+				s.pending_end_call = callLog;
+				s.recovery_verification = {call_log: callLog};
+			} else if (call.agent_connected && media) {
+				s.recovery_verification = null;
+				this.set_browser_network_issue('media', false);
+				s.status = call.status === 'Connected' ? __('In Call') : __(call.status);
+				for (const current of [this.state.active_call, this.state.workdesk_live_call]) {
+					if (current?.name === callLog) current.status = call.status;
+				}
+				this.render_workdesk_live_call();
+				this.attach_browser_softphone_audio();
+			} else if (call.retire_session && alive) {
+				s.recovery_verification = {call_log: callLog};
+				try { Promise.resolve(sdk.hangup()).catch(() => {}); } catch (_) {}
+			} else if (call.destination && !alive && s.registered && !s.ownership_blocked) {
+				if (s.sdk_call_uuid) {
+					s.conference_retired_uuids = [...(s.conference_retired_uuids || []), s.sdk_call_uuid].slice(-64);
+				}
+				s.sdk_call_uuid = '';
+				s.conference_generation = call.conference_generation;
+				s.conference_session_ended = false;
+				s.conference_join_started_at = Date.now();
+				s.recovery_verification = {call_log: callLog};
+				s.in_call = true;
+				s.status = __('Reconnecting');
+				this.disable_browser_outgoing_tones();
+				try {
+					const started = sdk.call(call.destination, call.conference_headers || {});
+					if (started === false) s.conference_session_ended = true;
+					Promise.resolve(started).catch(() => { if (s.current_call_log === callLog) s.conference_session_ended = true; });
+				} catch (_) { s.conference_session_ended = true; }
+			}
+			this.render_browser_softphone();
+		}).catch(() => {
+			// A failed request cannot end or redial the customer's call.
+			if (s.current_call_log === callLog) s.recovery_verification = {call_log: callLog};
+		}).finally(() => {
+			s.conference_next_check = Date.now() + 5000;
+			if (this.conference_recovery_check === check) this.conference_recovery_check = null;
 		});
 	}
 
@@ -1987,6 +2107,16 @@ class VobizAgentConsole {
 		this.stop_browser_softphone_audio();
 		const softphone = this.state.softphone;
 		softphone.pending_end_call = '';
+		softphone.conference_recovery = false;
+		softphone.conference_generation = 0;
+		softphone.conference_end_requested = '';
+		softphone.conference_login_required = false;
+		softphone.conference_login_after = 0;
+		softphone.conference_retired_uuids = [];
+		softphone.conference_session_ended = false;
+		softphone.conference_join_started_at = 0;
+		softphone.conference_next_check = 0;
+		if (softphone.config) softphone.config.recovery_call = null;
 		softphone.recovery_verification = null;
 		this.set_browser_network_issue('media', false);
 		softphone.in_call = false;
@@ -2189,7 +2319,8 @@ class VobizAgentConsole {
 				event,
 				status: info.status || '',
 				reason: info.reason || '',
-				call_uuid: this.extract_call_uuid(info)
+				call_uuid: this.extract_call_uuid(info),
+				conference_generation: this.state.softphone.conference_generation || 0
 			}
 		});
 	}
@@ -2200,9 +2331,13 @@ class VobizAgentConsole {
 		const softphone = this.state.softphone;
 		softphone.current_call_log = message.call_log;
 		softphone.sdk_call_uuid = '';
+		softphone.conference_recovery = Boolean(message.conference_recovery);
+		softphone.conference_generation = message.conference_generation || 0;
+		softphone.conference_session_ended = false;
+		softphone.conference_join_started_at = Date.now();
 		let dialAttempted = false;
 		return this.connect_browser_softphone().then(() => {
-			softphone.current_destination = message.destination || message.customer_number;
+			softphone.current_destination = message.conference_recovery ? message.customer_number : (message.destination || message.customer_number);
 			softphone.current_customer = row.title || row.name || __('Customer');
 			softphone.direction = __('Outgoing');
 			softphone.in_call = true;
@@ -2213,9 +2348,12 @@ class VobizAgentConsole {
 			this.render_browser_softphone();
 			this.disable_browser_outgoing_tones();
 			dialAttempted = true;
-			softphone.client.client.call(softphone.current_destination, {});
+			softphone.client.client.call(message.destination || softphone.current_destination, message.conference_headers || {});
 			return this.sync_browser_softphone_event('browserCallStarted', {}, message.call_log);
 		}).then(() => message).catch((err) => {
+			if (!dialAttempted && message.conference_recovery) {
+				return this.cancel_call_log(message.call_log, row).then(() => { throw err; });
+			}
 			if (!dialAttempted) {
 				// Registration failed before invoking the SDK: no voice call was issued.
 				return Promise.resolve(this.sync_browser_softphone_event(
@@ -6546,7 +6684,8 @@ class VobizAgentConsole {
 		const softphone = this.state.softphone;
 		const isBrowser = softphone.current_call_log === call_log;
 		if (isBrowser) {
-			if (this.browser_softphone_reconnecting()) softphone.pending_end_call = call_log;
+			if (softphone.conference_recovery) softphone.conference_end_requested = call_log;
+			if (softphone.conference_recovery || this.browser_softphone_reconnecting()) softphone.pending_end_call = call_log;
 			try {
 				if (!softphone.client || !softphone.client.client) throw new Error(__('Softphone session is unavailable.'));
 				const sdk = softphone.client.client;

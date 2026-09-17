@@ -80,6 +80,9 @@ def start_call(
     if not mapping:
         frappe.throw(_("No active Vobiz user mapping found for your user."))
     if call_device == CALL_DEVICE_BROWSER_SOFTPHONE:
+        from vobiz_system_call.api import conference
+        if conference.enabled(frappe.session.user):
+            conference.assert_ready()
         if not get_inbound_callback_token(system_settings):
             frappe.throw(_("Configure the provider callback token before browser calling."))
         if not system_settings.get("enable_cdr_sync"):
@@ -267,6 +270,8 @@ def start_browser_softphone_call(
     }
     frappe.db.set_value("Vobiz Call Log", call_log.name, updates, update_modified=True)
     call_log.reload()
+    from vobiz_system_call.api import conference
+    recovery = conference.prepare(call_log, settings) if conference.enabled(frappe.session.user) else {}
     update_reference_call_metrics(reference_doctype, reference_name)
     sync_linked_summaries(call_log)
     log_vobiz_event(
@@ -291,6 +296,7 @@ def start_browser_softphone_call(
         "customer_number": customer_number,
         "agent_mobile_display": mask_phone(user_mobile) if user_mobile else endpoint_username,
         "message": _("Browser softphone call prepared."),
+        **recovery,
     }
 
 
