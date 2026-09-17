@@ -291,6 +291,7 @@ def start_browser_softphone_call(
         "status": call_log.status,
         "call_device": CALL_DEVICE_BROWSER_SOFTPHONE,
         "browser_softphone": True,
+        "provider_session_recording": bool(frappe.utils.cint(settings.get("enable_recording"))),
         "destination": customer_number,
         "call_flow": call_flow,
         "customer_number": customer_number,

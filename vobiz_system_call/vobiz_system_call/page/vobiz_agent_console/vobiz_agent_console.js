@@ -1293,12 +1293,14 @@ class VobizAgentConsole {
 			if (!this.matches_browser_call_event(callInfo)) return;
 			const softphone = this.state.softphone;
 			softphone.incoming_answering = false;
-			softphone.incoming_answered = !softphone.conference_recovery;
+			const customerConfirmed = softphone.incoming_answered || [this.state.active_call, this.state.workdesk_live_call]
+				.some(call => call?.name === softphone.current_call_log && ['Connected', 'In Progress'].includes(call.status));
+			softphone.incoming_answered = !softphone.conference_recovery && (!softphone.provider_session_recording || customerConfirmed);
 			if (softphone.conference_recovery && softphone.muted) {
 				try { client.mute(); } catch (_) {}
 			}
 			softphone.incoming_call_uuid = '';
-			this.browser_softphone_status(softphone.conference_recovery ? __('Connecting customer') : __('In Call'), true);
+			this.browser_softphone_status(softphone.incoming_answered ? __('In Call') : __('Connecting customer'), true);
 			this.attach_browser_softphone_audio();
 			this.sync_browser_softphone_event('onCallAnswered', callInfo).catch(() => this.load());
 		});
@@ -1442,7 +1444,7 @@ class VobizAgentConsole {
 		if (softphone.current_call_log && (this.state.workdesk_live_call || {}).name === softphone.current_call_log) {
 			// Joining a conference confirms only the browser leg. Keep the
 			// customer's server status until its own answer/completion arrives.
-			if (!softphone.conference_recovery) this.state.workdesk_live_call.status = inCall && softphone.incoming_answered ? 'Connected' : status;
+			if (!softphone.conference_recovery && !softphone.provider_session_recording) this.state.workdesk_live_call.status = inCall && softphone.incoming_answered ? 'Connected' : status;
 			this.render_workdesk_live_call();
 		}
 		this.render_browser_softphone();
@@ -2046,6 +2048,12 @@ class VobizAgentConsole {
 
 	reconcile_browser_softphone_call(call = {}) {
 		const softphone = this.state.softphone;
+		if (softphone.provider_session_recording && !softphone.conference_recovery
+			&& call.name === softphone.current_call_log && ['Connected', 'In Progress'].includes(call.status)) {
+			softphone.incoming_answered = true;
+			if (!softphone.pending_end_call && !softphone.recovery_verification) softphone.status = __('In Call');
+			this.render_browser_softphone();
+		}
 		if (!call.name || !this.is_terminal_status(call.status)) return false;
 		if (softphone.current_call_log !== call.name) {
 			// The SDK can clear first. Reconcile only the matching server snapshot;
@@ -2108,6 +2116,7 @@ class VobizAgentConsole {
 		const softphone = this.state.softphone;
 		softphone.pending_end_call = '';
 		softphone.conference_recovery = false;
+		softphone.provider_session_recording = false;
 		softphone.conference_generation = 0;
 		softphone.conference_end_requested = '';
 		softphone.conference_login_required = false;
@@ -2332,6 +2341,7 @@ class VobizAgentConsole {
 		softphone.current_call_log = message.call_log;
 		softphone.sdk_call_uuid = '';
 		softphone.conference_recovery = Boolean(message.conference_recovery);
+		softphone.provider_session_recording = Boolean(message.provider_session_recording);
 		softphone.conference_generation = message.conference_generation || 0;
 		softphone.conference_session_ended = false;
 		softphone.conference_join_started_at = Date.now();

@@ -222,7 +222,10 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
             values["status"] = "Ringing"
         elif event == "onCallAnswered":
             values["call_status"] = "browser-audio-connected"
-            if row.direction == "Outgoing":
+            from vobiz_click_to_call.services.recording import has_session_recording
+            # Record answers the browser leg before Dial answers the customer.
+            # Only the authenticated Dial event may confirm that customer answer.
+            if row.direction == "Outgoing" and not has_session_recording(call_log):
                 values["status"] = "Connected"
                 if not row.answer_time:
                     values["answer_time"] = frappe.utils.now()
@@ -692,11 +695,7 @@ def provider_event(call_log: str, token: str, final: str = "0"):
             frappe.db.set_value("Vobiz Call Log", row.name, {
                 "status": "Connected", "answer_time": row.answer_time or frappe.utils.now(),
             })
-            frappe.enqueue(
-                "vobiz_click_to_call.services.recording.start_recording_if_needed",
-                call_log=row.name, queue="short", timeout=180, enqueue_after_commit=True,
-                job_id="vsc-record-" + row.name, deduplicate=True,
-            )
+            _enqueue_recording_start(row.name)
         elif state in ("completed", "hangup", "busy", "no-answer", "failed", "timeout", "cancel") or final == "1":
             outcome = {"busy": "Busy", "no-answer": "No Answer", "timeout": "No Answer",
                        "failed": "Failed"}.get(state)
@@ -830,6 +829,9 @@ def _append_callback_if_enabled(call_log, event, payload):
 
 def _enqueue_recording_start(call_log: str) -> None:
     try:
+        from vobiz_click_to_call.services.recording import has_session_recording
+        if has_session_recording(call_log):
+            return
         frappe.enqueue(
             "vobiz_click_to_call.services.recording.start_recording_if_needed",
             call_log=call_log, queue="short", timeout=180, enqueue_after_commit=True,
@@ -889,20 +891,23 @@ def _dial_attrs(caller_id, row=None):
 
 
 def _dial_number_xml(destination, caller_id, row=None):
+    from vobiz_click_to_call.services.recording import session_recording_xml
     return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
+            f'{session_recording_xml(row, get_settings())}'
             f'<Dial {_dial_attrs(caller_id, row)}><Number>{escape(provider_phone_number(destination))}</Number>'
             '</Dial></Response>')
 
 
 def _dial_agent_xml(endpoint, caller_id, row):
     if lifecycle.context(row).get("call_device") == CALL_DEVICE_MOBILE_BRIDGE:
-        return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
-                f'<Dial {_dial_attrs(caller_id, row)}><Number>{escape(provider_phone_number(endpoint))}</Number></Dial></Response>')
+        return _dial_number_xml(endpoint, caller_id, row)
     return _dial_user_xml(endpoint, caller_id, row)
 
 
 def _dial_user_xml(endpoint_uri, caller_id, row=None):
+    from vobiz_click_to_call.services.recording import session_recording_xml
     return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
+            f'{session_recording_xml(row, get_settings())}'
             f'<Dial {_dial_attrs(caller_id, row)}><User>{escape(endpoint_uri)}</User></Dial></Response>')
 
 
