@@ -52,13 +52,10 @@ def state(row):
 
 
 def assert_ready():
-    """Refuse new pilot calls if the timeout sweep/isolated worker is unavailable."""
-    from frappe.utils.background_jobs import get_queues_timeout
-    heartbeat = frappe.cache().get_value(HEARTBEAT)
-    worker_heartbeat = frappe.cache().get_value(WORKER_HEARTBEAT)
-    if (QUEUE not in get_queues_timeout() or not heartbeat or time.time() - float(heartbeat) > 150
-            or not worker_heartbeat or time.time() - float(worker_heartbeat) > 150):
-        frappe.throw(_("Call recovery services are unavailable. Ask your administrator to start the conference worker and scheduler."))
+    """Require the dedicated dispatcher and both queues, including queue latency."""
+    from vobiz_system_call.api import conference_jobs
+    if not conference_jobs.health()["ready"]:
+        frappe.throw(_("Call recovery is unavailable or busy. Ask your administrator to check the conference dispatcher and both call workers."))
 
 
 def prepare(row, settings):
@@ -98,6 +95,8 @@ def save(row, value, **fields):
     row.request_json = encoded
     for key, item in fields.items():
         row[key] = item
+    from vobiz_system_call.api.conference_jobs import schedule_state
+    schedule_state(row.name, value)
 
 
 def stopped(row, value, now=None):
@@ -132,32 +131,19 @@ def authorize(call_log, role, generation, received):
 
 
 def watch(name, delay=30):
-    # State remains in SQL; this index includes terminal calls whose agent legs
-    # still need cleanup. Mapping reconciliation can rebuild active entries.
-    cache = frappe.cache()
-    cache.zadd(cache.make_key(REGISTRY), {name: time.time() + delay})
+    from vobiz_system_call.api import conference_jobs
+    conference_jobs.watch(name, delay)
 
 
-def enqueue(name):
-    watch(name, 0)
-    frappe.enqueue("vobiz_system_call.api.conference.reconcile", call_log=name,
-                   queue=QUEUE, timeout=120, enqueue_after_commit=True,
-                   job_id="vsc-conference-" + name, deduplicate=True)
+def enqueue(name, urgent=False):
+    from vobiz_system_call.api import conference_jobs
+    conference_jobs.enqueue(name, urgent=urgent)
 
 
 def sweep():
-    cache = frappe.cache()
-    cache.set_value(HEARTBEAT, time.time(), expires_in_sec=180)
-    # A completed probe proves this queue can execute work. RQ's worker registry
-    # alone can be stale or cleared while an actual consumer is still running.
-    frappe.enqueue("vobiz_system_call.api.conference.worker_heartbeat", queue=QUEUE,
-                   timeout=30, job_id="vsc-conference-heartbeat", deduplicate=True)
-    key = cache.make_key(REGISTRY)
-    for name in cache.zrangebyscore(key, "-inf", time.time(), start=0, num=100):
-        name = name.decode() if isinstance(name, bytes) else name
-        watch(name, 60)
-        frappe.enqueue("vobiz_system_call.api.conference.reconcile", call_log=name,
-                       queue=QUEUE, timeout=120, job_id="vsc-conference-" + name, deduplicate=True)
+    # Compatibility/backup only. This cannot fake dedicated-dispatcher health.
+    from vobiz_system_call.api import conference_jobs
+    conference_jobs.dispatch_due()
 
 
 def worker_heartbeat():
@@ -312,7 +298,7 @@ def customer_callback(call_log, role, generation, received, action):
         return webrtc._xml_response(webrtc._hangup_xml())
     save(row, value, call_uuid=uuid, recording_call_uuid=uuid)
     if stopped(row, value):
-        enqueue(row.name)
+        enqueue(row.name, urgent=True)
         frappe.db.commit()
         return webrtc._xml_response(webrtc._hangup_xml())
     if action == "answer":
@@ -397,7 +383,7 @@ def member(call_log, token, role, generation=0):
         frappe.enqueue("vobiz_system_call.api.conference.originate_customer", call_log=row.name,
                        queue=QUEUE, timeout=30, enqueue_after_commit=True,
                        job_id="vsc-conference-originate-" + row.name, deduplicate=True)
-    enqueue(row.name)
+    enqueue(row.name, urgent=value.get("closed", False))
     frappe.db.commit()
     return webrtc._plain_response("OK")
 
@@ -421,7 +407,7 @@ def ended(call_log, token, role="customer", generation=0):
                                         bool(row.answer_time or webrtc._billable_seconds(payload)))
     lifecycle.finish_locked(mapping, row, "conference-customer-hangup", str(payload.get("HangupCause") or "")[:140],
                             status=outcome if outcome in lifecycle.TERMINAL else None)
-    enqueue(row.name)
+    enqueue(row.name, urgent=True)
     frappe.db.commit()
     return webrtc._plain_response("OK")
 
@@ -455,9 +441,24 @@ def cancel(mapping, row):
     data.setdefault("agent_cancel_requested_at", frappe.utils.now())
     row.request_json = json.dumps(data)
     save(row, value, call_status="cancellation-requested")
-    enqueue(row.name)
     frappe.db.commit()
-    reconcile(row.name)
+    try:
+        from vobiz_system_call.api import conference_jobs
+        conference_jobs.enqueue(row.name, urgent=True, after_commit=False)
+    except Exception:
+        # Persisted intent and deadline dispatch remain. A queue outage must
+        # not prevent the independent direct customer hangup attempt below.
+        frappe.logger("vobiz_conference").exception("Unable to queue End Call for %s", row.name)
+    # First customer hangup does not wait behind queued recovery/CDR work.
+    # Only one bounded provider request runs in the web request; all leg cleanup
+    # and confirmation are independently retried by the urgent workers.
+    if row.call_uuid:
+        try:
+            client = VobizClient(get_settings())
+            client.timeout = 3
+            client.hangup_call(row.call_uuid, allow_missing=True)
+        except Exception:
+            pass
     current = frappe.db.get_value("Vobiz Call Log", row.name, "status")
     return {"status": current, "pending_provider": current not in lifecycle.TERMINAL}
 
@@ -566,6 +567,24 @@ def recover(call_log, tab_id, sdk_uuid="", media_connected=0, session_alive=0, g
 
 
 def reconcile(call_log):
+    # Normal and urgent queues may both contain this call. Serialize provider
+    # checks without blocking workers on a SQL lock throughout network I/O.
+    cache = frappe.cache()
+    lock = cache.lock(cache.make_key("vsc:conference-reconcile:" + call_log), timeout=150,
+                      blocking_timeout=0)
+    if not lock.acquire(blocking=False):
+        return  # Registry leases retain the retry; cancellation intent is in SQL.
+    try:
+        _reconcile(call_log)
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            # Expired leases must not release a replacement worker's lock.
+            pass
+
+
+def _reconcile(call_log):
     """Retry termination and consult exact leg CDRs; absence is never proof."""
     mapping, row = lifecycle.lock_call(call_log)
     value = state(row)
@@ -630,10 +649,7 @@ def reconcile(call_log):
                 value["deadline"] = time.time() + GRACE_SECONDS
     save(row, value)
     complete = value.get("customer_ended") and all(leg.get("ended") for leg in value["legs"].values())
-    if complete:
-        cache = frappe.cache()
-        cache.zrem(cache.make_key(REGISTRY), row.name)
-    else:
+    if not complete:
         watch(row.name)
     frappe.db.commit()
 
@@ -641,4 +657,4 @@ def reconcile(call_log):
 def on_call_update(doc, method=None):
     """Manual completion still needs cleanup of the independent provider legs."""
     if state(doc) and doc.status in lifecycle.TERMINAL:
-        enqueue(doc.name)
+        enqueue(doc.name, urgent=True)

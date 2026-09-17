@@ -371,9 +371,14 @@ def _reconcile_call(call_log, recovery_lookup=False):
     """Expire unissued calls; release provider calls only after matching terminal CDR."""
     mapping, row = lock_call(call_log)
     from vobiz_system_call.api import conference
-    if conference.state(row):
+    conference_state = conference.state(row)
+    if conference_state:
+        from vobiz_system_call.api import conference_jobs
+        urgent = conference.stopped(row, conference_state)
         frappe.db.commit()
-        return conference.reconcile(call_log)
+        # Legacy/general recovery jobs only hand off; they must not run
+        # conference provider polling on Frappe's shared queues.
+        return conference_jobs.enqueue(call_log, urgent=urgent, after_commit=False)
     if row.status in TERMINAL:
         release_locked(mapping, row)
         frappe.db.commit()

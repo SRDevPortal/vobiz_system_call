@@ -29,7 +29,9 @@ enabled in their Vobiz User Mapping use the existing flow.
   ceiling (Vobiz Settings `max_call_duration`, default 3600 seconds, capped at
   14400 seconds).
 - End Call records intent before browser hangup, prevents further rejoins, and
-  requests termination of customer and browser legs. Jobs retry unresolved
+  attempts the customer hangup directly with a three-second request timeout.
+  A separate urgent queue requests termination of customer and browser legs
+  and retries unresolved
   termination. A timeout, a missing live-call result, or successful DELETE alone
   does not release the agent or open disposition. An authenticated customer
   hangup or exact final customer CDR does.
@@ -60,28 +62,61 @@ not part of this feature.
    bench --site SITE clear-cache
    ```
 
-2. Merge this entry into the existing `workers` object in
+2. Merge these entries into the existing `workers` object in
    `sites/common_site_config.json`, preserving all other queues:
 
    ```json
-   "vobiz_conference": {"timeout": 120, "background_workers": 1}
+   "vobiz_conference": {"timeout": 120, "background_workers": 1},
+   "vobiz_conference_end": {"timeout": 120, "background_workers": 1}
    ```
 
-   Start a supervised worker for this queue:
+   Start separately supervised workers for these queues:
 
    ```bash
    bench worker --queue vobiz_conference
+   bench worker --queue vobiz_conference_end
    ```
 
-   Use your normal process manager for a persistent production service. Worker
-   capacity must be evaluated before expanding the pilot; one worker is not a
-   claim of production call-center capacity.
+   Use your normal process manager for persistent production services. Do not
+   combine these queues on one worker, or mix them with short/default/long.
+   The worker counts above are a startup example, NOT capacity sizing for
+   400–500 agents. Reserve CPU/memory and measure queue latency, provider API
+   latency/limits and database load before choosing production worker counts.
+   Separate hosts can isolate CPU/memory but still share SQL and Redis load.
 
-3. Ensure the site's scheduler runs. Migration registers
-   `vobiz_system_call.api.conference.sweep` every minute. The sweep records a
-   heartbeat and queues due work. New pilot calls are refused before creating
-   a Call Log if the sweep heartbeat is stale or its worker is unavailable.
-   Monitor both services; a preflight check cannot prevent a later service outage.
+3. Start a dedicated dispatcher for each site as a supervised CLI process:
+
+   ```bash
+   bench --site SITE execute vobiz_system_call.api.conference_jobs.run
+   ```
+
+   This command stays running. It is not an HTTP endpoint or a one-time setup
+   command. Configure automatic restart and log rotation in Supervisor/systemd.
+   It dispatches every second when idle, claims up to 1000 entries per index per
+   pass, and performs no provider network requests. Batches can take longer
+   under load. Recovery deadlines and End Call retries go to the urgent queue;
+   ordinary checks/customer origination use the normal conference queue.
+   Claimed work remains indexed with a retry lease if the dispatcher crashes.
+
+   Keep the ordinary site scheduler running too. Its existing minute sweep is
+   a backup, and does not make the dedicated dispatcher appear healthy.
+   The dispatcher also rebuilds active-call timers from User Mapping in bounded
+   batches once a minute. Configure Redis persistence: cleanup for calls already
+   released from their mappings still depends on retained queue/watch data.
+
+   After workers have consumed their probes, verify:
+
+   ```bash
+   bench --site SITE execute vobiz_system_call.api.conference_jobs.health
+   bench --site SITE execute vobiz_system_call.api.conference.assert_ready
+   ```
+
+   Health must show `ready: true`; assert_ready must not raise an error.
+   Both queues must execute a probe sent within 30 seconds, and the dispatcher
+   heartbeat must be no older than 15 seconds. Old delayed probes cannot reopen
+   admission. These checks reject NEW recovery calls; they never cancel existing
+   calls or falsely confirm a hangup. Monitor queue age and service failures:
+   preflight cannot prevent a later outage or guarantee a hard carrier deadline.
 
 4. Open **Vobiz User Mapping**, select the agent, and expand **Browser Softphone**.
    Check **Enable Call Recovery** and save. Any mapped browser agent can be
@@ -105,11 +140,42 @@ not part of this feature.
    This changes call topology and adds conference/browser-leg usage; confirm
    billing and provider concurrency capacity before a broader rollout.
 
+   Do not enable this across production merely because the code is deployed.
+   Run the local dispatch/conference tests and then a controlled live pilot.
+   Roll out 5 → 25 → 100 → remaining agents only after each stage passes:
+   no duplicate customer origination, no premature disposition, correct End Call,
+   full recordings, no significant ordinary ERP latency regression, and queue
+   probe ages consistently inside the readiness threshold. Test mass disconnect,
+   worker/process restart, provider timeouts and recovery after Redis interruption.
+   Real account concurrency and call-start limits must support the test load.
+
 To disable new conference calls for an agent, uncheck **Enable Call Recovery**
 in their User Mapping and save. Keep the
 code, callbacks, queue worker, and sweep running until existing conference calls
 and their cleanup jobs are finished. Do not remove them while a customer leg
 may still be connected.
+
+### Upgrading from the original conference worker
+
+Pause new recovery calls using the mapping checkbox and let active calls/cleanup
+finish before upgrading services. The old single-worker heartbeat no longer
+admits new recovery calls. Install both worker services and the dispatcher,
+restart the web/worker processes to load the new code, verify health, then enable
+one test mapping. No mapping is enabled or disabled automatically by this change.
+
+To roll back, disable new recovery calls, retain the new services until their
+cleanup work finishes, then restore the backed-up code/configuration. Do not
+remove the urgent worker while it has pending termination jobs.
+
+### Automated scale checks (not real-call capacity certification)
+
+`test_conference_dispatch.py` starts a temporary isolated Redis on a Unix socket.
+It verifies 500 simultaneous deadlines, a 1500-entry backlog, concurrent dispatch,
+crash retry leases, queue failure, late probes and restoration of 500 active-call
+timers. ERP SQL and provider operations in these tests are simulated. Conference
+contract tests verify exact-call termination, no duplicate origination, no release
+on an unconfirmed hangup, and stale deadline protection. These tests do not measure
+500 live calls, carrier audio, provider throttling or production database capacity.
 
 ## Local validation — 17 September 2026
 

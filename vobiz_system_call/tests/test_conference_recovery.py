@@ -96,15 +96,93 @@ class ConferenceTests(unittest.TestCase):
 
     def test_new_calls_require_timeout_sweep_and_conference_worker(self):
         from frappe.utils import background_jobs
-        self.replace(background_jobs, "get_queues_timeout", lambda: {c.QUEUE: 120})
+        from vobiz_system_call.api import conference_jobs as jobs
+        self.replace(background_jobs, "get_queues_timeout", lambda: {c.QUEUE: 120, jobs.URGENT_QUEUE: 120})
         self.cache.get_value.return_value = 999
         c.assert_ready()
         self.cache.get_value.return_value = 800
         with self.assertRaises(ValueError):
             c.assert_ready()
-        self.cache.get_value.side_effect = lambda key: 999 if key == c.HEARTBEAT else None
+        self.cache.get_value.side_effect = lambda key, **kw: 999 if key == jobs.DISPATCHER_HEARTBEAT else None
         with self.assertRaises(ValueError):
             c.assert_ready()
+
+    def test_cancel_attempts_customer_hangup_even_when_urgent_queue_fails(self):
+        from vobiz_system_call.api import conference_jobs as jobs
+        self.issued()
+        self.replace(jobs, "enqueue", MagicMock(side_effect=ConnectionError("queue down")))
+        self.replace(frappe, "logger", MagicMock())
+        frappe.db.get_value.return_value = "Connected"
+        result = c.cancel(self.mapping, self.row)
+        self.assertTrue(c.state(self.row)["closed"])
+        self.assertTrue(lifecycle.context(self.row)["agent_cancelled"])
+        frappe.db.commit.assert_called()
+        self.client.hangup_call.assert_called_once_with(CUSTOMER, allow_missing=True)
+        self.assertTrue(result["pending_provider"])
+        self.finish.assert_not_called()
+
+    def test_cancel_does_not_wait_for_cdr_queries_or_clear_on_delete_success(self):
+        from vobiz_system_call.api import conference_jobs as jobs
+        self.issued()
+        queued = self.replace(jobs, "enqueue", MagicMock())
+        frappe.db.get_value.return_value = "Connected"
+        result = c.cancel(self.mapping, self.row)
+        queued.assert_called_once_with("CALL", urgent=True, after_commit=False)
+        self.find_cdr.assert_not_called()
+        self.assertTrue(result["pending_provider"])
+        self.finish.assert_not_called()
+
+    def test_busy_reconcile_lease_does_not_execute_duplicate_provider_requests(self):
+        self.cache.lock.return_value.acquire.return_value = False
+        c.reconcile("CALL")
+        self.client.hangup_call.assert_not_called()
+        self.find_cdr.assert_not_called()
+
+    def test_shared_erp_reconcile_only_hands_off_conference_calls(self):
+        from vobiz_system_call.api import conference_jobs as jobs
+        queued = self.replace(jobs, "enqueue", MagicMock())
+        lifecycle._reconcile_call("CALL")
+        queued.assert_called_once_with("CALL", urgent=False, after_commit=False)
+        self.find_cdr.assert_not_called()
+        self.client.retrieve_live_call.assert_not_called()
+        self.value["closed"] = True
+        c.save(self.row, self.value)
+        lifecycle._reconcile_call("CALL")
+        queued.assert_called_with("CALL", urgent=True, after_commit=False)
+
+    def test_stale_deadline_after_rejoin_cannot_end_connected_call(self):
+        self.issued()
+        self.value["deadline"] = None
+        c.save(self.row, self.value)
+        c.reconcile("CALL")
+        self.client.hangup_call.assert_not_called()
+        self.finish.assert_not_called()
+
+    def test_500_expired_calls_request_both_legs_without_claiming_completion(self):
+        from copy import deepcopy
+        base = deepcopy(self.value)
+        customer_ids = set()
+        agent_ids = set()
+        for n in range(500):
+            customer = f"customer-{n}"
+            agent = f"agent-{n}"
+            customer_ids.add(customer)
+            agent_ids.add(agent)
+            self.row.update(name=f"CALL-{n}", call_uuid=customer, status="Connected")
+            self.mapping.current_call_log = self.row.name
+            value = deepcopy(base)
+            value.update(customer_issue="issued", deadline=999,
+                         legs={"1": {"uuid": agent, "entered": True}})
+            c.save(self.row, value)
+            c.reconcile(self.row.name)
+            self.assertTrue(c.state(self.row)["closed"])
+            self.assertFalse(c.state(self.row)["customer_ended"])
+        requested = {call.args[0] for call in self.client.hangup_call.call_args_list}
+        self.assertEqual(requested, customer_ids | agent_ids)
+        self.assertEqual(self.client.hangup_call.call_count, 1000)
+        self.client.make_call.assert_not_called()
+        self.cdr_finish.assert_not_called()
+        self.finish.assert_not_called()
 
     def test_join_header_routes_the_call_without_exposing_callback_secret(self):
         join = c.browser_join(self.row, self.value)
