@@ -64,14 +64,26 @@ class ConferenceTests(unittest.TestCase):
         self.row.call_uuid = CUSTOMER
         c.save(self.row, self.value)
 
-    def test_disabled_by_default_and_requires_allowlist(self):
+    def test_user_mapping_controls_recovery_without_site_config(self):
+        self.replace(frappe, "get_meta", lambda dt: SimpleNamespace(has_field=lambda f: True))
+        frappe.db.get_value.return_value = 0
         self.assertFalse(c.enabled(self.row.user))
-        frappe.conf.update(vsc_conference_recovery=1)
-        self.assertFalse(c.enabled(self.row.user))
-        frappe.conf.vsc_conference_recovery_users = [self.row.user]
+        frappe.db.get_value.return_value = 1
         self.assertTrue(c.enabled(self.row.user))
-        frappe.conf.vsc_conference_recovery = "0"
+        frappe.db.get_value.assert_called_with("Vobiz User Mapping",
+            {"user": self.row.user, "enabled": 1, "browser_softphone_enabled": 1},
+            "browser_call_recovery_enabled")
+        # Old pilot configuration cannot override an administrator unchecking it.
+        frappe.conf.update(vsc_conference_recovery=1, vsc_conference_recovery_users=[self.row.user])
+        frappe.db.get_value.return_value = 0
         self.assertFalse(c.enabled(self.row.user))
+        frappe.db.get_value.return_value = None
+        self.assertFalse(c.enabled(self.row.user))
+
+    def test_recovery_is_off_before_mapping_field_is_installed(self):
+        self.replace(frappe, "get_meta", lambda dt: SimpleNamespace(has_field=lambda f: False))
+        self.assertFalse(c.enabled(self.row.user))
+        frappe.db.get_value.assert_not_called()
 
     def test_routes_and_rooms_are_unique_and_grace_is_120(self):
         original = c.state(self.row)
@@ -313,6 +325,34 @@ class ConferenceTests(unittest.TestCase):
         ]:
             self.client.retrieve_live_call.return_value = response
             self.assertEqual(c.live_customer(self.row), expected)
+
+
+class MappingRecoveryMigrationTests(unittest.TestCase):
+    def run_install(self, field_exists, **config):
+        from vobiz_system_call import install
+        db = MagicMock()
+        db.exists.side_effect = lambda dt, name: field_exists if dt == "Custom Field" else True
+        db.get_value.return_value = "pilot-mapping"
+        with patch.object(frappe, "db", db), patch.object(frappe, "conf", frappe._dict(config)), \
+                patch.object(frappe, "clear_cache"), patch.object(install, "create_custom_fields"):
+            install.ensure_patch_fields()
+        return db
+
+    def test_existing_pilot_is_preserved_on_first_field_install(self):
+        db = self.run_install(False, vsc_conference_recovery=1,
+            vsc_conference_recovery_users=["pilot@test.invalid"])
+        db.set_value.assert_called_once_with("Vobiz User Mapping", "pilot-mapping",
+            "browser_call_recovery_enabled", 1)
+
+    def test_later_migration_does_not_reenable_unchecked_pilot(self):
+        db = self.run_install(True, vsc_conference_recovery=1,
+            vsc_conference_recovery_users=["pilot@test.invalid"])
+        db.set_value.assert_not_called()
+
+    def test_disabled_old_pilot_does_not_enable_anyone(self):
+        db = self.run_install(False, vsc_conference_recovery=0,
+            vsc_conference_recovery_users=["pilot@test.invalid"])
+        db.set_value.assert_not_called()
 
 
 if __name__ == "__main__":

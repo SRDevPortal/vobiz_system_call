@@ -36,10 +36,14 @@ MAX_AGENT_LEGS = 64
 
 
 def enabled(user):
-    # Explicit pilot allow-list; never change every agent on installation.
-    conf = frappe.conf
-    users = conf.get("vsc_conference_recovery_users") or []
-    return bool(frappe.utils.cint(conf.get("vsc_conference_recovery")) and isinstance(users, list) and user in users)
+    # User Mapping is authoritative. Existing calls retain their stored mode
+    # even if an administrator disables recovery for subsequent calls.
+    if not user or not frappe.get_meta("Vobiz User Mapping").has_field("browser_call_recovery_enabled"):
+        return False
+    return bool(frappe.utils.cint(frappe.db.get_value(
+        "Vobiz User Mapping", {"user": user, "enabled": 1, "browser_softphone_enabled": 1},
+        "browser_call_recovery_enabled",
+    )))
 
 
 def state(row):

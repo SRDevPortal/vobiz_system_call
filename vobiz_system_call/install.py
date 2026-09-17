@@ -33,6 +33,9 @@ def ensure_patch_fields():
     if not frappe.db.exists("DocType", "Vobiz Settings") or not frappe.db.exists("DocType", "Vobiz User Mapping"):
         return
 
+    recovery_field_exists = frappe.db.exists(
+        "Custom Field", {"dt": "Vobiz User Mapping", "fieldname": "browser_call_recovery_enabled"}
+    )
     create_custom_fields(
         {
             "Vobiz Settings": [
@@ -111,6 +114,16 @@ def ensure_patch_fields():
                     "insert_after": "browser_softphone_section",
                 },
                 {
+                    "fieldname": "browser_call_recovery_enabled",
+                    "label": "Enable Call Recovery",
+                    "fieldtype": "Check",
+                    "default": "0",
+                    "no_copy": 1,
+                    "insert_after": "browser_softphone_endpoint_uri",
+                    "depends_on": "eval:doc.browser_softphone_enabled",
+                    "description": "Outgoing browser calls only. Keep the customer connected while the agent reconnects, with a 120-second recovery window after connection loss is detected. Applies to new calls. Requires running call recovery services on the server.",
+                },
+                {
                     "fieldname": "browser_softphone_username",
                     "label": "Browser Softphone Username",
                     "fieldtype": "Data",
@@ -136,6 +149,21 @@ def ensure_patch_fields():
     )
     frappe.clear_cache(doctype="Vobiz Settings")
     frappe.clear_cache(doctype="Vobiz User Mapping")
+    if not recovery_field_exists:
+        migrate_conference_pilot_users()
+
+
+def migrate_conference_pilot_users():
+    """One-time import when the UI field is first installed, never on later saves."""
+    users = frappe.conf.get("vsc_conference_recovery_users") or []
+    if not frappe.utils.cint(frappe.conf.get("vsc_conference_recovery")) or not isinstance(users, list):
+        return
+    for user in users:
+        if not isinstance(user, str):
+            continue
+        name = frappe.db.get_value("Vobiz User Mapping", {"user": user}, "name")
+        if name:
+            frappe.db.set_value("Vobiz User Mapping", name, "browser_call_recovery_enabled", 1)
 
 
 def ensure_defaults():

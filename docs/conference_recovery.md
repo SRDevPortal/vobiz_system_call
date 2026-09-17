@@ -2,8 +2,8 @@
 
 This optional mode keeps the customer in a Vobiz conference when the agent's
 browser leg disconnects. The browser may join that same room again. Recovery
-does not issue another customer call. Incoming calls and agents outside the
-pilot allowlist use the existing flow.
+does not issue another customer call. Incoming calls and agents without recovery
+enabled in their Vobiz User Mapping use the existing flow.
 
 ## Behavior and guarantees
 
@@ -46,8 +46,9 @@ pilot allowlist use the existing flow.
 
 ## Deployment and activation
 
-The new code is in `vobiz_system_call`. No new DocType fields are required.
-Default behavior is disabled. Existing unrelated local edits in other apps are
+The new code is in `vobiz_system_call`. Migration adds the **Enable Call Recovery**
+checkbox to the Browser Softphone section of Vobiz User Mapping. It defaults to
+off. Existing unrelated local edits in other apps are
 not part of this feature.
 
 1. Back up the apps and site configuration. Deploy the app, build its assets,
@@ -82,12 +83,16 @@ not part of this feature.
    a Call Log if the sweep heartbeat is stale or its worker is unavailable.
    Monitor both services; a preflight check cannot prevent a later service outage.
 
-4. Configure an explicit pilot user list in the site's configuration:
+4. Open **Vobiz User Mapping**, select the agent, and expand **Browser Softphone**.
+   Check **Enable Call Recovery** and save. Any mapped browser agent can be
+   enabled this way by a user with permission to edit mappings; no site-config
+   change is needed. Start with a small pilot. The setting affects new outgoing
+   browser calls only. Incoming and Mobile Bridge calls keep their existing flow.
 
-   ```json
-   "vsc_conference_recovery": 1,
-   "vsc_conference_recovery_users": ["pilot-agent@example.com"]
-   ```
+   When this field is first installed, any enabled legacy pilot allowlist is
+   copied into the mapping checkboxes once. Later migrations do not overwrite
+   choices made in the UI. The old `vsc_conference_recovery` and
+   `vsc_conference_recovery_users` site-config values no longer control new calls.
 
    The endpoint must already use the app's authenticated WebRTC answer URL.
    Its SIP account and Vobiz Settings REST credentials must belong to the same
@@ -100,7 +105,8 @@ not part of this feature.
    This changes call topology and adds conference/browser-leg usage; confirm
    billing and provider concurrency capacity before a broader rollout.
 
-To disable new conference calls, set `vsc_conference_recovery` to `0`. Keep the
+To disable new conference calls for an agent, uncheck **Enable Call Recovery**
+in their User Mapping and save. Keep the
 code, callbacks, queue worker, and sweep running until existing conference calls
 and their cleanup jobs are finished. Do not remove them while a customer leg
 may still be connected.
