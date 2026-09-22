@@ -120,12 +120,9 @@ def finish_locked(mapping, row, event, reason="", status=None):
         values["duration"] = max(0, (now - frappe.utils.get_datetime(row.answer_time)).total_seconds())
     frappe.db.set_value("Vobiz Call Log", row.name, values)
     release_locked(mapping, row)
-    if row.reference_doctype and row.reference_name:
-        from vobiz_click_to_call.services.disposition import update_reference_call_metrics
-        update_reference_call_metrics(row.reference_doctype, row.reference_name)
-    from vobiz_ai.api.call_log import sync_linked_summaries
+    from vobiz_click_to_call.services.reference_sync import request_reference_sync
+    request_reference_sync(row.name)
     completed = frappe.get_doc("Vobiz Call Log", row.name)
-    sync_linked_summaries(completed)
     if is_browser_call(row) or context(row).get("incoming_mobile_bridge"):
         from vobiz_click_to_call.services.realtime import publish_call_disconnected
         publish_call_disconnected(completed)

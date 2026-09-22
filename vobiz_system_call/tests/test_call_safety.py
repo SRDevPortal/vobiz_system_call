@@ -429,7 +429,11 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(webrtc, "_request_params", lambda: {
             "From": "+919876543210", "To": "+919999999999", "CallUUID": "uuid-12345678",
         })
-        self.replace(frappe, "cache", lambda: SimpleNamespace(lock=lambda *args, **kwargs: nullcontext()))
+        cache = MagicMock()
+        cache.get_value.return_value = None
+        self.replace(frappe, "cache", lambda: cache)
+        self.replace(webrtc, "get_webhook_base_url", lambda *args: "https://example.test")
+        self.db.sql.return_value = [(50,)]
         self.replace(inbound, "route", MagicMock(return_value=Response(
             '<?xml version="1.0" encoding="UTF-8"?><Response><Dial><Number>911234567890</Number></Dial></Response>',
             content_type="text/xml",

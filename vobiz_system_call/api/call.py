@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 import frappe
+from vobiz_click_to_call.services.reference_sync import request_reference_sync
 from frappe import _
 
 from vobiz_ai.api.call_log import sync_linked_summaries
@@ -192,8 +193,7 @@ def start_system_dialer_call(
         default=str,
     )
     call_log = save_doc_latest(call_log, before)
-    update_reference_call_metrics(reference_doctype, reference_name)
-    sync_linked_summaries(call_log)
+    request_reference_sync(call_log.name)
     log_vobiz_event("Vobiz System Call dialer prepared", call_log=call_log.name)
     frappe.db.commit()
 
@@ -272,8 +272,7 @@ def start_browser_softphone_call(
     call_log.reload()
     from vobiz_system_call.api import conference
     recovery = conference.prepare(call_log, settings) if conference.enabled(frappe.session.user) else {}
-    update_reference_call_metrics(reference_doctype, reference_name)
-    sync_linked_summaries(call_log)
+    request_reference_sync(call_log.name)
     log_vobiz_event(
         "Vobiz System Call browser softphone prepared",
         call_log=call_log.name,

@@ -283,17 +283,18 @@ def answer(token=None):
         return _plain_response("Not permitted.", 403)
     payload = _request_params()
     if str(payload.get("Event") or payload.get("event") or "").lower() == "hangup":
+        from vobiz_click_to_call.services.incoming_routing import mark_ended
+        mark_ended(payload)
         return _xml_response(_hangup_xml())
     raw_from = str(payload.get("From") or payload.get("from") or "")
     raw_to = str(payload.get("To") or payload.get("to") or "")
     if raw_from.startswith("sip:"):
         return _answer_sdk_outbound(raw_from, raw_to, payload)
-    # Serialize DID assignment across provider retries and round-robin updates.
-    route_key = hashlib.sha256(str(_number(raw_to) or raw_to).encode()).hexdigest()
-    caller_key = hashlib.sha256(str(_number(raw_from) or raw_from).encode()).hexdigest()
-    with frappe.cache().lock("vsc:incoming-caller:" + caller_key, timeout=120, blocking_timeout=5):
-        with frappe.cache().lock("vsc:incoming-route:" + route_key, timeout=120, blocking_timeout=5):
-            return _answer_core_routed_pstn_inbound(payload)
+    from vobiz_click_to_call.services import incoming_routing
+    return incoming_routing.run(
+        payload, lambda: _answer_core_routed_pstn_inbound(payload),
+        get_webhook_base_url(get_settings()) + "/api/method/vobiz_system_call.api.webrtc.answer",
+    )
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
@@ -313,6 +314,8 @@ def hangup(token=None):
         return _plain_response("IGNORED")
     if not uuid:
         return _plain_response("IGNORED")
+    from vobiz_click_to_call.services.incoming_routing import mark_ended
+    mark_ended(payload)
     matches = frappe.get_all("Vobiz Call Log", filters={"call_uuid": uuid},
                             fields=["name", "request_json"], limit_page_length=2)
     if len(matches) != 1 or not lifecycle.is_managed_call(matches[0]):
