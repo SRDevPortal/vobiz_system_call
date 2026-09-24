@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 import re
 from datetime import timedelta, timezone
+from functools import partial
 from zoneinfo import ZoneInfo
+
+from redis.exceptions import LockNotOwnedError
 
 import frappe
 from frappe import _
@@ -216,19 +219,50 @@ def finish_provider_pending_if_expired(call_log, expected_uuid=None):
 
 
 def enqueue_reconcile(name):
-    from vobiz_click_to_call.services.recovery_policy import due
-    if not due(name):
-        return
     try:
+        # Check the queue after the call update commits. Checking now and deferring
+        # only the enqueue leaves concurrent callbacks with an outdated queue view.
+        frappe.db.after_commit.add(partial(_enqueue_reconcile_after_commit, name))
+    except Exception:
+        frappe.log_error(title="Vobiz reconciliation queue unavailable", message=frappe.get_traceback())
+
+
+def _enqueue_reconcile_after_commit(name):
+    from frappe.utils.background_jobs import is_job_enqueued
+    from vobiz_click_to_call.services.recovery_policy import due
+
+    lock = None
+    acquired = False
+    try:
+        if not due(name):
+            return
+        cache = frappe.cache()
+        # Short, site/call-specific enqueue guard; never wait behind another
+        # webhook and never hold a database lock while touching the RQ queue.
+        lock = cache.lock(cache.make_key("vsc:reconcile-enqueue:" + name), timeout=15)
+        acquired = lock.acquire(blocking=False)
+        if not acquired:
+            return
+        job_id = "vsc-reconcile-" + name
+        if is_job_enqueued(job_id):
+            return
         frappe.enqueue(
             "vobiz_system_call.api.lifecycle.reconcile_call",
-            call_log=name, queue="short", timeout=240, enqueue_after_commit=True,
-            job_id="vsc-reconcile-" + name, deduplicate=True,
+            call_log=name, queue="short", timeout=240, enqueue_after_commit=False,
+            job_id=job_id, deduplicate=True,
         )
     except Exception:
         # The mapping remains reserved; the bounded scheduler will retry later.
         frappe.log_error(title="Vobiz reconciliation queue unavailable", message=frappe.get_traceback())
-
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except LockNotOwnedError:
+                # Never release another owner's lease or mask the enqueue result.
+                pass
+            except Exception:
+                frappe.log_error(title="Vobiz reconciliation queue cleanup failed", message=frappe.get_traceback())
 
 
 def provider_outcome(cdr, answered=False):

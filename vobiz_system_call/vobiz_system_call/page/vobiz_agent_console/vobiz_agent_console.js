@@ -3213,7 +3213,9 @@ class VobizAgentConsole {
 	}
 
 	show_auto_call_dialog() {
-		if (this.auto_call_dialog && this.auto_call_dialog.$wrapper && this.auto_call_dialog.$wrapper.is(':visible')) {
+		// Bootstrap's opening transition can still report :visible=false.
+		// Reuse the instance so repeated start updates cannot stack stale dialogs.
+		if (this.auto_call_dialog) {
 			this.render_auto_call_dialog();
 			return;
 		}
@@ -3236,11 +3238,8 @@ class VobizAgentConsole {
 			}
 		});
 		dialog.$wrapper.on('hidden.bs.modal', () => {
-			if (this.state.active_workdesk_dialog !== dialog) return;
-			this.stop_whatsapp_sync();
-			if (this.auto_call_dialog === dialog) {
-				this.auto_call_dialog = null;
-			}
+			if (this.auto_call_dialog === dialog) this.auto_call_dialog = null;
+			dialog.$wrapper.remove();
 		});
 		dialog.show();
 		this.render_auto_call_dialog();
@@ -3602,7 +3601,8 @@ class VobizAgentConsole {
 		const active = this.state.active_call || {};
 		const known = this.state.softphone.current_call_log === payload.name || active.name === payload.name
 			|| active.last_call?.name === payload.name || this.state.workdesk_live_call_log === payload.name
-			|| this.completed_call_contexts?.has(payload.name);
+			|| this.completed_call_contexts?.has(payload.name)
+			|| this.state.auto_dial?.current?.call_log === payload.name;
 		if (!known) {
 			if (payload.direction === 'Incoming') this.watch_browser_call_disposition(payload.name);
 			return;
@@ -6371,7 +6371,10 @@ class VobizAgentConsole {
 	finish_auto_dial_call(call) {
 		const session = this.state.auto_dial || {};
 		const current = session.current || {};
-		if (!current.call_log || current.call_log !== call.name) return;
+		if (!call || !this.is_terminal_status(call.status)
+			|| !current.call_log || current.call_log !== call.name) return;
+		call = this.completed_call_context(call);
+		const ownsActiveCall = this.is_disposition_call_current(call.name);
 
 		const outcome = this.auto_call_outcome(call);
 		session.results.push({
@@ -6386,16 +6389,22 @@ class VobizAgentConsole {
 		session.current = null;
 		session.in_flight = false;
 		session.awaiting_disposition = true;
+		session.awaiting_disposition_call_log = call.name;
 		this.state.auto_dial = session;
-		this.state.active_call = { last_call: call };
-		this.state.call_started_at = null;
 		this.state.disposition_prompted_call_log = call.name;
-		this.clear_tracked_live_call(call.name);
-		this.stop_timer();
+		// get_call_status can confirm the end before the SDK callback arrives.
+		// Release only this call; a newer incoming call must remain untouched.
+		if (ownsActiveCall) {
+			this.reconcile_browser_softphone_call(call);
+			this.state.active_call = { last_call: call };
+			this.state.call_started_at = null;
+			this.clear_tracked_live_call(call.name);
+			this.stop_timer();
+		}
 		this.add_auto_event(__('Waiting for disposition'), `${current.lead} • ${outcome.label}. ${__('Update status to continue.')}`, outcome.state);
 		this.update_selected_count();
 		this.render_auto_live();
-		this.render_auto_call_dialog();
+		this.hide_auto_call_dialog();
 		this.prompt_auto_dial_disposition(call, current);
 	}
 
@@ -6404,7 +6413,10 @@ class VobizAgentConsole {
 		const row = (this.state.queue || []).find(item =>
 			item.name === (call.reference_name || current.lead) &&
 			(!call.reference_doctype || item.doctype === call.reference_doctype)
-		) || this.state.selected || {
+		) || ((this.state.auto_dial || {}).queue || []).find(item =>
+			item.name === (call.reference_name || current.lead) &&
+			(!call.reference_doctype || item.doctype === call.reference_doctype)
+		) || {
 			doctype: call.reference_doctype,
 			name: call.reference_name || current.lead,
 			title: current.title || call.reference_name || current.lead,
@@ -6440,8 +6452,10 @@ class VobizAgentConsole {
 
 	complete_auto_dial_disposition(call_log) {
 		const session = this.state.auto_dial || {};
-		if (!session.awaiting_disposition) return;
+		if (!session.awaiting_disposition
+			|| session.awaiting_disposition_call_log !== call_log) return;
 		session.awaiting_disposition = false;
+		session.awaiting_disposition_call_log = null;
 		this.state.auto_dial = session;
 		this.add_auto_event(__('Disposition completed'), `${call_log || __('Call')} • ${__('Moving to next lead.')}`, 'done');
 		this.update_selected_count();
@@ -6721,6 +6735,12 @@ class VobizAgentConsole {
 		this.post_call_disposition?.waiting_for_end.delete(call.name);
 		this.sync_post_call_disposition();
 		if (!this.is_disposition_call_current(call.name)) return;
+		if ((this.state.auto_dial?.current || {}).call_log === call.name) {
+			// Confirmed events/status checks can finish auto dial independently
+			// of a slow or failed queue refresh. This path is idempotent.
+			this.finish_auto_dial_call(call);
+			return;
+		}
 		if ((!call.reference_doctype || !call.reference_name) && call.direction !== 'Incoming') {
 			// Compatibility with old workers sending only name/status during deployment.
 			if (!call.disposition_reference_checked) this.watch_browser_call_disposition(call.name);

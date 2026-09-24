@@ -106,11 +106,17 @@ test('automatic reconciliation preserves AI, auto-dial and excluded-reference di
     for (const scenario of ['ai', 'auto-dial', 'Issue', 'Patient Encounter']) {
         const t = setup(); let call = {...completed};
         if (scenario === 'ai') t.obj.state.ai_disposition_enabled = true;
-        else if (scenario === 'auto-dial') t.obj.state.auto_dial = {running: true, current: {call_log: 'C1'}};
+        else if (scenario === 'auto-dial') {
+            t.obj.state.auto_dial = {running: true, current: {call_log: 'C1'}};
+            let delegated = 0;
+            t.obj.finish_auto_dial_call = call => { assert.equal(call.name, 'C1'); delegated++; };
+            t.assertDelegated = () => assert.equal(delegated, 1);
+        }
         else call.reference_doctype = scenario;
         t.obj.reconcile_browser_softphone_call(call);
         assert.equal(t.obj.state.softphone.current_call_log, '');
         assert.equal(t.timers.length, 0, scenario);
+        if (t.assertDelegated) t.assertDelegated();
     }
 });
 
