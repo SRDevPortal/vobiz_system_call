@@ -1547,7 +1547,7 @@ class VobizAgentConsole {
 
 	softphone_ownership_error(state) {
 		const messages = {
-			active_call: __('Finish the current call or stop auto-dial before switching windows.'),
+			active_call: __('Your previous call has not been confirmed ended. Use End Call above and wait for confirmation before switching windows.'),
 			superseded: __('Use here was selected in another window. Your softphone is switching there.'),
 			expired: __('The previous switch request expired. Please select Use softphone here again.')
 		};
@@ -2599,12 +2599,36 @@ class VobizAgentConsole {
 		frappe.realtime.on('vobiz_customer_callback', this.callback_handler);
 		frappe.realtime.on('vobiz_patient_routed_call', this.patient_routed_handler);
 		frappe.realtime.on('vobiz_call_disconnected', this.call_disconnected_handler);
+        this.call_outcome_handler = payload => this.handle_call_outcome_corrected(payload || {});
+        frappe.realtime.on('vobiz_call_outcome_corrected', this.call_outcome_handler);
 		frappe.realtime.on('vobiz_softphone_ownership', this.softphone_ownership_handler);
 		frappe.realtime.on('wa_chat_new_message', this.whatsapp_message_handler);
 		frappe.realtime.on('wa_chat_message_status_updated', this.whatsapp_status_handler);
 	}
 
+    handle_call_outcome_corrected(payload) {
+        if (!payload.name || !this.is_terminal_status(payload.status)) return;
+        const matches = call => call && call.name === payload.name;
+        const calls = [this.state.workdesk_live_call, this.state.active_call,
+            (this.state.active_call || {}).last_call];
+        calls.filter(matches).forEach(call => Object.assign(call, payload));
+        const queued = this.pending_post_call_dispositions && this.pending_post_call_dispositions.get(payload.name);
+        if (queued && matches(queued[0])) Object.assign(queued[0], payload);
+        const current = this.post_call_disposition;
+        if (current && current.call_log === payload.name && current.dialog) {
+            current.dialog.$wrapper.find('[data-role="call-outcome"]').text(payload.status);
+        }
+        if (matches(this.state.workdesk_live_call) || matches((this.state.active_call || {}).last_call)) {
+            this.render_workdesk_live_call();
+        }
+        // No disconnect handler, queue advancement, dialog creation or new call.
+    }
+
 	unbind_realtime() {
+        if (frappe.realtime && frappe.realtime.off && this.call_outcome_handler) {
+            frappe.realtime.off('vobiz_call_outcome_corrected', this.call_outcome_handler);
+        }
+        this.call_outcome_handler = null;
 		this.stop_whatsapp_sync();
 		if (frappe.realtime && this.whatsapp_message_handler && frappe.realtime.off) {
 			frappe.realtime.off('wa_chat_new_message', this.whatsapp_message_handler);
@@ -3675,7 +3699,9 @@ class VobizAgentConsole {
 				return;
 			}
 			this.state.confirmed_end_call = true;
-			Promise.resolve(this.cancel_call_log(callLog)).finally(() => { this.state.confirmed_end_call = false; release(); });
+			Promise.resolve(this.cancel_call_log(callLog)).catch(() => {
+				frappe.msgprint(__('End Call was requested, but termination is not confirmed yet. Please retry if the call remains active.'));
+			}).finally(() => { this.state.confirmed_end_call = false; release(); });
 		}, release);
 		if (dialog && dialog.$wrapper) dialog.$wrapper.one('hidden.bs.modal', () => {
 			if (!this.state.confirmed_end_call) release();
@@ -4249,14 +4275,14 @@ class VobizAgentConsole {
 	}
 
 	live_call_steps(call) {
-		const flow = call.call_flow || 'Customer First';
+		const flow = call.customer_leg_attempted ? 'Agent First' : (call.call_flow || 'Customer First');
 		const first = flow === 'Agent First' ? __('Agent') : __('Customer');
 		const second = flow === 'Agent First' ? __('Customer') : __('Agent');
 		const firstNumber = flow === 'Agent First' ? call.agent_mobile_display : call.customer_number_display;
 		const secondNumber = flow === 'Agent First' ? call.customer_number_display : call.agent_mobile_display;
 		const status = call.status || '';
 		const terminal = ['Completed', 'Failed', 'Busy', 'No Answer', 'Cancelled', 'Canceled'].includes(status);
-		const answeredFirst = Boolean(call.answer_time) || ['Agent Answered', 'Customer Answered', 'Agent Ringing', 'Connected', 'Completed'].includes(status);
+		const answeredFirst = Boolean(call.customer_leg_attempted || call.answer_time) || ['Agent Answered', 'Customer Answered', 'Agent Ringing', 'Connected', 'Completed'].includes(status);
 		const connected = ['Connected', 'Completed'].includes(status);
 
 		let firstState = 'active';
@@ -4286,7 +4312,9 @@ class VobizAgentConsole {
 				firstState = 'failed';
 				secondState = 'waiting';
 				firstMeta = this.live_failure_text(call, first);
-				secondMeta = __('Not called because {0} did not connect.', [first.toLowerCase()]);
+				secondMeta = ['terminated', 'provider-hangup'].includes(call.call_status)
+                    ? __('Connection was not confirmed.')
+                    : __('Not called because {0} did not connect.', [first.toLowerCase()]);
 			}
 		}
 
@@ -4307,6 +4335,11 @@ class VobizAgentConsole {
 	live_failure_text(call, party) {
 		const status = call.status || '';
 		const signal = this.normalized_call_signal(call);
+        if (['Cancelled', 'Canceled'].includes(status) &&
+            ['terminated', 'provider-hangup'].includes(call.call_status)) {
+            return __('Call ended; final cause is not confirmed.');
+        }
+
 		if (status === 'Busy' || signal.includes('busy')) {
 			return __('{0} line was busy.', [party]);
 		}
@@ -6605,6 +6638,9 @@ class VobizAgentConsole {
 		// Online events and the retry timer can arrive during a slow Stop request.
 		const requests = this.browser_cancel_requests || (this.browser_cancel_requests = new Map());
 		if (requests.has(call_log)) return requests.get(call_log);
+        const cooldowns = this.cancel_retry_at || (this.cancel_retry_at = new Map());
+        if ((cooldowns.get(call_log) || 0) > Date.now()) return Promise.resolve({pending_provider: true});
+
 		const request = this.cancel_call_log_request(call_log, row).finally(() => requests.delete(call_log));
 		requests.set(call_log, request);
 		return request;
@@ -6634,12 +6670,20 @@ class VobizAgentConsole {
 		}
 		const endpoint = isBrowser ? 'vobiz_system_call.api.webrtc.cancel_browser_call' : 'vobiz_click_to_call.api.call.cancel_call';
 		const request = frappe.call(endpoint, { call_log });
-		return (isBrowser ? this.browser_request_with_timeout(request, 30000) : Promise.resolve(request)).then(() => {
+		// Ending a server-tracked call works even when this window has no SDK session.
+		return this.browser_request_with_timeout(request, 30000).then((response) => {
+            const retry = Number((response.message || {}).retry_after);
+            const delay = Number.isFinite(retry) && retry > 0 ? retry : 5;
+            this.cancel_retry_at = this.cancel_retry_at || new Map();
+            this.cancel_retry_at.set(call_log, Date.now() + delay * 1000);
+            // Bound per-window history; a new call never inherits an old cooldown.
+            if (this.cancel_retry_at.size > 100) this.cancel_retry_at.delete(this.cancel_retry_at.keys().next().value);
+
 			const statusRequest = frappe.call({
 				method: 'vobiz_click_to_call.api.call.get_call_status',
 				args: { call_log, sync_provider: 0 }
 			});
-			return isBrowser ? this.browser_request_with_timeout(statusRequest) : statusRequest;
+			return this.browser_request_with_timeout(statusRequest);
 		}).then((r) => {
 			const call = r.message || { name: call_log };
 			if (isBrowser && softphone.current_call_log !== call_log) return call;
@@ -6668,8 +6712,11 @@ class VobizAgentConsole {
 			}
 			frappe.show_alert({ message: __('Call stopped.'), indicator: 'orange' });
 			this.load();
-		}).catch(err => {
-			this.watch_browser_call_disposition(call_log);
+        }).catch(err => {
+            this.cancel_retry_at = this.cancel_retry_at || new Map();
+            const offline = window.navigator && window.navigator.onLine === false;
+            this.cancel_retry_at.set(call_log, Date.now() + (offline ? 0 : 10000));
+            this.watch_browser_call_disposition(call_log);
 			if (isBrowser && softphone.current_call_log === call_log) {
 				const status = Number(err && err.status) || 0;
 				if (status === 0 || status >= 500) softphone.pending_end_call = call_log;
@@ -6980,7 +7027,7 @@ class VobizAgentConsole {
 					options: `
 						<div class="vobiz-workdesk-card">
 							<div><strong>${frappe.utils.escape_html(row.title || row.name || call.reference_name || call.customer_number_display || call.customer_number || __('Customer'))}</strong></div>
-							<div class="text-muted">${frappe.utils.escape_html(call.status || '')}</div>
+							<div class="text-muted" data-role="call-outcome">${frappe.utils.escape_html(call.status || '')}</div>
 							${call.ai_disposition ? `<hr><div><strong>${__('AI Suggestion')}</strong>: ${frappe.utils.escape_html(call.ai_disposition)}${call.ai_confidence ? ` (${frappe.utils.escape_html(String(call.ai_confidence))})` : ''}</div>` : ''}
 							${call.ai_summary ? `<div class="vobiz-related-meta">${frappe.utils.escape_html(call.ai_summary)}</div>` : ''}
 						</div>

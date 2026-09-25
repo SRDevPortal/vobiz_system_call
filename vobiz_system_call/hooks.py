@@ -21,7 +21,7 @@ override_whitelisted_methods = {
 app_include_js = [
     # Keep the URL version in sync with the console cache version in this asset.
     # Otherwise browsers can retain the pre-identity script across page reloads.
-	"/assets/vobiz_system_call/js/vobiz_system_call.js?v=20260917.3",
+	"/assets/vobiz_system_call/js/vobiz_system_call.js?v=20260925.1",
 ]
 
 before_uninstall = "vobiz_system_call.install.before_uninstall"

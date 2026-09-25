@@ -77,6 +77,8 @@ def presence_heartbeat(tab_id, registered=1, claim_idle=0, call_log=None):
                         "transfer_token": pending["token"], "tab_id": tab_id}
             return {"registered": False, "ownership": "other_window"}
         if owner and owner != tab_id:
+            if mapping.current_call_log:
+                return {"registered": False, "ownership": "active_call"}
             # The durable ID records ownership history, not current liveness.
             # Only a fresh connection may recover an idle, expired owner;
             # background heartbeats from superseded windows never reclaim it.

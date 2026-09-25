@@ -21,7 +21,7 @@ from vobiz_system_call.api.settings import (
     CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_MOBILE_BRIDGE, device_enabled, get_browser_softphone_registrar,
     get_browser_softphone_sdk_url, get_call_device, get_caller_id,
     get_inbound_callback_token, get_profile_endpoint_uri, get_profile_password,
-    get_settings, get_system_call_profile, get_webhook_base_url, is_enabled,
+    get_settings, get_system_call_profile, get_webhook_base_url, is_enabled, callback_request_limit,
 )
 
 ACTIVE_BROWSER_STATUSES = lifecycle.ACTIVE
@@ -266,18 +266,20 @@ def cancel_browser_call(call_log: str):
     frappe.db.commit()
     from vobiz_click_to_call.services.client import VobizClient
     # On a provider error keep the reservation. A queued reconciliation may still resolve it.
+    hangup_result = {}
     try:
         if uuid:
             client = VobizClient(get_settings())
-            client.hangup_call(uuid, allow_missing=True)
+            hangup_result = client.hangup_call(uuid, allow_missing=True) or {}
     finally:
         lifecycle.enqueue_reconcile(call_log)
         frappe.db.commit()
-    return {"status": row.status, "pending_provider": True}
+    return {"status": row.status, "pending_provider": True,
+            "retry_after": hangup_result.get("retry_after", 30)}
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
-@rate_limit(limit=600, seconds=60)
+@rate_limit(limit=lambda: callback_request_limit("answer"), seconds=60)
 def answer(token=None):
     if not _valid_public_token(token) or not is_enabled(get_settings()):
         return _plain_response("Not permitted.", 403)
@@ -298,7 +300,7 @@ def answer(token=None):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
-@rate_limit(limit=600, seconds=60)
+@rate_limit(limit=lambda: callback_request_limit("hangup"), seconds=60)
 def hangup(token=None):
     """Application-level final callback; never route or dial from this endpoint."""
     if not _valid_public_token(token):
@@ -346,7 +348,7 @@ def hangup(token=None):
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
-@rate_limit(limit=600, seconds=60)
+@rate_limit(limit=lambda: callback_request_limit("answer"), seconds=60)
 def fallback(token=None):
     """Fail closed if answering fails; final hangup/CDR confirms termination."""
     if not _valid_public_token(token):
@@ -681,7 +683,7 @@ def _answer_pstn_inbound(raw_from, raw_to, payload):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
-@rate_limit(limit=600, seconds=60)
+@rate_limit(limit=lambda: callback_request_limit("event"), seconds=60)
 def provider_event(call_log: str, token: str, final: str = "0"):
     # Per-call credential is sent only to the provider through Dial XML.
     auth_row = frappe.db.get_value("Vobiz Call Log", call_log, ["name", "call_uuid"], as_dict=True)
@@ -693,7 +695,9 @@ def provider_event(call_log: str, token: str, final: str = "0"):
     # The Dial token is specific to this call and authorizes B-leg callbacks too.
     state = str(payload.get("DialCallStatus") or payload.get("DialStatus") or
                 payload.get("DialAction") or payload.get("DialBLegStatus") or payload.get("Event") or "").lower()
-    if row.status not in lifecycle.TERMINAL:
+    from vobiz_system_call.api.customer_outcome import apply as apply_customer_outcome
+    outcome_applied = apply_customer_outcome(mapping, row, payload, state)
+    if not outcome_applied and row.status not in lifecycle.TERMINAL:
         if state in ("answer", "answered", "connected", "in-progress", "in progress"):
             frappe.db.set_value("Vobiz Call Log", row.name, {
                 "status": "Connected", "answer_time": row.answer_time or frappe.utils.now(),
@@ -709,7 +713,7 @@ def provider_event(call_log: str, token: str, final: str = "0"):
     _append_callback_if_enabled(row.name, "provider-event", {
         k: v for k, v in payload.items() if k not in ("token", "cmd")
     })
-    if row.status in lifecycle.TERMINAL:
+    if not outcome_applied and row.status in lifecycle.TERMINAL:
         lifecycle.release_locked(mapping, row)
     lifecycle.enqueue_reconcile(row.name)
     frappe.db.commit()
@@ -717,7 +721,7 @@ def provider_event(call_log: str, token: str, final: str = "0"):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
-@rate_limit(limit=600, seconds=60)
+@rate_limit(limit=lambda: callback_request_limit("event"), seconds=60)
 def incoming_action(call_log: str, token: str):
     auth = frappe.db.get_value("Vobiz Call Log", call_log, ["name", "call_uuid"], as_dict=True)
     if not auth or not hmac.compare_digest(_provider_call_token(auth), str(token or "")) or not token:

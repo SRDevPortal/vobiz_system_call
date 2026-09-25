@@ -154,7 +154,7 @@ test('server active-call refusal preserves the old window and prevents new SDK l
     obj.connect_browser_softphone = async () => logins++;
     await obj.use_softphone_here();
     assert.equal(logins, 0);
-    assert.match(obj.state.softphone.error, /Finish the current call/);
+    assert.match(obj.state.softphone.error, /Use End Call/);
     assert.equal(obj.state.softphone.switching_window, false);
 });
 

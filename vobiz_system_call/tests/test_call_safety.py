@@ -39,6 +39,7 @@ class BrowserSafetyTests(unittest.TestCase):
         self.db = self.replace(frappe, "db", MagicMock())
         self.replace(frappe, "session", SimpleNamespace(user="agent@example.test"))
         self.replace(frappe, "form_dict", {})
+        self.replace(frappe, "flags", frappe._dict())
         self.replace(frappe, "request", None)
         self.replace(frappe, "get_roles", lambda: [])
         self.replace(frappe, "throw", lambda message: (_ for _ in ()).throw(ValueError(message)))
@@ -813,6 +814,20 @@ class BrowserSafetyTests(unittest.TestCase):
         self.assertEqual(provider.hangup_call.call_count, 2)
         self.assertEqual(enqueue.call_count, 2)
 
+    def test_end_call_does_not_require_browser_registration_in_requesting_window(self):
+        from vobiz_click_to_call.services import client
+        provider = MagicMock()
+        self.replace(client, "VobizClient", lambda _: provider)
+        self.replace(lifecycle, "lock_call", lambda _: (frappe._dict(current_call_log="CALL-1"),
+                                                       row(call_uuid="provider-uuid")))
+        presence = self.replace(lifecycle, "presence", MagicMock(return_value=None))
+        release = self.replace(lifecycle, "release_locked", MagicMock())
+        self.replace(lifecycle, "enqueue_reconcile", MagicMock())
+        self.assertTrue(webrtc.cancel_browser_call("CALL-1")["pending_provider"])
+        provider.hangup_call.assert_called_once_with("provider-uuid", allow_missing=True)
+        presence.assert_not_called()
+        release.assert_not_called()
+
     def test_terminal_after_cancel_retains_recovery_and_first_timestamp(self):
         pending = row(call_status="cancellation-requested",
                       request_json=json.dumps({"agent_cancelled": True,
@@ -953,7 +968,7 @@ class BrowserSafetyTests(unittest.TestCase):
         for code, message in [(401, "call not found"), (500, "call not found"), (404, "account not found")]:
             response.status_code = code
             response.json.return_value = {"message": message}
-            with self.assertRaises(ValueError):
+            with self.assertRaises(client.ProviderTemporaryError if code == 500 else ValueError):
                 provider.hangup_call("uuid", allow_missing=True)
 
     def test_provider_failure_keeps_mapping_and_queues_reconciliation(self):

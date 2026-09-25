@@ -267,6 +267,25 @@ test('a timed-out Stop status check remains queued for confirmation', async () =
     assert.equal(t.obj.state.softphone.current_call_log, 'C1');
 });
 
+test('End Call from an unregistered window uses the server and waits for confirmation', async () => {
+    const t = setup(), requests = [];
+    t.obj.state.softphone.current_call_log = '';
+    t.obj.state.softphone.client = null;
+    t.obj.state.softphone.registered = false;
+    t.obj.state.softphone.in_call = false;
+    t.ctx.frappe.call = (method, args) => {
+        requests.push(typeof method === 'string' ? [method, args] : [method.method, method.args]);
+        return Promise.resolve({message: typeof method === 'string'
+            ? {pending_provider: true} : {name: 'C1', status: 'Connected'}});
+    };
+    await t.obj.cancel_call_log('C1');
+    assert.equal(requests[0][0], 'vobiz_click_to_call.api.call.cancel_call');
+    assert.equal(requests[0][1].call_log, 'C1');
+    assert.equal(t.hangups(), 0);
+    assert.equal(t.obj.state.active_call.name, 'C1');
+    assert.equal(t.obj.state.active_call.status, 'Connected');
+});
+
 test('the workdesk shows recovery only for the affected browser call', () => {
     const t = setup();
     t.ctx.frappe.utils = {escape_html: value => String(value)};
@@ -361,4 +380,51 @@ test('provider active cannot claim audio resumed when the SDK peer connection is
     t.sdk.getPeerConnection = () => ({pc: null});
     await t.obj.check_browser_network(t.client, true);
     assert.match(t.obj.browser_softphone_network_message(), /checking call status/);
+});
+
+test('Stop retries honor server cooldown without blocking a different call', async () => {
+    const t = setup();
+    let stops = 0;
+    t.obj.load = () => {};
+    t.ctx.frappe.call = arg => {
+        if (typeof arg === 'string') {
+            stops++;
+            return Promise.resolve({message: {pending_provider: true, retry_after: 30}});
+        }
+        return Promise.resolve({message: {name: 'C1', status: 'Connected'}});
+    };
+    await t.obj.cancel_call_log('C1');
+    for (let i = 0; i < 5; i++) {
+        t.advance(3000);
+        await t.obj.cancel_call_log('C1');
+    }
+    assert.equal(stops, 1);
+    t.advance(16000);
+    await t.obj.cancel_call_log('C1');
+    assert.equal(stops, 2);
+    await t.obj.cancel_call_log('C2');
+    assert.equal(stops, 3);
+});
+
+test('late customer outcome only refreshes matching display and preserves the new call', () => {
+    const t = setup();
+    const displayed = {name: 'OLD', status: 'Cancelled'};
+    const newer = {name: 'NEW', status: 'Connected'};
+    let statusText, renders = 0;
+    t.obj.state.workdesk_live_call = displayed;
+    t.obj.state.active_call = newer;
+    t.obj.post_call_disposition = {
+        call_log: 'OLD', dialog: {$wrapper: {find: () => ({text: value => {statusText = value;}})}},
+    };
+    t.obj.render_workdesk_live_call = () => {renders++;};
+    t.obj.handle_call_disconnected = () => {throw new Error('Must not repeat completion');};
+    t.obj.maybe_prompt_workdesk_disposition = () => {throw new Error('Must not open another dialog');};
+    t.obj.handle_call_outcome_corrected({name: 'OLD', status: 'Busy', customer_leg_attempted: true});
+    assert.equal(displayed.status, 'Busy');
+    assert.equal(newer.status, 'Connected');
+    assert.equal(statusText, 'Busy');
+    assert.equal(renders, 1);
+    const legs = t.obj.live_call_steps({name: 'OLD', status: 'Busy', call_flow: 'Customer First', customer_leg_attempted: true});
+    assert.equal(legs[0].state, 'done');
+    assert.equal(legs[1].state, 'failed');
 });

@@ -222,7 +222,7 @@ class BrowserOwnershipTests(unittest.TestCase):
         self.assertEqual(ownership.presence_heartbeat("new-window", claim_idle=1)["ownership"], "other_window")
         self.now += 66
         self.mapping.current_call_log = "CALL"
-        self.assertEqual(ownership.presence_heartbeat("new-window", claim_idle=1)["ownership"], "other_window")
+        self.assertEqual(ownership.presence_heartbeat("new-window", claim_idle=1)["ownership"], "active_call")
         self.assertEqual(self.get(ownership.owner_key("agent")), "live-window")
 
     def test_selected_window_reload_finishes_abandoned_transfer_after_lease_expiry(self):
