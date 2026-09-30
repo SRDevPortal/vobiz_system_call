@@ -31,6 +31,10 @@ class VobizAgentConsole {
 		this.page = page;
 		this.state = {
 			queue: [],
+			console_view: 'queue',
+			encounter_page: 1,
+			encounters: [],
+			encounter_columns: [],
 			queue_meta: this.default_queue_meta(),
 			selected: null,
 			selected_queue_keys: new Set(),
@@ -169,6 +173,32 @@ class VobizAgentConsole {
 					</div>
 				</div>
 
+                <div class="vobiz-tabs">
+                    <button class="active" data-console-view="queue">${__('Lead / Patient Queue')}</button>
+                    <button data-console-view="encounters">${__('Patient Encounter List')}</button>
+                </div>
+                <section class="vobiz-band hidden" data-role="encounter-panel">
+                    <div class="vobiz-section-title">
+                        <h3>${__('Patient Encounter List')}</h3>
+                        <div class="vobiz-queue-tools">
+                            <input class="form-control input-sm" data-role="encounter-search" placeholder="${__('Search encounter or patient')}">
+                            <button class="btn btn-default btn-sm" data-action="refresh-encounters">${__('Refresh')}</button>
+                            ${frappe.user.has_role('System Manager') ? '<button class="btn btn-default btn-sm" data-action="encounter-settings">' + __('Settings') + '</button>' : ''}
+                        </div>
+                    </div>
+                    <div class="vobiz-table-wrap">
+                        <table class="table table-sm vobiz-table" data-role="encounter-table">
+                            <thead></thead><tbody></tbody>
+                        </table>
+                    </div>
+                    <div class="vobiz-pagination">
+                        <span data-role="encounter-page-label"></span>
+                        <div class="vobiz-page-controls">
+                            <button class="btn btn-default btn-sm" data-action="encounter-prev">${__('Previous')}</button>
+                            <button class="btn btn-default btn-sm" data-action="encounter-next">${__('Next')}</button>
+                        </div>
+                    </div>
+                </section>
 				<section class="vobiz-band vobiz-dialer-control">
 					<div>
 						<strong>${__('Auto-Dial Controls')}</strong>
@@ -581,6 +611,28 @@ class VobizAgentConsole {
 
 	bind() {
 		const $main = this.page.main;
+        $main.on('click', '[data-console-view]', (e) => {
+            this.state.console_view = $(e.currentTarget).attr('data-console-view');
+            const encounters = this.state.console_view === 'encounters';
+            $main.find('[data-console-view]').removeClass('active');
+            $(e.currentTarget).addClass('active');
+            $main.find('[data-role="encounter-panel"]').toggleClass('hidden', !encounters);
+            $main.find('.vobiz-layout, .vobiz-dialer-control').toggleClass('hidden', encounters);
+            if (encounters) this.load_encounters();
+        });
+        $main.on('click', '[data-action="encounter-settings"]', () => frappe.set_route('Form', 'Vobiz Settings'));
+        $main.on('click', '[data-action="refresh-encounters"]', () => this.load_encounters());
+        $main.on('click', '[data-action="encounter-prev"], [data-action="encounter-next"]', (e) => {
+            const next = $(e.currentTarget).attr('data-action') === 'encounter-next';
+            if (next && !this.state.encounter_has_more) return;
+            this.state.encounter_page = Math.max(1, this.state.encounter_page + (next ? 1 : -1));
+            this.load_encounters();
+        });
+        $main.on('input', '[data-role="encounter-search"]', () => {
+            clearTimeout(this.encounter_search_timer);
+            this.state.encounter_page = 1;
+            this.encounter_search_timer = setTimeout(() => this.load_encounters(), 300);
+        });
 		$main.on('click', '[data-action="refresh"]', () => this.load());
 		$main.on('click', '[data-action="open-analytics"]', () => frappe.set_route('vobiz-agent-analytics'));
 		$main.on('click', '[data-action="end-active-call"]', () => this.end_header_active_call());
@@ -602,6 +654,10 @@ class VobizAgentConsole {
 		$main.on('click', '[data-action="queue-page-next"]', () => this.change_queue_page(1));
 		$main.on('click', '[data-action="call-row"]', (e) => {
 			e.stopPropagation();
+            if ($(e.currentTarget).closest('[data-role="encounter-table"]').length) {
+                this.call_encounter_row($(e.currentTarget).closest('tr').data('index'));
+                return;
+            }
 			this.call_row($(e.currentTarget).closest('tr').data('index'));
 		});
 		$main.on('click', '[data-action="open-missed-calls"]', (e) => {
@@ -3598,6 +3654,73 @@ class VobizAgentConsole {
 		`);
 	}
 
+    async load_encounters() {
+        const requestId = this.encounter_request_id = (this.encounter_request_id || 0) + 1;
+        const table = this.page.main.find('[data-role="encounter-table"]');
+        table.find('thead').empty();
+        table.find('tbody').html('<tr><td>' + __('Loading...') + '</td></tr>');
+        this.page.main.find('[data-action="encounter-prev"], [data-action="encounter-next"]').prop('disabled', true);
+        try {
+            const result = await frappe.call({
+                method: 'vobiz_click_to_call.api.encounter_queue.get_queue',
+                args: {
+                    limit: 25, limit_start: (this.state.encounter_page - 1) * 25,
+                    search: this.page.main.find('[data-role="encounter-search"]').val() || ''
+                }
+            });
+            if (this.encounter_request_id !== requestId) return;
+            const data = result.message || {};
+            this.state.encounters = data.rows || [];
+            this.state.encounter_columns = data.columns || [];
+            this.state.encounter_has_more = Boolean(data.has_more);
+            this.render_encounters();
+        } catch (error) {
+            if (this.encounter_request_id !== requestId) return;
+            this.state.encounters = [];
+            this.state.encounter_has_more = false;
+            table.find('tbody').html('<tr><td>' + __('Unable to load encounters. Check queue settings and your access, then refresh.') + '</td></tr>');
+        }
+    }
+
+    render_encounters() {
+        const escape = frappe.utils.escape_html;
+        const columns = this.state.encounter_columns;
+        const table = this.page.main.find('[data-role="encounter-table"]');
+        table.find('thead').html('<tr>' + columns.map(c => '<th>' + escape(__(c.label)) + '</th>').join('') + '<th>' + __('Action') + '</th></tr>');
+        table.find('tbody').html(this.state.encounters.map((row, index) => {
+            const loading = this.state.encounter_detail_loading === row.name;
+            return '<tr data-index="' + index + '">' + columns.map(c =>
+                '<td>' + escape(String(row[c.fieldname] == null ? '' : row[c.fieldname])) + '</td>'
+            ).join('') + '<td><button class="btn btn-xs btn-primary" data-action="call-row" ' +
+                (loading ? 'disabled' : '') + '><i class="fa fa-phone"></i> ' +
+                (loading ? __('Loading') : __('Details')) + '</button></td></tr>';
+        }).join('') || '<tr><td colspan="' + (columns.length + 1) + '">' + __('No matching patient encounters') + '</td></tr>');
+        this.page.main.find('[data-role="encounter-page-label"]').text(__('Page {0}', [this.state.encounter_page]));
+        this.page.main.find('[data-action="encounter-prev"]').prop('disabled', this.state.encounter_page <= 1);
+        this.page.main.find('[data-action="encounter-next"]').prop('disabled', !this.state.encounter_has_more);
+    }
+
+    async call_encounter_row(index) {
+        const encounter = this.state.encounters[index];
+        if (!encounter || this.state.encounter_detail_loading || this.state.detail_loading_key) return;
+        this.state.encounter_detail_loading = encounter.name;
+        this.render_encounters();
+        try {
+            const result = await frappe.call({
+                method: 'vobiz_click_to_call.api.encounter_queue.get_encounter_context',
+                args: { encounter: encounter.name }
+            });
+            const context = result.message || {};
+            const row = Object.assign({}, context.reference, {doctype: 'Patient', encounter_name: encounter.name});
+            this.state.context = context;
+            this.apply_context_dispositions(context);
+            this.open_detail_dialog(row, context);
+        } finally {
+            this.state.encounter_detail_loading = null;
+            this.render_encounters();
+        }
+    }
+
 	call_row(index) {
 		const row = this.state.queue[index];
 		if (!row) return;
@@ -3871,7 +3994,7 @@ class VobizAgentConsole {
 			<div class="vobiz-detail-dialog">
 				<div data-workdesk-incoming></div>
 				<div class="vobiz-tabs">
-					<button class="active" data-detail-tab="summary">${frappe.utils.escape_html(this.queue_meta_value('summary_tab_label'))}</button>
+					<button class="active" data-detail-tab="summary">${frappe.utils.escape_html(row.doctype || this.queue_meta_value('summary_tab_label'))}</button>
 					<button data-detail-tab="encounters">${__('Encounters')}</button>
 					<button data-detail-tab="clinical-history">${__('Patient Clinical History')}</button>
 					<button data-detail-tab="reports">${__('Reports')}</button>
@@ -4381,6 +4504,7 @@ class VobizAgentConsole {
 		return `
 			<div class="vobiz-workdesk-top">
 				<div class="vobiz-workdesk-title">
+                        ${row.encounter_name ? '<div class="text-muted">' + __('Patient Encounter') + ': <a href="/app/patient-encounter/' + encodeURIComponent(row.encounter_name) + '">' + frappe.utils.escape_html(row.encounter_name) + '</a></div>' : ''}
 					<h3>${frappe.utils.escape_html(row.title || row.name || '')}</h3>
 					<div class="vobiz-call-route">
 						<span class="vobiz-call-route-chip">${__('Agent')}: ${frappe.utils.escape_html(agent_number)}</span>
@@ -4391,7 +4515,7 @@ class VobizAgentConsole {
 				</div>
 				<div class="vobiz-workdesk-actions">
 					<button class="btn btn-primary btn-sm" data-workdesk-action="call"><i class="fa fa-phone"></i> ${__('Start Call')}</button>
-					<button class="btn btn-default btn-sm" data-workdesk-action="open-lead"><i class="fa fa-external-link"></i> ${__('Open')} ${frappe.utils.escape_html(this.queue_meta_value('summary_tab_label'))}</button>
+					<button class="btn btn-default btn-sm" data-workdesk-action="open-lead"><i class="fa fa-external-link"></i> ${__('Open')} ${frappe.utils.escape_html(row.doctype || this.queue_meta_value('summary_tab_label'))}</button>
 					<button class="btn btn-default btn-sm" data-workdesk-action="whatsapp"><i class="fa fa-whatsapp"></i> ${workdesk.whatsapp && workdesk.whatsapp.conversation ? __('Open WhatsApp') : __('WhatsApp')}</button>
 					<button class="btn btn-default btn-sm" data-workdesk-action="new-encounter"><i class="fa fa-file-text-o"></i> ${__('Create Encounter')}</button>
 				</div>

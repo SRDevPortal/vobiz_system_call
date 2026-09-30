@@ -11,6 +11,7 @@ from xml.sax.saxutils import escape, quoteattr
 
 import frappe
 from frappe import _
+from vobiz_click_to_call.services.queue_sources import queue_includes, queue_source_options
 from frappe.rate_limiter import rate_limit
 from werkzeug.wrappers import Response
 
@@ -555,8 +556,8 @@ def _select_inbound_agent(primary_user, patient=None, candidate_users=None, list
         settings = get_settings()
         device = get_call_device(settings, mapping)
         browser = device == CALL_DEVICE_BROWSER_SOFTPHONE
-        route_matches = (mapping.get("queue_source") in ("Patient", "CRM Lead and Patient")
-                         and patient_matches_mapping(patient, mapping)) if patient is not None else mapping.get("queue_source") != "Patient"
+        route_matches = (queue_includes(mapping.get("queue_source"), "Patient")
+                         and patient_matches_mapping(patient, mapping)) if patient is not None else any(source != "Patient" for source in queue_source_options(mapping.get("queue_source")))
         eligible = ((route_matches or listed_only) and device in (CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_MOBILE_BRIDGE)
                     and device_enabled(device, settings) and mapping.get("enabled") != 0
                     and not mapping.current_call_log and mapping.availability_status == "Available"
