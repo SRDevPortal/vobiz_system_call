@@ -110,6 +110,7 @@ class BrowserSafetyTests(unittest.TestCase):
 
     def test_mobile_incoming_routes_without_browser_presence_and_records_device(self):
         import json
+        self.replace(webrtc, "get_settings", lambda: frappe._dict(enabled=1, agent_call_device="Mobile Bridge", enable_mobile_bridge=1))
         caller, did, mobile = "+919876545966", "+911234565565", "+911234567890"
         mapping = row(name="MAP", current_call_log="", enabled=1, availability_status="Available",
                       accept_calls=1, agent_mobile=mobile, agent_call_device="Mobile Bridge", browser_softphone_enabled=0)
@@ -1303,7 +1304,7 @@ class BrowserSafetyTests(unittest.TestCase):
         cache.get_value.side_effect = lambda *a, **kw: None
         self.assertFalse(lifecycle.healthy_browser_call(current))
 
-    def test_restricted_browser_devices_route_through_server_bridge(self):
+    def test_restricted_browser_keeps_console_requirement_without_mobile_fallback(self):
         from vobiz_click_to_call import number_privacy
         settings = frappe._dict(enabled=1)
         profile = row(user=frappe.session.user, availability_status="Available")
@@ -1312,24 +1313,15 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(lifecycle, "lock_mapping", lambda _: profile)
         self.replace(lifecycle, "assert_available", lambda _: None)
         enabled = self.replace(call, "assert_device_enabled", MagicMock())
-        devices = self.replace(call, "get_call_device", MagicMock(
-            side_effect=["Browser Softphone", "System Dialer"]))
+        self.replace(call, "get_call_device", lambda *_: "Browser Softphone")
         self.replace(number_privacy, "restricted", lambda: True)
-        bridge = self.replace(call.core_call, "start_call", MagicMock(
-            return_value={"call_log": "CALL-PRIVATE", "customer_number": "******7890"}))
-        for expected_device in ("Browser Softphone", "System Dialer"):
-            with self.subTest(device=expected_device):
-                result = call.start_call("Patient", "PAT-1", "privacy:v1:choice", None, 1)
-                self.assertEqual(result["call_device"], "Mobile Bridge")
-                self.assertTrue(result["privacy_routed"])
-                self.assertNotIn("destination", result)
-                self.assertNotIn("dial_url", result)
-        self.assertEqual(devices.call_count, 2)
-        self.assertEqual(bridge.call_count, 2)
-        self.assertEqual([entry.args[0] for entry in enabled.call_args_list],
-                         ["Mobile Bridge", "Mobile Bridge"])
+        bridge = self.replace(call.core_call, "start_call", MagicMock())
+        with self.assertRaises(ValueError):
+            call.start_call("Patient", "PAT-1", "privacy:v1:choice", None, 1)
+        bridge.assert_not_called()
+        enabled.assert_called_once_with("Browser Softphone", settings)
 
-    def test_restricted_call_stops_when_mobile_bridge_is_disabled(self):
+    def test_restricted_system_dialer_is_rejected_instead_of_switching_devices(self):
         from vobiz_click_to_call import number_privacy
         settings = frappe._dict(enabled=1)
         profile = row(user=frappe.session.user, availability_status="Available")
@@ -1337,14 +1329,11 @@ class BrowserSafetyTests(unittest.TestCase):
         self.replace(call, "is_enabled", lambda _: True)
         self.replace(lifecycle, "lock_mapping", lambda _: profile)
         self.replace(lifecycle, "assert_available", lambda _: None)
-        self.replace(call, "get_call_device", lambda *_: "Browser Softphone")
+        self.replace(call, "get_call_device", lambda *_: "System Dialer")
         self.replace(number_privacy, "restricted", lambda: True)
-        enabled = self.replace(call, "assert_device_enabled", MagicMock(
-            side_effect=frappe.ValidationError("Mobile Bridge is disabled.")))
         bridge = self.replace(call.core_call, "start_call", MagicMock())
-        with self.assertRaises(frappe.ValidationError):
+        with self.assertRaisesRegex(ValueError, "System Dialer exposes"):
             call.start_call("Patient", "PAT-1", "privacy:v1:choice", None, 1)
-        enabled.assert_called_once_with("Mobile Bridge", settings)
         bridge.assert_not_called()
 
     def test_full_view_browser_device_keeps_console_requirement(self):

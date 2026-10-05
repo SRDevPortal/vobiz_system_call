@@ -2399,7 +2399,7 @@ class VobizAgentConsole {
 		softphone.conference_join_started_at = Date.now();
 		let dialAttempted = false;
 		return this.connect_browser_softphone().then(() => {
-			softphone.current_destination = message.conference_recovery ? message.customer_number : (message.destination || message.customer_number);
+			softphone.current_destination = (message.private_browser_call || message.conference_recovery) ? message.customer_number : (message.destination || message.customer_number);
 			softphone.current_customer = row.title || row.name || __('Customer');
 			softphone.direction = __('Outgoing');
 			softphone.in_call = true;

@@ -55,17 +55,8 @@ def start_call(
     lifecycle.assert_available(profile)
     system_settings = get_settings()
     call_device = get_call_device(system_settings, profile)
-    if number_privacy.restricted():
-        assert_device_enabled(CALL_DEVICE_MOBILE_BRIDGE, system_settings)
-        result = core_call.start_call(
-            reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected
-        )
-        result.update({
-            "call_device": CALL_DEVICE_MOBILE_BRIDGE,
-            "privacy_routed": True,
-            "message": _("Privacy-protected call started through Mobile Bridge."),
-        })
-        return result
+    if number_privacy.restricted() and call_device == CALL_DEVICE_SYSTEM_DIALER:
+        frappe.throw(_("System Dialer exposes customer numbers. Enable Browser Softphone or select Mobile Bridge."))
 
     assert_device_enabled(call_device, system_settings)
     if call_device not in {CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
@@ -253,6 +244,8 @@ def start_browser_softphone_call(
     if not endpoint_uri:
         frappe.throw(_("Browser Softphone Endpoint URI is missing on your Vobiz User Mapping."))
 
+    from vobiz_system_call.api import private_routing
+    private_context = private_routing.prepare(caller_id, customer_number) if number_privacy.restricted() else {}
     core_call.mark_mapping_busy(mapping["name"], call_log.name)
     updates = {
         "status": "Initiated",
@@ -272,6 +265,7 @@ def start_browser_softphone_call(
                 "caller_id": caller_id,
                 "call_flow": call_flow,
                 "source": "vobiz_system_call",
+                **private_context,
             },
             indent=2,
             default=str,
@@ -305,9 +299,8 @@ def start_browser_softphone_call(
         "call_device": CALL_DEVICE_BROWSER_SOFTPHONE,
         "browser_softphone": True,
         "provider_session_recording": bool(frappe.utils.cint(settings.get("enable_recording"))),
-        "destination": customer_number,
+        **private_routing.browser_payload(call_log),
         "call_flow": call_flow,
-        "customer_number": customer_number,
         "agent_mobile_display": mask_phone(user_mobile) if user_mobile else endpoint_username,
         "message": _("Browser softphone call prepared."),
         **recovery,

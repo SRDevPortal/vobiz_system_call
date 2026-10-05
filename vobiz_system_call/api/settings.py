@@ -57,8 +57,15 @@ def device_enabled(device, settings=None):
 
 def get_call_device(settings=None, profile=None) -> str:
     settings = settings or get_settings()
-    selected = (profile or {}).get("agent_call_device")
-    value = selected if selected and selected != "Use Default" else settings.get("agent_call_device")
+    profile = profile or {}
+    if profile.get("browser_softphone_enabled") is not None:
+        # User Mapping's checkbox is authoritative; otherwise use the site default.
+        value = (CALL_DEVICE_BROWSER_SOFTPHONE if frappe.utils.cint(profile.get("browser_softphone_enabled"))
+                 else settings.get("agent_call_device"))
+    else:
+        # Preserve compatibility for callers that do not supply a complete mapping.
+        selected = profile.get("agent_call_device")
+        value = selected if selected and selected != "Use Default" else settings.get("agent_call_device")
     value = (value or CALL_DEVICE_MOBILE_BRIDGE).strip()
     if value not in {CALL_DEVICE_MOBILE_BRIDGE, CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
         frappe.throw(_("Invalid Agent Call Device."))

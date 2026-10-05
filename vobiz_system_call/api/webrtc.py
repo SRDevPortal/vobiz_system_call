@@ -470,6 +470,17 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
     mapping, row = lifecycle.lock_call(mapping.current_call_log)
     if conference.state(row):
         return conference.answer_agent(raw_from, raw_to, payload)
+    from vobiz_system_call.api import private_routing
+    private = private_routing.state(row)
+    if private:
+        if not private_routing.matches(row, raw_to, payload):
+            frappe.db.rollback()
+            return _xml_response(_hangup_xml())
+        # Resolve only from the locked, authorized call; never trust browser To.
+        destination = _number(row.customer_number)
+    elif private_routing.header(payload):
+        frappe.db.rollback()
+        return _xml_response(_hangup_xml())
     if conference.browser_route(payload):
         # A delayed conference invite must never enter the ordinary Dial path.
         frappe.db.commit()

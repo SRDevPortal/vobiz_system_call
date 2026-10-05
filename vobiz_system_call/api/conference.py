@@ -76,8 +76,11 @@ def browser_join(row, value):
     # Vobiz invokes the endpoint application for number destinations; arbitrary
     # SIP usernames are rejected before our answer URL. The signed application
     # callback plus this one-call route token select a conference, never Dial.
-    return {"destination": row.customer_number, "conference_generation": value["generation"],
-            "conference_headers": {"X-VH-VSC": value["route"]}}
+    from vobiz_system_call.api import private_routing
+    result = private_routing.browser_payload(row)
+    headers = result.get("conference_headers", {})
+    headers["X-VH-VSC"] = value["route"]
+    return {**result, "conference_generation": value["generation"], "conference_headers": headers}
 
 
 def browser_route(payload):
@@ -179,9 +182,14 @@ def answer_agent(raw_from, raw_to, payload):
     mapping, row = lifecycle.lock_call(mapping.current_call_log)
     value = state(row)
     uuid = webrtc._provider_uuid(payload)
+    from vobiz_system_call.api import private_routing
+    private = private_routing.state(row)
+    target_matches = (private_routing.matches(row, raw_to, payload) if private
+                      else not private_routing.header(payload)
+                      and webrtc._number(raw_to) == webrtc._number(row.customer_number))
     if (not value or row.direction != "Outgoing" or not uuid or stopped(row, value)
             or get_profile_endpoint_uri(mapping.as_dict()) != raw_from
-            or webrtc._number(raw_to) != webrtc._number(row.customer_number)
+            or not target_matches
             or browser_route(payload) != value["route"]
             or not bind_agent(row, value, uuid)):
         frappe.db.commit()
