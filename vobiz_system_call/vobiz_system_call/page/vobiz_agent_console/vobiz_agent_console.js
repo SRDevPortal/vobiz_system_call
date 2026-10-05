@@ -3028,6 +3028,11 @@ class VobizAgentConsole {
 	}
 
 	softphone_incoming_matches_row(row) {
+		if (row && row.phone_masked) {
+			const call = this.state.workdesk_live_call || {};
+			return Boolean(call.name && call.name === this.state.softphone.current_call_log
+				&& call.reference_doctype === row.doctype && call.reference_name === row.name);
+		}
 		const incoming = this.phone_digits((this.state.softphone || {}).incoming_caller);
 		const rowPhone = this.phone_digits(row && row.phone);
 		if (!incoming || !rowPhone) return false;
@@ -6202,7 +6207,8 @@ class VobizAgentConsole {
 				reference_doctype: row.doctype,
 				reference_name: row.name,
 				phone_field: patientPhone ? patientPhone.fieldname : row.phone_field,
-				phone_number: patientPhone ? patientPhone.number : row.phone,
+				phone_number: String(patientPhone ? patientPhone.fieldname : row.phone_field).startsWith('privacy:')
+					? null : (patientPhone ? patientPhone.number : row.phone),
 				patient_phone_selected: patientPhone ? 1 : 0,
 				client_context: 'agent_console',
 				tab_id: this.get_softphone_tab_id()

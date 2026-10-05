@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 import frappe
+from vobiz_click_to_call import number_privacy
 from vobiz_click_to_call.services.reference_sync import request_reference_sync
 from frappe import _
 
@@ -18,6 +19,7 @@ from vobiz_click_to_call.services.safety import assert_call_allowed
 from vobiz_click_to_call.services.settings import get_allowed_doctypes, get_default_country_code, get_settings as get_core_settings
 from vobiz_system_call.api.settings import (
     CALL_DEVICE_BROWSER_SOFTPHONE,
+    CALL_DEVICE_MOBILE_BRIDGE,
     CALL_DEVICE_SYSTEM_DIALER,
     build_system_dialer_url,
     get_call_device,
@@ -53,6 +55,18 @@ def start_call(
     lifecycle.assert_available(profile)
     system_settings = get_settings()
     call_device = get_call_device(system_settings, profile)
+    if number_privacy.restricted():
+        assert_device_enabled(CALL_DEVICE_MOBILE_BRIDGE, system_settings)
+        result = core_call.start_call(
+            reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected
+        )
+        result.update({
+            "call_device": CALL_DEVICE_MOBILE_BRIDGE,
+            "privacy_routed": True,
+            "message": _("Privacy-protected call started through Mobile Bridge."),
+        })
+        return result
+
     assert_device_enabled(call_device, system_settings)
     if call_device not in {CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
         return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)

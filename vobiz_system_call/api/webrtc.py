@@ -11,6 +11,7 @@ from xml.sax.saxutils import escape, quoteattr
 
 import frappe
 from frappe import _
+from vobiz_click_to_call import number_privacy
 from vobiz_click_to_call.services.queue_sources import queue_includes, queue_source_options
 from frappe.rate_limiter import rate_limit
 from werkzeug.wrappers import Response
@@ -82,7 +83,7 @@ def _conference_resume_call(profile):
                               ["name", "user", "status", "request_json", "customer_number"], as_dict=True)
     if (row and row.user == frappe.session.user and conference.state(row)
             and row.status not in lifecycle.TERMINAL):
-        return {"name": row.name, "customer_number": row.customer_number,
+        return {"name": row.name, "customer_number": number_privacy.display_number(row.customer_number),
                 "conference_generation": conference.state(row)["generation"]}
     return None
 
@@ -179,7 +180,8 @@ def get_incoming_call(caller: str, tab_id: str):
         frappe.throw(_("Incoming call does not match the routed call."))
     frappe.db.commit()
     return {
-        "call_log": row.name, "call_uuid": row.call_uuid, "customer_number": row.customer_number,
+        "call_log": row.name, "call_uuid": row.call_uuid,
+        "customer_number": number_privacy.display_number(row.customer_number),
         "status": row.status, "direction": row.direction,
         "reference_doctype": row.reference_doctype, "reference_name": row.reference_name,
     }

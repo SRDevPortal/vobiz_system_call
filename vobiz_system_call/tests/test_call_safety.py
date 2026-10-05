@@ -24,6 +24,8 @@ def row(**values):
 class BrowserSafetyTests(unittest.TestCase):
     def setUp(self):
         self.patches = []
+        from vobiz_click_to_call import number_privacy
+        self.replace(number_privacy, "display_number", lambda value, user=None: value)
         from vobiz_click_to_call.services import recovery_policy
         # Cooldown/concurrency behavior has its own recovery-policy tests.
         self.replace(recovery_policy, "attempt", lambda *a, **kw: nullcontext(True))
@@ -183,6 +185,35 @@ class BrowserSafetyTests(unittest.TestCase):
         self.assertEqual(webrtc.get_incoming_call("primary-did", "tab")["call_log"], "IN")
         with self.assertRaises(ValueError):
             webrtc.get_incoming_call("unrelated-did", "tab")
+
+    def test_incoming_call_projects_customer_number_after_route_validation(self):
+        from vobiz_click_to_call import number_privacy
+        self.replace(lifecycle, "presence", lambda _: "tab")
+        self.replace(webrtc, "get_system_call_profile", lambda: {"current_call_log": "IN"})
+        self.replace(webrtc, "_number", lambda value: value)
+        incoming = row(name="IN", direction="Incoming", status="Ringing", did_number="business-did",
+                       customer_number="1234567890", reference_doctype="Patient", reference_name="PAT-1",
+                       request_json='{"source":"vobiz_system_call","call_device":"Browser Softphone","reference_route":true}')
+        mapping = row(current_call_log="IN", caller_id="business-did")
+        self.replace(lifecycle, "lock_call", lambda _: (mapping, incoming))
+        display = self.replace(number_privacy, "display_number", MagicMock(return_value="******7890"))
+        result = webrtc.get_incoming_call("business-did", "tab")
+        self.assertEqual(result["customer_number"], "******7890")
+        self.assertEqual(result["reference_name"], "PAT-1")
+        display.assert_called_once_with("1234567890")
+
+    def test_conference_recovery_projects_customer_number(self):
+        from vobiz_click_to_call import number_privacy
+        recovered = row(name="CALL-RECOVERY", status="Connected", customer_number="1234567890",
+                        request_json='{"source":"vobiz_system_call","call_device":"Browser Softphone","conference":{"generation":2}}')
+        self.db.get_value.return_value = recovered
+        from vobiz_system_call.api import conference
+        self.replace(conference, "state", lambda _: {"generation": 2})
+        display = self.replace(number_privacy, "display_number", MagicMock(return_value="******7890"))
+        result = webrtc._conference_resume_call({"current_call_log": recovered.name})
+        self.assertEqual(result, {"name": recovered.name, "customer_number": "******7890",
+                                  "conference_generation": 2})
+        display.assert_called_once_with("1234567890")
 
     def test_patient_route_requires_queue_department_and_followup(self):
         from vobiz_click_to_call.services import safety
@@ -1271,6 +1302,67 @@ class BrowserSafetyTests(unittest.TestCase):
         self.assertFalse(lifecycle.healthy_browser_call(current))
         cache.get_value.side_effect = lambda *a, **kw: None
         self.assertFalse(lifecycle.healthy_browser_call(current))
+
+    def test_restricted_browser_devices_route_through_server_bridge(self):
+        from vobiz_click_to_call import number_privacy
+        settings = frappe._dict(enabled=1)
+        profile = row(user=frappe.session.user, availability_status="Available")
+        self.replace(call, "get_settings", lambda: settings)
+        self.replace(call, "is_enabled", lambda _: True)
+        self.replace(lifecycle, "lock_mapping", lambda _: profile)
+        self.replace(lifecycle, "assert_available", lambda _: None)
+        enabled = self.replace(call, "assert_device_enabled", MagicMock())
+        devices = self.replace(call, "get_call_device", MagicMock(
+            side_effect=["Browser Softphone", "System Dialer"]))
+        self.replace(number_privacy, "restricted", lambda: True)
+        bridge = self.replace(call.core_call, "start_call", MagicMock(
+            return_value={"call_log": "CALL-PRIVATE", "customer_number": "******7890"}))
+        for expected_device in ("Browser Softphone", "System Dialer"):
+            with self.subTest(device=expected_device):
+                result = call.start_call("Patient", "PAT-1", "privacy:v1:choice", None, 1)
+                self.assertEqual(result["call_device"], "Mobile Bridge")
+                self.assertTrue(result["privacy_routed"])
+                self.assertNotIn("destination", result)
+                self.assertNotIn("dial_url", result)
+        self.assertEqual(devices.call_count, 2)
+        self.assertEqual(bridge.call_count, 2)
+        self.assertEqual([entry.args[0] for entry in enabled.call_args_list],
+                         ["Mobile Bridge", "Mobile Bridge"])
+
+    def test_restricted_call_stops_when_mobile_bridge_is_disabled(self):
+        from vobiz_click_to_call import number_privacy
+        settings = frappe._dict(enabled=1)
+        profile = row(user=frappe.session.user, availability_status="Available")
+        self.replace(call, "get_settings", lambda: settings)
+        self.replace(call, "is_enabled", lambda _: True)
+        self.replace(lifecycle, "lock_mapping", lambda _: profile)
+        self.replace(lifecycle, "assert_available", lambda _: None)
+        self.replace(call, "get_call_device", lambda *_: "Browser Softphone")
+        self.replace(number_privacy, "restricted", lambda: True)
+        enabled = self.replace(call, "assert_device_enabled", MagicMock(
+            side_effect=frappe.ValidationError("Mobile Bridge is disabled.")))
+        bridge = self.replace(call.core_call, "start_call", MagicMock())
+        with self.assertRaises(frappe.ValidationError):
+            call.start_call("Patient", "PAT-1", "privacy:v1:choice", None, 1)
+        enabled.assert_called_once_with("Mobile Bridge", settings)
+        bridge.assert_not_called()
+
+    def test_full_view_browser_device_keeps_console_requirement(self):
+        from vobiz_click_to_call import number_privacy
+        settings = frappe._dict(enabled=1)
+        profile = row(user=frappe.session.user, availability_status="Available")
+        self.replace(call, "get_settings", lambda: settings)
+        self.replace(call, "is_enabled", lambda _: True)
+        self.replace(lifecycle, "lock_mapping", lambda _: profile)
+        self.replace(lifecycle, "assert_available", lambda _: None)
+        enabled = self.replace(call, "assert_device_enabled", MagicMock())
+        self.replace(call, "get_call_device", lambda *_: "Browser Softphone")
+        self.replace(number_privacy, "restricted", lambda: False)
+        bridge = self.replace(call.core_call, "start_call", MagicMock())
+        with self.assertRaises(ValueError):
+            call.start_call("Patient", "PAT-1")
+        bridge.assert_not_called()
+        enabled.assert_called_once_with("Browser Softphone", settings)
 
 
 if __name__ == "__main__":
