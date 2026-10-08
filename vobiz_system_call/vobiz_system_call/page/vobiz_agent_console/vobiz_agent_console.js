@@ -5636,7 +5636,7 @@ class VobizAgentConsole {
 			const response = r.message || {};
 			const templates = response.templates || [];
 			if (!response.success || !templates.length) {
-				frappe.msgprint(response.message || __('No approved WhatsApp templates found for this conversation.'));
+				frappe.msgprint(response.message || __('No templates enabled for this account. Contact your administrator.'));
 				return;
 			}
 			this.show_workdesk_template_dialog($body, conversation, templates);
@@ -5669,7 +5669,7 @@ class VobizAgentConsole {
 			return `<fieldset style="margin:12px 0;border:0;padding:0"><legend style="font-size:14px;margin-bottom:8px">${escape(title)}</legend>${slots.map(slot => `
 				<div class="form-group">
 					<label style="display:block">${escape(section === 'header' ? __('Header') : __('Message'))} ${escape(slot.placeholder)} <span class="text-danger" aria-hidden="true">*</span>
-						<input type="text" class="form-control" data-wa-template-variable="${section}_${slot.index}" aria-required="true" autocomplete="off" placeholder="${escape(__('Enter a value'))}" />
+						<input type="text" class="form-control" data-wa-template-variable="${section}_${slot.index}" aria-required="true" autocomplete="off" value="${escape((template.autofill_values || {})[section + '_' + slot.index] || '')}" title="${escape(__('Suggested values can be edited before sending.'))}" placeholder="${escape(__('Enter a value'))}" />
 					</label>
 					<div class="text-muted" style="font-size:12px;white-space:pre-wrap">${escape(slot.context)}</div>
 				</div>`).join('')}</fieldset>`;
@@ -5799,7 +5799,7 @@ class VobizAgentConsole {
 						<div class="vobiz-template-send">
 							<label>${__('Template')}</label>
 							<select class="form-control" data-wa-template-select>${options}</select>
-							<div data-wa-template-variables></div>
+							<p class="text-muted">${__("Known variables are autofilled. Review and edit them before sending; fill any blank values.")}</p><div data-wa-template-variables></div>
 							<div class="text-muted" data-wa-template-progress></div>
 							<div class="text-danger" role="alert" data-wa-template-variable-errors style="display:none"></div>
 							<label style="margin-top:12px">${__('Preview')}</label>
