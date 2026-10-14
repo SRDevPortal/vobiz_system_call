@@ -2876,10 +2876,10 @@ class VobizAgentConsole {
 	}
 
 	filtered_queue_rows() {
-		const query = (this.page.main.find('[data-role="search"]').val() || '').toLowerCase();
+		const query = (this.page.main.find('[data-role="search"]').val() || '').trim().toLowerCase();
 		const rows = this.state.queue
 			.map((row, index) => ({ ...row, index }))
-			.filter(row => !query || [row.name, row.title, row.company, row.phone, row.owner, row.status, row.next_action, row.team, row.sr_medical_department, row.sr_dpt_disease, row.sr_dpt_language, row.sr_followup_id, row.sr_followup_day, row.missed_call_status, row.missed_call_time, row.whatsapp_last_message_preview].join(' ').toLowerCase().includes(query));
+			.filter(row => !query || [row.name, row.patient_id, row.title, row.company, row.phone, row.owner, row.status, row.next_action, row.team, row.sr_medical_department, row.sr_dpt_disease, row.sr_dpt_language, row.sr_followup_id, row.sr_followup_day, row.missed_call_status, row.missed_call_time, row.whatsapp_last_message_preview].join(' ').toLowerCase().includes(query));
 		return this.new_missed_calls_first(rows);
 	}
 
