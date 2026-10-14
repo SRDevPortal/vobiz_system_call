@@ -3426,7 +3426,7 @@ class VobizAgentConsole {
 		if (call.recording_status) {
 			rows.push(`<div><strong>${__('Recording')}</strong>: ${frappe.utils.escape_html(call.recording_status)}</div>`);
 		}
-		if (call.recording_url) {
+		if (call.recording_download_url || call.recording_url) {
 			const recordingUrl = call.recording_download_url || `/api/method/vobiz_click_to_call.api.recording.stream?call_log=${encodeURIComponent(call.name || '')}`;
 			rows.push(`<div><a href="${frappe.utils.escape_html(recordingUrl)}" target="_blank" rel="noopener">${__('Open Recording')}</a></div>`);
 		}
@@ -3621,7 +3621,7 @@ class VobizAgentConsole {
 	}
 
 	render_audio(history) {
-		const rows = history.filter(row => row.recording_url || row.recording_status);
+		const rows = history.filter(row => row.recording_available || row.recording_download_url || row.recording_url || row.recording_status);
 		this.page.main.find('[data-role="tab-panel"]').html(`
 			<div class="vobiz-audio-list">
 				${rows.map(row => `
@@ -6123,13 +6123,13 @@ class VobizAgentConsole {
 	}
 
 	detail_audio_html(history) {
-		const rows = this.call_history_latest_first(history).filter(row => row.recording_url || row.recording_status);
+		const rows = this.call_history_latest_first(history).filter(row => row.recording_available || row.recording_download_url || row.recording_url || row.recording_status);
 		return `
 			<div class="vobiz-audio-list">
 				${rows.map(row => `
 					<div class="vobiz-audio-card">
 						<div><strong>${frappe.utils.escape_html(row.name)}</strong></div>
-						<div class="text-muted">${frappe.datetime.str_to_user(row.creation)} • ${frappe.utils.escape_html(row.recording_status || row.status || '')} • ${frappe.utils.escape_html(row.duration_label || '')}</div>
+						<div class="text-muted">${frappe.datetime.str_to_user(row.creation)} • ${frappe.utils.escape_html(row.recording_status || row.status || '')} • ${frappe.utils.escape_html(this.recording_duration_label(row))}</div>
 						${this.audio_player_html(row) || `<div class="text-muted">${__('No audio file yet')}</div>`}
 					</div>
 				`).join('') || `<div class="text-muted">${__('No recording available for this lead.')}</div>`}
@@ -6137,10 +6137,20 @@ class VobizAgentConsole {
 		`;
 	}
 
+	recording_duration_label(row) {
+        const seconds = Number(row.recording_duration);
+        return Number.isFinite(seconds) && seconds > 0 ? `${Math.round(seconds)}s` : __('Duration unavailable');
+    }
+
 	audio_player_html(row) {
 		const url = row.recording_download_url || (row.name && row.recording_url ? `/api/method/vobiz_click_to_call.api.recording.stream?call_log=${encodeURIComponent(row.name)}` : '');
 		if (!url) return '';
-		return `<audio controls preload="none" src="${frappe.utils.escape_html(url)}" style="width:100%; margin-top:8px;"></audio>`;
+		return `<div class="vobiz-recording-player">
+            <audio class="vobiz-recording-audio" controls controlsList="nodownload" preload="none"
+                src="${frappe.utils.escape_html(url)}" style="width:100%; margin-top:8px;"></audio>
+            <div class="text-muted small" data-role="recording-status" role="status" aria-live="polite"></div>
+            <button type="button" class="btn btn-xs btn-default" data-role="retry-recording" hidden>${__('Retry playback')}</button>
+        </div>`;
 	}
 
 	call_selected() {
@@ -7375,3 +7385,34 @@ class VobizAgentConsole {
 		}
 	}
 }
+
+// Native media events do not bubble; capture once for either console owner.
+(() => {
+    if (document.__vobizRecordingFeedback) return;
+    document.__vobizRecordingFeedback = true;
+    for (const type of ['loadstart', 'canplay', 'error']) {
+        document.addEventListener(type, (event) => {
+            const audio = event.target;
+            if (!audio?.matches?.('audio.vobiz-recording-audio')) return;
+            const wrapper = audio.closest('.vobiz-recording-player');
+            const status = wrapper?.querySelector('[data-role="recording-status"]');
+            const retry = wrapper?.querySelector('[data-role="retry-recording"]');
+            if (!status || !retry) return;
+            if (type === 'error') {
+                status.textContent = __('Recording could not be played. Access may have changed or the recording is unavailable.');
+                retry.hidden = false;
+            } else {
+                status.textContent = type === 'loadstart' ? __('Loading recording?') : '';
+                retry.hidden = true;
+            }
+        }, true);
+    }
+    document.addEventListener('click', (event) => {
+        const retry = event.target.closest?.('[data-role="retry-recording"]');
+        if (!retry) return;
+        const audio = retry.closest('.vobiz-recording-player')?.querySelector('audio');
+        if (!audio) return;
+        audio.load();
+        audio.play().catch(() => {}); // The media error handler explains failures.
+    });
+})();
