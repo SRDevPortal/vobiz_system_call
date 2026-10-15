@@ -595,22 +595,22 @@ class BrowserSafetyTests(unittest.TestCase):
             webrtc.update_browser_softphone_call("CALL-1", "onCallTerminated")
         self.db.set_value.assert_not_called()
 
-    def test_manual_complete_saves_only_status_and_releases_exact_call(self):
-        current = row(status="Initiated", answer_time=None, call_status="browserCallStarted", call_uuid="provider-id")
+    def test_manual_complete_requests_hangup_without_marking_active_call_completed(self):
+        current = row(status="Connected", call_status="browser-audio-connected", call_uuid="provider-id")
         current.save = MagicMock()
         mapping = row(name="MAP", current_call_log=current.name)
         self.replace(lifecycle, "lock_mapping", MagicMock(return_value=mapping))
-        get_doc = self.replace(frappe, "get_doc", MagicMock(return_value=current))
+        self.replace(frappe, "get_doc", MagicMock(return_value=current))
         release = self.replace(lifecycle, "release_locked", MagicMock())
-        provider = self.replace(lifecycle.core_call, "VobizClient", MagicMock())
-        before = dict(current)
+        cancel = self.replace(call, "cancel_call", MagicMock(return_value={"pending_provider": True, "retry_after": 5}))
+        self.db.get_value.return_value = "Connected"
         result = call.complete_call_log(current.name)
-        self.assertEqual(result, {"name": current.name, "status": "Completed"})
-        self.assertEqual(dict(current), dict(before, status="Completed"))
-        get_doc.assert_called_once_with("Vobiz Call Log", current.name, for_update=True)
-        current.save.assert_called_once_with(ignore_permissions=True)
-        release.assert_called_once_with(mapping, current)
-        provider.assert_not_called()
+        self.assertTrue(result["pending_provider"])
+        self.assertEqual(result["status"], "Connected")
+        current.save.assert_not_called()
+        release.assert_not_called()
+        self.db.set_value.assert_not_called()
+        cancel.assert_called_once_with(current.name)
         self.db.commit.assert_called_once()
 
     def test_manual_complete_rejects_guest_before_reading_call(self):
@@ -644,16 +644,68 @@ class BrowserSafetyTests(unittest.TestCase):
                 current.save.assert_not_called()
                 self.db.set_value.assert_not_called()
 
-    def test_manual_complete_save_error_does_not_release_or_commit(self):
+    def test_manual_complete_provider_error_does_not_falsely_release(self):
         current = row()
-        current.save = MagicMock(side_effect=RuntimeError("save failed"))
+        current.save = MagicMock()
         self.replace(lifecycle, "lock_mapping", MagicMock(return_value=row(current_call_log=current.name)))
         self.replace(frappe, "get_doc", MagicMock(return_value=current))
+        self.replace(call, "cancel_call", MagicMock(side_effect=RuntimeError("provider unavailable")))
         release = self.replace(lifecycle, "release_locked", MagicMock())
-        with self.assertRaisesRegex(RuntimeError, "save failed"):
+        with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
             call.complete_call_log(current.name)
         release.assert_not_called()
-        self.db.commit.assert_not_called()
+        current.save.assert_not_called()
+        self.db.set_value.assert_not_called()
+
+    def test_dial_hangup_only_normalizes_direct_outgoing_customer(self):
+        payload = {"Event": "DialHangup", "CallStatus": "in-progress"}
+        self.assertEqual(webrtc._dial_callback_state(row(direction="Outgoing"), payload), "hangup")
+        self.assertEqual(webrtc._dial_callback_state(row(direction="Outgoing"), dict(payload, DialStatus="busy")), "busy")
+        self.assertEqual(webrtc._dial_callback_state(row(direction="Incoming"), payload), "dialhangup")
+        self.assertEqual(webrtc._dial_callback_state(row(direction="Outgoing", request_json='{"conference_recovery":{"generation":1}}'), payload), "dialhangup")
+        self.assertEqual(webrtc._dial_callback_state(row(direction="Outgoing"), {"Event":"RecordStop", "CallStatus":"in-progress"}), "recordstop")
+        self.assertEqual(webrtc._dial_callback_state(row(direction="Outgoing"), {"Event":"Redirect", "DialStatus":"completed", "CallStatus":"in-progress"}), "completed")
+
+    def test_verified_hangup_enriches_legacy_completion_without_releasing_new_call(self):
+        from vobiz_click_to_call.services import realtime
+        publish = self.replace(realtime, "publish_call_disconnected", MagicMock())
+        current = row(status="Completed", end_time=None)
+        mapping = row(name="MAP", current_call_log="CALL-NEW")
+        self.replace(frappe, "get_doc", MagicMock(return_value=current))
+        result = lifecycle.finish_locked(mapping, current, "provider-dial-ended", confirmed_end=True)
+        self.assertEqual(result, "Completed")
+        values = self.db.set_value.call_args.args[2]
+        self.assertIn("end_time", values)
+        self.assertNotIn("status", values)
+        self.assertEqual(mapping.current_call_log, "CALL-NEW")
+        self.assertEqual(self.db.set_value.call_args.args[0], "Vobiz Call Log")
+        publish.assert_called_once_with(current)
+        self.db.set_value.reset_mock()
+        current.end_time = values["end_time"]
+        lifecycle.finish_locked(mapping, current, "provider-dial-ended", confirmed_end=True)
+        self.db.set_value.assert_not_called()
+        self.assertEqual(publish.call_count, 1)
+
+    def test_unverified_manual_status_does_not_invent_end_time(self):
+        current = row(status="Completed", end_time=None)
+        lifecycle.finish_locked(row(current_call_log="CALL-NEW"), current, "terminated")
+        self.db.set_value.assert_not_called()
+
+    def test_authenticated_dialhangup_finishes_without_browser_end_event(self):
+        current = row(direction="Outgoing", call_uuid="parent-uuid")
+        mapping = row(name="MAP", current_call_log=current.name)
+        self.db.get_value.return_value = current
+        self.replace(webrtc, "_provider_call_token", lambda value: "correct")
+        self.replace(webrtc, "_request_params", lambda: {"Event": "DialHangup", "CallStatus": "in-progress"})
+        self.replace(lifecycle, "lock_call", lambda value: (mapping, current))
+        finish = self.replace(lifecycle, "finish_locked", MagicMock())
+        self.replace(lifecycle, "enqueue_reconcile", MagicMock())
+        self.replace(webrtc, "_append_callback_if_enabled", MagicMock())
+        response = webrtc.provider_event(current.name, "correct")
+        self.assertEqual(response.status_code, 200)
+        finish.assert_called_once()
+        self.assertEqual(finish.call_args.kwargs["status"], "Completed")
+        self.assertTrue(finish.call_args.kwargs["confirmed_end"])
 
     def test_callback_job_arguments_bind_to_actual_worker(self):
         self.replace(webrtc, "get_settings", lambda: frappe._dict(store_raw_payloads=1))
@@ -814,8 +866,10 @@ class BrowserSafetyTests(unittest.TestCase):
         finish = self.setup_static_hangup({"CallUUID": "provider-uuid", "Event": "Hangup"}, status="Failed")
         release = self.replace(lifecycle, "release_locked", MagicMock())
         webrtc.hangup("valid")
-        finish.assert_not_called()
-        release.assert_called_once()
+        finish.assert_called_once()
+        self.assertEqual(finish.call_args.kwargs["status"], "Failed")
+        self.assertTrue(finish.call_args.kwargs["confirmed_end"])
+        release.assert_not_called()  # finish_locked owns the guarded release
 
     def test_static_hangup_preserves_busy_classification(self):
         finish = self.setup_static_hangup({"CallUUID": "provider-uuid", "Event": "Hangup",

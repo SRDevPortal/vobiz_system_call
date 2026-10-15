@@ -309,7 +309,7 @@ def start_browser_softphone_call(
 
 @frappe.whitelist(methods=["POST"])
 def complete_call_log(call_log: str):
-    """Agent-requested manual completion, equivalent to saving Status=Completed."""
+    """Request termination; completion still requires provider confirmation."""
     if frappe.session.user == "Guest":
         frappe.throw(_("Login required."))
     # Lock in the same order as call start/cancellation, and bind the action to
@@ -324,13 +324,13 @@ def complete_call_log(call_log: str):
         return {"name": doc.name, "status": doc.status}
     if mapping.current_call_log != doc.name:
         frappe.throw(_("This is no longer your current call. Refresh and try again."))
-    doc.status = "Completed"
-    # The agent may only perform this fixed transition on their own reserved
-    # call; normal save hooks still run, just as for a manual form edit.
-    doc.save(ignore_permissions=True)
-    lifecycle.release_locked(mapping, doc)
+    # Release locks before provider I/O. Existing cancellation reconciles the
+    # exact call and retains its reservation until termination is confirmed.
     frappe.db.commit()
-    return {"name": doc.name, "status": doc.status}
+    result = cancel_call(call_log) or {}
+    status = frappe.db.get_value("Vobiz Call Log", call_log, "status")
+    return {"name": doc.name, "status": status, "pending_provider": status not in lifecycle.TERMINAL,
+            "retry_after": result.get("retry_after", 5)}
 
 
 @frappe.whitelist(methods=["POST"])

@@ -105,9 +105,19 @@ def terminal_status(previous, event, reason="", answered=False):
     return "Cancelled"
 
 
-def finish_locked(mapping, row, event, reason="", status=None):
+def finish_locked(mapping, row, event, reason="", status=None, confirmed_end=False):
     """Caller holds mapping then call row locks. Preserve a final result."""
     if row.status in TERMINAL:
+        if confirmed_end and not row.end_time:
+            # Enrich a legacy manual completion only after verified provider end;
+            # keep the saved outcome and never release a newer reservation.
+            values = {"end_time": frappe.utils.now_datetime(), "call_status": event}
+            if reason:
+                values["hangup_cause"] = str(reason)[:140]
+            frappe.db.set_value("Vobiz Call Log", row.name, values)
+            completed = frappe.get_doc("Vobiz Call Log", row.name)
+            from vobiz_click_to_call.services.realtime import publish_call_disconnected
+            publish_call_disconnected(completed)
         release_locked(mapping, row)
         return row.status
     result = status or terminal_status(row.status, event, reason, bool(row.answer_time))

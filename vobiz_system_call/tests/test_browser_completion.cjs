@@ -205,3 +205,43 @@ test('a fresh console release invalidates the cached page once and tolerates blo
     ctx.window.localStorage = {getItem() {throw new Error('blocked');}};
     assert.doesNotThrow(() => vm.runInContext(asset, ctx));
 });
+
+test('failed SDK end-event request still observes provider completion', async () => {
+    const {obj, ctx, timers} = setup();
+    obj.browser_request_with_timeout = value => value;
+    obj.sync_browser_softphone_event = () => Promise.reject(new Error('network lost'));
+    ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Completed'}});
+    obj.browser_softphone_call_done('onCallTerminated', {call_uuid: 'sdk-1'});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(obj.state.softphone.current_call_log, 'C1', 'Keep reservation until provider confirms');
+    assert(timers.length > 0, 'Watcher starts even though end-event POST failed');
+    await timers.shift()();
+    assertCleared(obj);
+});
+test('late SDK end-event failure cannot change a newer call', async () => {
+    const {obj} = setup();
+    let rejectRequest;
+    obj.browser_request_with_timeout = value => value;
+    obj.watch_browser_call_disposition = () => {};
+    obj.sync_browser_softphone_event = () => new Promise((resolve, reject) => {rejectRequest = reject;});
+    obj.browser_softphone_call_done('onCallTerminated', {call_uuid: 'sdk-1'});
+    await new Promise(resolve => setImmediate(resolve));
+    newCall(obj);
+    rejectRequest(new Error('old request failed'));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(obj.state.softphone.current_call_log, 'C2');
+    assert.equal(obj.state.softphone.in_call, true);
+    assert.equal(obj.state.softphone.error, undefined);
+});
+test('manual completion waits for provider termination instead of clearing an active call', async () => {
+    const {obj, ctx} = setup();
+    let watched = '';
+    obj.render_header_active_call = () => {};
+    obj.browser_request_with_timeout = value => value;
+    obj.watch_browser_call_disposition = name => {watched = name;};
+    ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Connected', pending_provider: true}});
+    await obj.complete_header_active_call();
+    assert.equal(watched, 'C1');
+    assert.equal(obj.state.softphone.current_call_log, 'C1');
+    assert.equal(obj.state.softphone.in_call, true);
+});

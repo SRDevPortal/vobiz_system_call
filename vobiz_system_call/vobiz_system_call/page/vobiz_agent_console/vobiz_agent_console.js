@@ -268,8 +268,8 @@ class VobizAgentConsole {
 						<div class="vobiz-section-title">
 							<h3 data-role="queue-title">${__('Lead Queue')}</h3>
 							<div class="vobiz-queue-tools">
-								<select class="form-control input-sm hidden" data-role="queue-source-filter"></select>
-								<select class="form-control input-sm" data-role="queue-sort">
+								<div class="frappe-control form-group control-input-wrapper hidden" data-fieldtype="Select" data-role="queue-source-wrapper"><div class="control-input flex align-center"><select class="form-control input-sm" data-role="queue-source-filter" aria-label="${__('Queue source')}" title="${__('Queue source')}"></select><div class="select-icon">${frappe.utils.icon('select', 'sm')}</div></div></div>
+								<div class="frappe-control form-group control-input-wrapper" data-fieldtype="Select"><div class="control-input flex align-center"><select class="form-control input-sm" data-role="queue-sort" aria-label="${__('Sort queue')}" title="${__('Sort queue')}">
 									<option value="modified_desc">${__('Recently Updated')}</option>
 									<option value="modified_asc">${__('Oldest Updated')}</option>
 									<option value="creation_desc" selected>${__('Newest Created')}</option>
@@ -278,11 +278,17 @@ class VobizAgentConsole {
 									<option value="name_desc">${__('Name Z-A')}</option>
 									<option value="whatsapp_unread_desc">${__('New WhatsApp Msgs')}</option>
 									<option value="next_follow_up_asc">${__('Next Follow-up')}</option>
-								</select>
-								<button class="btn btn-default btn-sm vobiz-filter-btn" data-action="open-filters">
-									<i class="fa fa-filter filter-icon"></i> <span class="button-label">${__('Filters')}</span>
-								</button>
-								<input class="form-control input-sm" data-role="search" placeholder="${__('Search')}">
+								</select><div class="select-icon">${frappe.utils.icon('select', 'sm')}</div></div></div>
+								<div class="filter-selector"><div class="btn-group">
+									<button class="btn btn-default btn-sm filter-button" data-action="open-filters">
+										<span class="filter-icon">${frappe.utils.icon('es-line-filter')}</span>
+										<span class="button-label">${__('Filter')}</span>
+									</button>
+									<button class="btn btn-default btn-sm filter-x-button" data-action="clear-queue-filters" title="${__('Clear all filters')}" aria-label="${__('Clear all filters')}">
+										<span class="filter-icon">${frappe.utils.icon('es-small-close')}</span>
+									</button>
+								</div></div>
+								<input class="form-control input-sm" data-role="search" aria-label="${__('Search queue')}" placeholder="${__('Search')}">
 							</div>
 						</div>
 						<div class="vobiz-table-wrap">
@@ -416,13 +422,14 @@ class VobizAgentConsole {
 				@keyframes vobiz-phone-ring { 0%, 100% { opacity: .28; transform: scale(.96); } 50% { opacity: .85; transform: scale(1.04); } }
 				@keyframes vobiz-wave { 0%, 100% { transform: scaleY(.55); } 50% { transform: scaleY(1); } }
 				.vobiz-layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
-				.vobiz-section-title { align-items: center; display: flex; gap: 12px; justify-content: space-between; margin-bottom: 12px; }
+				.vobiz-section-title { align-items: center; display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; margin-bottom: 12px; }
 				.vobiz-section-title h3 { font-size: 15px; font-weight: 700; margin: 0; }
-				.vobiz-queue-tools { display: flex; gap: 8px; justify-content: flex-end; min-width: 280px; }
-				.vobiz-filter-btn { align-items: center !important; display: inline-flex !important; flex: 0 0 auto; gap: 6px; justify-content: center; min-width: 86px; white-space: nowrap !important; width: auto !important; }
-				.vobiz-filter-btn .filter-icon, .vobiz-filter-btn .button-label { display: inline-block; line-height: 1; white-space: nowrap; }
-				.vobiz-queue-tools select { max-width: 150px; }
-				.vobiz-queue-tools input { max-width: 260px; }
+				.vobiz-queue-tools { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; max-width: 100%; min-width: 0; }
+				.vobiz-queue-tools .form-group { margin-bottom: 0; }
+				.vobiz-queue-tools .control-input { position: relative; }
+				.vobiz-queue-tools select.form-control { flex: 0 0 auto; max-width: 100%; width: 180px; }
+				.vobiz-queue-tools select[data-role="queue-sort"] { width: 200px; }
+				.vobiz-queue-tools input.form-control { flex: 1 1 200px; max-width: 260px; min-width: 140px; width: 220px; }
 				.vobiz-table-wrap { overflow-x: auto; }
 				.vobiz-table { margin: 0; table-layout: fixed; }
 				.vobiz-table th { color: #6b7280; font-size: 11px; font-weight: 700; }
@@ -599,6 +606,10 @@ class VobizAgentConsole {
 					.vobiz-wa-composer { grid-template-columns: 30px 30px 30px minmax(0, 1fr) 40px; padding: 8px; }
 				}
 				@media (max-width: 700px) {
+					.vobiz-section-title .vobiz-queue-tools { justify-content: flex-start; width: 100%; }
+					.vobiz-queue-tools .control-input-wrapper { flex: 1 1 160px; min-width: 0; }
+					.vobiz-queue-tools select.form-control { min-width: 0; width: 100%; }
+					.vobiz-queue-tools input.form-control { max-width: none; min-width: 0; width: auto; }
 					.vobiz-workdesk-modal .modal-dialog { max-width: calc(100vw - 20px) !important; }
 					.vobiz-wa-composer { border-radius: 14px; gap: 4px; grid-template-columns: 28px 28px 28px minmax(0, 1fr) 38px; padding: 7px; }
 					.vobiz-wa-icon-btn { font-size: 15px; height: 28px; min-width: 28px; width: 28px; }
@@ -650,6 +661,15 @@ class VobizAgentConsole {
 		$main.on('click', '[data-action="toggle-auto"]', () => this.toggle_auto_dial());
 		$main.on('click', '[data-action="auto-report"]', () => this.open_auto_dial_report());
 		$main.on('click', '[data-action="open-filters"]', () => this.open_filter_popover());
+		$main.on('click', '[data-action="clear-queue-filters"]', () => {
+			const group = this.state.filter_group;
+			if (group) {
+				group.clear_filters();
+				group.update_filter_button();
+				group.hide_popover();
+			}
+			this.apply_queue_filters([]);
+		});
 		$main.on('click', '[data-action="queue-page-prev"]', () => this.change_queue_page(-1));
 		$main.on('click', '[data-action="queue-page-next"]', () => this.change_queue_page(1));
 		$main.on('click', '[data-action="call-row"]', (e) => {
@@ -707,7 +727,6 @@ class VobizAgentConsole {
 		$main.on('input', '[data-role="search"]', () => this.queue_search_changed());
 		$main.on('change', '[data-role="queue-source-filter"]', () => {
 			this.state.queue_filters = [];
-			this.state.filter_group = null;
 			this.state.queue_page = 1;
 			this.state.selected_queue_keys.clear();
 			this.load();
@@ -768,6 +787,7 @@ class VobizAgentConsole {
 	}
 
 	render_browser_softphone() {
+        this.sync_browser_close_protection();
 		this.sync_post_call_disposition();
 		const softphone = this.state.softphone || {};
 		const config = softphone.config || {};
@@ -1235,7 +1255,7 @@ class VobizAgentConsole {
 			try {
 				softphone.client = new window.Vobiz({
 					debug: 'ERROR', permOnClick: false, enableTracking: false,
-					closeProtection: true, maxAverageBitrate: 48000
+					closeProtection: false, managePageLifecycle: false, maxAverageBitrate: 48000
 				});
 				this.disable_browser_outgoing_tones();
 				this.bind_browser_softphone_events(softphone.client);
@@ -1348,6 +1368,10 @@ class VobizAgentConsole {
 			const customerConfirmed = softphone.incoming_answered || [this.state.active_call, this.state.workdesk_live_call]
 				.some(call => call?.name === softphone.current_call_log && ['Connected', 'In Progress'].includes(call.status));
 			softphone.incoming_answered = !softphone.conference_recovery && (!softphone.provider_session_recording || customerConfirmed);
+            if (softphone.incoming_answered) {
+                softphone.customer_ringback_pending = false;
+                this.stop_browser_ringback();
+            }
 			if (softphone.conference_recovery && softphone.muted) {
 				try { client.mute(); } catch (_) {}
 			}
@@ -1508,6 +1532,8 @@ class VobizAgentConsole {
 		if (!this.matches_browser_call_event(callInfo)) return;
 		const callLog = softphone.current_call_log;
 		if (!callLog) return;
+        softphone.customer_ringback_pending = false;
+        this.stop_browser_ringback();
 		if (softphone.conference_recovery) {
 			softphone.conference_join_started_at = 0;
 			softphone.conference_session_ended = true;
@@ -1520,14 +1546,18 @@ class VobizAgentConsole {
 			return;
 		}
 		this.set_browser_network_issue('media', false);
-		this.sync_browser_softphone_event(event, callInfo, callLog).then(() => {
-			this.watch_browser_call_disposition(callLog);
+		// Observe provider completion even if saving the SDK end event fails.
+		this.watch_browser_call_disposition(callLog);
+		this.browser_request_with_timeout(Promise.resolve().then(() =>
+			this.sync_browser_softphone_event(event, callInfo, callLog)
+		)).then(() => {
 			if (softphone.current_call_log !== callLog) return;
 			this.reset_browser_softphone_call_state(
 				softphone.registered ? __('Registered') : __('Disconnected'), callLog, ''
 			);
 			this.load();
 		}).catch((err) => {
+			if (softphone.current_call_log !== callLog) return;
 			softphone.error = err.message || __('Call status could not be saved. Please retry Stop Call.');
 			softphone.in_call = false;
 			this.render_browser_softphone();
@@ -2100,6 +2130,7 @@ class VobizAgentConsole {
 
 	reconcile_browser_softphone_call(call = {}) {
 		const softphone = this.state.softphone;
+        this.update_browser_ringback(call);
 		if (softphone.provider_session_recording && !softphone.conference_recovery
 			&& call.name === softphone.current_call_log && ['Connected', 'In Progress'].includes(call.status)) {
 			softphone.incoming_answered = true;
@@ -2167,6 +2198,10 @@ class VobizAgentConsole {
 		this.stop_browser_softphone_audio();
 		const softphone = this.state.softphone;
 		softphone.pending_end_call = '';
+        softphone.customer_ringback_pending = false;
+        softphone.ringback_provider_audio = false;
+        softphone.ringback_energy = {};
+        softphone.ringback_customer_answered = false;
 		softphone.conference_recovery = false;
 		softphone.provider_session_recording = false;
 		softphone.conference_generation = 0;
@@ -2222,6 +2257,8 @@ class VobizAgentConsole {
 	}
 
 	enable_browser_softphone_audio() {
+        this.prepare_browser_ringback_audio();
+        if (this.state.softphone.customer_ringback_pending) this.start_browser_ringback();
 		const softphone = this.state.softphone;
 		const audio = this.page.main.find('[data-role="softphone-audio"]').get(0);
 		const sdk = softphone.client && softphone.client.client;
@@ -2273,6 +2310,106 @@ class VobizAgentConsole {
 			+ (jitter === null ? '' : `; ${jitter} ms ` + __('jitter'));
 	}
 
+    prepare_browser_ringback_audio() {
+        // Called from call-start / Enable audio so autoplay can be unlocked.
+        try {
+            const Context = window.AudioContext || window.webkitAudioContext;
+            if (!Context) return null;
+            if (!this.browser_ringback_context || this.browser_ringback_context.state === 'closed') {
+                this.browser_ringback_context = new Context();
+            }
+            const context = this.browser_ringback_context;
+            Promise.resolve(context.resume()).catch(() => {});
+            return context;
+        } catch (_) { return null; }
+    }
+
+    update_browser_ringback(call = {}) {
+        const s = this.state.softphone;
+        if (!call.name || call.name !== s.current_call_log) return;
+        if (call.answer_time || ['Connected', 'In Progress'].includes(call.status)) {
+            s.ringback_customer_answered = true;
+        }
+        const ringing = call.status === 'Ringing' &&
+            (!s.conference_recovery || call.call_status === 'conference-customer-ringing');
+        s.customer_ringback_pending = Boolean(ringing && s.direction === __('Outgoing') && s.in_call &&
+            !s.ringback_customer_answered && !s.incoming_answered && !s.pending_end_call &&
+            !s.conference_end_requested && !s.recovery_verification && !this.is_terminal_status(call.status));
+        if (s.customer_ringback_pending && !s.ringback_provider_audio) this.start_browser_ringback();
+        else this.stop_browser_ringback();
+    }
+
+    observe_browser_ringback_media(reports) {
+        const s = this.state.softphone;
+        const levels = s.ringback_energy || (s.ringback_energy = {});
+        let audible = false;
+        reports.forEach(report => {
+            if (report.type !== 'inbound-rtp' || !(report.kind === 'audio' || report.mediaType === 'audio')) return;
+            const energy = Number(report.totalAudioEnergy);
+            const previous = levels[report.id];
+            if (Number(report.audioLevel) > 0.005 ||
+                (Number.isFinite(energy) && previous !== undefined && energy - previous > 0.00001)) audible = true;
+            if (Number.isFinite(energy)) levels[report.id] = energy;
+        });
+        if (audible && s.customer_ringback_pending) {
+            s.ringback_provider_audio = true;
+            this.stop_browser_ringback();
+        }
+    }
+
+    start_browser_ringback() {
+        const s = this.state.softphone;
+        if (this.browser_ringback || !s.customer_ringback_pending || s.ringback_provider_audio) return;
+        const context = this.prepare_browser_ringback_audio();
+        if (!context) return;
+        const tone = {callLog: s.current_call_log, nodes: [], context};
+        this.browser_ringback = tone;
+        Promise.resolve(context.resume()).then(() => {
+            if (this.browser_ringback !== tone || s.current_call_log !== tone.callLog || !s.customer_ringback_pending) return;
+            if (context.state !== 'running') throw new Error('Audio suspended');
+            const gain = context.createGain();
+            tone.gain = gain;
+            gain.gain.value = 0;
+            gain.connect(context.destination); // Output only; never mixed into microphone/upload.
+            for (const frequency of [440, 480]) {
+                const oscillator = context.createOscillator();
+                oscillator.frequency.value = frequency;
+                oscillator.connect(gain);
+                oscillator.start();
+                tone.nodes.push(oscillator);
+            }
+            const pulse = () => {
+                if (this.browser_ringback !== tone || s.current_call_log !== tone.callLog || !s.customer_ringback_pending) {
+                    if (this.browser_ringback === tone) this.stop_browser_ringback();
+                    return;
+                }
+                const now = context.currentTime;
+                gain.gain.cancelScheduledValues(now);
+                gain.gain.setValueAtTime(0, now);
+                gain.gain.linearRampToValueAtTime(0.025, now + 0.02);
+                gain.gain.setValueAtTime(0.025, now + 0.98);
+                gain.gain.linearRampToValueAtTime(0, now + 1);
+            };
+            pulse();
+            tone.timer = setInterval(pulse, 4000);
+        }).catch(() => {
+            if (this.browser_ringback !== tone) return;
+            this.stop_browser_ringback();
+            this.browser_softphone_audio_blocked();
+        });
+    }
+
+    stop_browser_ringback() {
+        const tone = this.browser_ringback;
+        this.browser_ringback = null;
+        if (!tone) return;
+        clearInterval(tone.timer);
+        for (const node of tone.nodes) {
+            try { node.stop(); node.disconnect(); } catch (_) {}
+        }
+        if (tone.gain) { try { tone.gain.disconnect(); } catch (_) {} }
+    }
+
 	disable_browser_outgoing_tones() {
 		const sdk = this.state.softphone.client && this.state.softphone.client.client;
 		if (!sdk) return;
@@ -2295,6 +2432,7 @@ class VobizAgentConsole {
 	}
 
 	stop_browser_softphone_audio() {
+        this.stop_browser_ringback();
 		clearInterval(this.browser_audio_timer);
 		this.browser_audio_timer = null;
 		const audio = this.page.main.find('[data-role="softphone-audio"]').get(0);
@@ -2339,6 +2477,7 @@ class VobizAgentConsole {
 					reports.forEach(report => {
 						if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) packets += report.packetsReceived || 0;
 					});
+                    this.observe_browser_ringback_media(reports);
 					softphone.received_audio_packets = packets;
 					if (packets) this.stop_browser_softphone_tones();
 					softphone.diagnostics = softphone.diagnostics || {};
@@ -2388,9 +2527,15 @@ class VobizAgentConsole {
 
 
 	start_browser_softphone_call(message, row) {
+        this.stop_browser_ringback();
+        this.prepare_browser_ringback_audio();
 		this.stop_browser_microphone_test();
 		const softphone = this.state.softphone;
 		softphone.current_call_log = message.call_log;
+        softphone.customer_ringback_pending = false;
+        softphone.ringback_provider_audio = false;
+        softphone.ringback_energy = {};
+        softphone.ringback_customer_answered = false;
 		softphone.sdk_call_uuid = '';
 		softphone.conference_recovery = Boolean(message.conference_recovery);
 		softphone.provider_session_recording = Boolean(message.provider_session_recording);
@@ -2515,10 +2660,49 @@ class VobizAgentConsole {
 		this.stop_console_heartbeat();
 	}
 
+    has_browser_close_protection_call() {
+        const s = this.state.softphone || {};
+        if (s.current_call_log || s.in_call || s.incoming_pending || s.pending_end_call) return true;
+        try { return Boolean(s.client?.client?.getCallUUID?.()); }
+        catch (_) { return false; }
+    }
+
+    sync_browser_close_protection() {
+        if (typeof window.addEventListener !== 'function') return;
+        const active = this.has_browser_close_protection_call();
+        if (active && !this.browser_close_warning) {
+            this.browser_close_warning = event => {
+                if (!this.has_browser_close_protection_call()) return;
+                // Warn only. The user may cancel; do not end calls or timers here.
+                event.preventDefault();
+                event.returnValue = true;
+            };
+            window.addEventListener('beforeunload', this.browser_close_warning);
+        } else if (!active && this.browser_close_warning) {
+            window.removeEventListener('beforeunload', this.browser_close_warning);
+            this.browser_close_warning = null;
+        }
+    }
+
+    cleanup_browser_page_departure() {
+        if (this.browser_close_warning) {
+            window.removeEventListener('beforeunload', this.browser_close_warning);
+            this.browser_close_warning = null;
+        }
+        this.stop_browser_softphone_audio();
+        // Match the SDK's old browser-leg cleanup only after real departure.
+        // Conference customer recovery and server cancellation remain unchanged.
+        const sdk = this.state.softphone?.client?.client;
+        if (sdk && this.has_browser_close_protection_call()) {
+            try { Promise.resolve(sdk.hangup()).catch(() => {}); } catch (_) {}
+        }
+    }
+
 	start_polling() {
 		clearInterval(this.poller);
 		this.poller = setInterval(() => this.load(), 30000);
-		$(window).one('beforeunload', () => {
+		$(window).one('pagehide', () => {
+            this.cleanup_browser_page_departure();
 			clearInterval(this.poller);
 			this.stop_browser_network_monitor();
 			clearInterval(this.timer);
@@ -2946,9 +3130,26 @@ class VobizAgentConsole {
 		const doctype = this.queue_meta_value('doctype');
 		if (this.state.filter_doctype && this.state.filter_doctype !== doctype) {
 			this.state.queue_filters = [];
-			this.state.filter_group = null;
+			const group = this.state.filter_group;
+			if (group) {
+				// Reuse one native popover so source changes cannot accumulate handlers.
+				group.clear_filters();
+				group.hide_popover();
+				group.doctype = doctype;
+				group.parent_doctype = doctype;
+				group.update_filter_button();
+			}
 		}
 		this.state.filter_doctype = doctype;
+	}
+
+	apply_queue_filters(filters) {
+		if (JSON.stringify(filters) === JSON.stringify(this.state.queue_filters || [])) return;
+		this.state.queue_filters = filters;
+		this.state.queue_page = 1;
+		this.state.selected_queue_keys.clear();
+		this.render_filter_button();
+		this.load();
 	}
 
 	open_filter_popover() {
@@ -2958,23 +3159,27 @@ class VobizAgentConsole {
 			frappe.msgprint(__('Filters are not available on this page.'));
 			return;
 		}
-		if (this.state.filter_group && this.state.filter_doctype === doctype) {
-			return;
-		}
+		if (this.queue_filter_opening) return;
+		this.queue_filter_opening = true;
 		frappe.model.with_doctype(doctype, () => {
-			this.state.filter_doctype = doctype;
-			this.state.filter_group = new frappe.ui.FilterGroup({
-				doctype,
-				parent_doctype: doctype,
-				filter_button: $button,
-				filters: this.state.queue_filters || [],
-				on_change: () => {
-					this.state.queue_filters = this.state.filter_group.get_filters();
-					this.state.queue_page = 1;
-					this.render_filter_button();
-					this.load();
-				}
-			});
+			this.queue_filter_opening = false;
+			if (this.queue_meta_value('doctype') !== doctype) return;
+			this.reset_filter_group_if_doctype_changed();
+			if (!this.state.filter_group) {
+				const group = new frappe.ui.FilterGroup({
+					doctype,
+					parent_doctype: doctype,
+					filter_button: $button,
+					on_change: () => {
+						if (this.queue_meta_value('doctype') !== group.doctype) return;
+						this.apply_queue_filters(group.get_filters());
+					}
+				});
+				this.state.filter_group = group;
+				// Our delegated click loads DocType metadata before opening. Remove
+				// the native direct toggle to avoid toggling twice for one click.
+				$button.off('click');
+			}
 			$button.popover('toggle');
 		});
 	}
@@ -2986,14 +3191,15 @@ class VobizAgentConsole {
 			.toggleClass('btn-primary-light', count > 0)
 			.toggleClass('btn-default', count === 0)
 			.find('.button-label')
-			.html(count ? __('Filters {0}', [`<span class="filter-label">${count}</span>`]) : __('Filters'));
+			.html(count ? __('Filters {0}', [`<span class="filter-label">${count}</span>`]) : __('Filter'));
 	}
 
 	render_queue_source_filter(meta) {
 		const $filter = this.page.main.find('[data-role="queue-source-filter"]');
 		const options = Array.isArray(meta.source_options) ? meta.source_options : [];
 		if (options.length <= 1) {
-			$filter.addClass('hidden').val('');
+			$filter.val('');
+			this.page.main.find('[data-role="queue-source-wrapper"]').addClass('hidden');
 			return;
 		}
 		const current = $filter.val() || '';
@@ -3003,7 +3209,7 @@ class VobizAgentConsole {
 		} else {
 			$filter.val(meta.source || options[0]);
 		}
-		$filter.removeClass('hidden');
+		this.page.main.find('[data-role="queue-source-wrapper"]').removeClass('hidden');
 	}
 
 	render_queue_sort(meta) {
@@ -3795,8 +4001,12 @@ class VobizAgentConsole {
 			args: {call_log: callLog}
 		}))).then(r => {
 			const call = r.message || {};
-			if (call.name !== callLog || !this.is_terminal_status(call.status)) {
-				throw new Error(__('Call log was not marked completed. Please retry.'));
+			if (call.name !== callLog) throw new Error(__('Call confirmation did not match. Please refresh.'));
+			if (!this.is_terminal_status(call.status)) {
+				this.watch_browser_call_disposition(callLog);
+				frappe.show_alert({message: __('End Call requested. Waiting for provider confirmation.'), indicator: 'orange'});
+				this.load();
+				return;
 			}
 			this.handle_call_disconnected(Object.assign({}, active, call));
 			this.load();
@@ -6790,6 +7000,8 @@ class VobizAgentConsole {
 		const softphone = this.state.softphone;
 		const isBrowser = softphone.current_call_log === call_log;
 		if (isBrowser) {
+            softphone.customer_ringback_pending = false;
+            this.stop_browser_ringback();
 			if (softphone.conference_recovery) softphone.conference_end_requested = call_log;
 			if (softphone.conference_recovery || this.browser_softphone_reconnecting()) softphone.pending_end_call = call_log;
 			try {
@@ -7388,6 +7600,7 @@ class VobizAgentConsole {
 
 // Native media events do not bubble; capture once for either console owner.
 (() => {
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
     if (document.__vobizRecordingFeedback) return;
     document.__vobizRecordingFeedback = true;
     for (const type of ['loadstart', 'canplay', 'error']) {

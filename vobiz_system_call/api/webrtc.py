@@ -329,19 +329,17 @@ def hangup(token=None):
     if row.call_uuid != uuid:
         frappe.db.rollback()
         return _plain_response("IGNORED")
-    if row.status in lifecycle.TERMINAL:
-        lifecycle.release_locked(mapping, row)
-        frappe.db.commit()
-        return _plain_response("OK")
     # Normalize the authenticated parent-call outcome without using Dial progress.
     outcome = lifecycle.provider_outcome({
         "status": state or "completed",
         "hangup_cause": payload.get("HangupCause") or payload.get("hangup_cause") or "",
     }, answered=bool(row.answer_time or _billable_seconds(payload)))
-    if outcome not in lifecycle.TERMINAL:
+    if row.status in lifecycle.TERMINAL:
+        outcome = row.status
+    elif outcome not in lifecycle.TERMINAL:
         outcome = lifecycle.terminal_status(row.status, "terminated", answered=bool(row.answer_time))
     lifecycle.finish_locked(mapping, row, "provider-hangup",
-                            str(payload.get("HangupCause") or "")[:140], status=outcome)
+                            str(payload.get("HangupCause") or "")[:140], status=outcome, confirmed_end=True)
     _append_callback_if_enabled(row.name, "provider-hangup", {
         k: v for k, v in payload.items() if k not in ("token", "cmd")
     })
@@ -696,6 +694,23 @@ def _answer_pstn_inbound(raw_from, raw_to, payload):
     return _xml_response(xml)
 
 
+def _dial_callback_state(row, payload):
+    state = str(payload.get("DialCallStatus") or payload.get("DialStatus") or
+                payload.get("DialAction") or payload.get("DialBLegStatus") or payload.get("Event") or "").strip().lower()
+    event = str(payload.get("Event") or "").strip().lower()
+    # Only the direct outgoing Dial's B-leg represents the customer. An incoming
+    # agent leg may still fall back; conference browser legs may reconnect.
+    direct_customer = row.direction == "Outgoing" and not lifecycle.context(row).get("conference_recovery")
+    if direct_customer and event == "dialhangup":
+        # Retain an explicit customer outcome even when the event is generic.
+        if state in ("completed", "busy", "no-answer", "failed", "timeout", "cancel"):
+            return state
+        return "hangup"
+    if direct_customer:
+        return {"dialanswer": "answered", "dialconnected": "connected"}.get(state, state)
+    return state
+
+
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 @rate_limit(limit=lambda: callback_request_limit("event"), seconds=60)
 def provider_event(call_log: str, token: str, final: str = "0"):
@@ -707,23 +722,26 @@ def provider_event(call_log: str, token: str, final: str = "0"):
     mapping, row = lifecycle.lock_call(call_log)
     payload = _request_params()
     # The Dial token is specific to this call and authorizes B-leg callbacks too.
-    state = str(payload.get("DialCallStatus") or payload.get("DialStatus") or
-                payload.get("DialAction") or payload.get("DialBLegStatus") or payload.get("Event") or "").lower()
+    state = _dial_callback_state(row, payload)
     from vobiz_system_call.api.customer_outcome import apply as apply_customer_outcome
     outcome_applied = apply_customer_outcome(mapping, row, payload, state)
-    if not outcome_applied and row.status not in lifecycle.TERMINAL:
-        if state in ("answer", "answered", "connected", "in-progress", "in progress"):
+    terminal = state in ("completed", "hangup", "busy", "no-answer", "failed", "timeout", "cancel") or final == "1"
+    if not outcome_applied:
+        if row.status in lifecycle.TERMINAL:
+            if terminal:
+                lifecycle.finish_locked(mapping, row, "provider-dial-ended", state, confirmed_end=True)
+        elif state in ("answer", "answered", "connected", "in-progress", "in progress"):
             frappe.db.set_value("Vobiz Call Log", row.name, {
                 "status": "Connected", "answer_time": row.answer_time or frappe.utils.now(),
             })
             _enqueue_recording_start(row.name)
-        elif state in ("completed", "hangup", "busy", "no-answer", "failed", "timeout", "cancel") or final == "1":
+        elif terminal:
             outcome = {"busy": "Busy", "no-answer": "No Answer", "timeout": "No Answer",
                        "failed": "Failed"}.get(state)
             lifecycle.finish_locked(mapping, row, "terminated", state, status=(
                 outcome or ("Completed" if row.answer_time or _billable_seconds(payload) > 0
                             or (state == "completed" and payload.get("DialBLegUUID")) else "Cancelled")
-            ))
+            ), confirmed_end=True)
     _append_callback_if_enabled(row.name, "provider-event", {
         k: v for k, v in payload.items() if k not in ("token", "cmd")
     })
