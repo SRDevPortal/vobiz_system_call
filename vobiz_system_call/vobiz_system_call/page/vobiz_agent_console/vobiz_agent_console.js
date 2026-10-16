@@ -3028,7 +3028,13 @@ class VobizAgentConsole {
 	}
 
 	render_availability(capability, active_call) {
-		const status = active_call && active_call.name
+		const activeName = active_call?.name && !this.is_terminal_status(active_call.status)
+			? active_call.name : '';
+		if (this.availability_call_name !== activeName) {
+			this.availability_call_name = activeName;
+			$(document).trigger('vobiz_refresh_availability');
+		}
+		const status = activeName
 			? 'Busy'
 			: (capability.availability_status || (capability.can_call ? 'Available' : 'Offline'));
 		const colors = {
@@ -4009,6 +4015,7 @@ class VobizAgentConsole {
 				return;
 			}
 			this.handle_call_disconnected(Object.assign({}, active, call));
+			$(document).trigger('vobiz_refresh_availability');
 			this.load();
 		}).catch(error => {
 			frappe.msgprint(error.message || __('Could not complete the call log. Please retry.'));

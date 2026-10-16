@@ -233,7 +233,7 @@ test('late SDK end-event failure cannot change a newer call', async () => {
     assert.equal(obj.state.softphone.in_call, true);
     assert.equal(obj.state.softphone.error, undefined);
 });
-test('manual completion waits for provider termination instead of clearing an active call', async () => {
+test('a nonterminal completion response preserves the active call', async () => {
     const {obj, ctx} = setup();
     let watched = '';
     obj.render_header_active_call = () => {};
@@ -244,4 +244,20 @@ test('manual completion waits for provider termination instead of clearing an ac
     assert.equal(watched, 'C1');
     assert.equal(obj.state.softphone.current_call_log, 'C1');
     assert.equal(obj.state.softphone.in_call, true);
+});
+
+
+test('manual Completed response clears the matching console call immediately', async () => {
+    const {obj, ctx} = setup();
+    let completed, refreshed = false;
+    ctx.document = {};
+    ctx.$ = () => ({trigger(name) {refreshed = name === 'vobiz_refresh_availability';}});
+    obj.render_header_active_call = () => {};
+    obj.browser_request_with_timeout = value => value;
+    obj.handle_call_disconnected = value => {completed = value;};
+    ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Completed'}});
+    await obj.complete_header_active_call();
+    assert.equal(completed.name, 'C1');
+    assert.equal(completed.status, 'Completed');
+    assert.equal(refreshed, true);
 });

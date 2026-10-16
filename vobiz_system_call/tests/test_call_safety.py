@@ -595,23 +595,22 @@ class BrowserSafetyTests(unittest.TestCase):
             webrtc.update_browser_softphone_call("CALL-1", "onCallTerminated")
         self.db.set_value.assert_not_called()
 
-    def test_manual_complete_requests_hangup_without_marking_active_call_completed(self):
-        current = row(status="Connected", call_status="browser-audio-connected", call_uuid="provider-id")
-        current.save = MagicMock()
-        mapping = row(name="MAP", current_call_log=current.name)
-        self.replace(lifecycle, "lock_mapping", MagicMock(return_value=mapping))
-        self.replace(frappe, "get_doc", MagicMock(return_value=current))
-        release = self.replace(lifecycle, "release_locked", MagicMock())
-        cancel = self.replace(call, "cancel_call", MagicMock(return_value={"pending_provider": True, "retry_after": 5}))
-        self.db.get_value.return_value = "Connected"
-        result = call.complete_call_log(current.name)
-        self.assertTrue(result["pending_provider"])
-        self.assertEqual(result["status"], "Connected")
-        current.save.assert_not_called()
-        release.assert_not_called()
-        self.db.set_value.assert_not_called()
-        cancel.assert_called_once_with(current.name)
-        self.db.commit.assert_called_once()
+    def test_manual_complete_updates_own_current_log_without_provider_call(self):
+        for provider_id in ("", "provider-id"):
+            with self.subTest(provider_id=provider_id):
+                current = row(status="Initiated", call_uuid=provider_id, end_time=None)
+                current.save = MagicMock()
+                mapping = row(name="MAP", current_call_log=current.name)
+                self.replace(lifecycle, "lock_mapping", MagicMock(return_value=mapping))
+                self.replace(frappe, "get_doc", MagicMock(return_value=current))
+                release = self.replace(lifecycle, "release_locked", MagicMock())
+                cancel = self.replace(call, "cancel_call", MagicMock())
+                result = call.complete_call_log(current.name)
+                self.assertEqual(result, {"name": current.name, "status": "Completed"})
+                self.assertIsNone(current.end_time)
+                current.save.assert_called_once_with(ignore_permissions=True)
+                release.assert_called_once_with(mapping, current)
+                cancel.assert_not_called()
 
     def test_manual_complete_rejects_guest_before_reading_call(self):
         self.replace(frappe, "session", SimpleNamespace(user="Guest"))
@@ -644,18 +643,16 @@ class BrowserSafetyTests(unittest.TestCase):
                 current.save.assert_not_called()
                 self.db.set_value.assert_not_called()
 
-    def test_manual_complete_provider_error_does_not_falsely_release(self):
+    def test_manual_complete_save_error_does_not_release_mapping(self):
         current = row()
-        current.save = MagicMock()
+        current.save = MagicMock(side_effect=RuntimeError("save failed"))
         self.replace(lifecycle, "lock_mapping", MagicMock(return_value=row(current_call_log=current.name)))
         self.replace(frappe, "get_doc", MagicMock(return_value=current))
-        self.replace(call, "cancel_call", MagicMock(side_effect=RuntimeError("provider unavailable")))
         release = self.replace(lifecycle, "release_locked", MagicMock())
-        with self.assertRaisesRegex(RuntimeError, "provider unavailable"):
+        with self.assertRaisesRegex(RuntimeError, "save failed"):
             call.complete_call_log(current.name)
         release.assert_not_called()
-        current.save.assert_not_called()
-        self.db.set_value.assert_not_called()
+        self.db.commit.assert_not_called()
 
     def test_dial_hangup_only_normalizes_direct_outgoing_customer(self):
         payload = {"Event": "DialHangup", "CallStatus": "in-progress"}
