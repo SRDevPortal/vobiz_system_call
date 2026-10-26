@@ -60,6 +60,7 @@ class VobizAgentConsole {
 			navigating_from_workdesk: false,
 			last_callback_call_log: null,
 			queue_filters: [],
+			queue_source_filter: this.load_saved_queue_source(),
 			queue_sort_by: 'creation_desc',
 			queue_page: 1,
 			queue_page_size: 25,
@@ -726,6 +727,7 @@ class VobizAgentConsole {
 		$main.on('click', '[data-role="row-check"]', (e) => e.stopPropagation());
 		$main.on('input', '[data-role="search"]', () => this.queue_search_changed());
 		$main.on('change', '[data-role="queue-source-filter"]', () => {
+			this.state.queue_source_filter = this.page.main.find('[data-role="queue-source-filter"]').val() || '';
 			this.state.queue_filters = [];
 			this.state.queue_page = 1;
 			this.state.selected_queue_keys.clear();
@@ -2582,20 +2584,29 @@ class VobizAgentConsole {
 			this.stop_console_heartbeat();
 			return;
 		}
-		if (this.load_in_flight) return;
+		if (this.load_in_flight) {
+			this.queue_reload_pending = true;
+			return;
+		}
 		this.load_in_flight = true;
 		const search = (this.page.main.find('[data-role="search"]').val() || '').trim();
-		const queue_source_filter = (this.page.main.find('[data-role="queue-source-filter"]').val() || '').trim();
+		const queue_source_filter = this.state.queue_source_filter || '';
 		const sort_by = (this.state.queue_sort_by || this.page.main.find('[data-role="queue-sort"]').val() || 'creation_desc').trim();
 		this.state.queue_sort_by = sort_by;
+		const requested_filters = JSON.stringify(this.state.queue_filters || []);
 		const request = frappe.call('vobiz_click_to_call.api.console.get_agent_console_data', {
 			limit: this.state.queue_page_size || 25,
 			limit_start: Math.max(0, ((this.state.queue_page || 1) - 1) * (this.state.queue_page_size || 25)),
 			search,
 			queue_source_filter,
 			sort_by,
-			filters: JSON.stringify(this.state.queue_filters || [])
+			filters: requested_filters
 		}).then((r) => {
+			if (queue_source_filter !== (this.state.queue_source_filter || '') ||
+				requested_filters !== JSON.stringify(this.state.queue_filters || [])) {
+				this.queue_reload_pending = true;
+				return;
+			}
 			const data = r.message || {};
 			const returnedCall = data.active_call || {};
 			if (this.confirmed_terminal_calls?.has(returnedCall.name) && !this.is_terminal_status(returnedCall.status)) {
@@ -2607,7 +2618,11 @@ class VobizAgentConsole {
 			this.state.queue_has_more = Boolean((data.queue_pagination || {}).has_more);
 			this.state.queue_meta = Object.assign(this.default_queue_meta(), data.queue_meta || {});
 			this.prune_selected_queue_keys();
-			this.reset_filter_group_if_doctype_changed();
+			if (this.reset_filter_group_if_doctype_changed()) {
+				// Fetch with restored filters before displaying or auto-dialing rows.
+				this.queue_reload_pending = true;
+				return;
+			}
 			this.state.active_call = data.active_call || null;
 			this.refresh_browser_softphone_call(data.active_call || {});
 			this.state.dispositions = data.dispositions || [];
@@ -2634,6 +2649,10 @@ class VobizAgentConsole {
 		});
 		request.always(() => {
 			this.load_in_flight = false;
+			if (this.queue_reload_pending) {
+				this.queue_reload_pending = false;
+				this.load();
+			}
 		});
 	}
 
@@ -3132,26 +3151,78 @@ class VobizAgentConsole {
 		return (meta.doctype || '') === 'Patient' ? 16 : 13;
 	}
 
+	queue_filter_storage_key(scope = 'source') {
+		return 'vobiz_console_filters:v1:' + JSON.stringify([frappe.session.user, scope]);
+	}
+
+	load_saved_queue_source() {
+		try {
+			const source = JSON.parse(window.localStorage.getItem(this.queue_filter_storage_key()));
+			return typeof source === 'string' ? source : '';
+		} catch (e) {
+			return '';
+		}
+	}
+
+	save_queue_filters() {
+		if (!this.state.saved_filter_scope) return;
+		try {
+			const key = this.queue_filter_storage_key(this.state.saved_filter_scope);
+			if (this.state.queue_filters.length) {
+				window.localStorage.setItem(key, JSON.stringify(this.state.queue_filters));
+			} else {
+				window.localStorage.removeItem(key);
+			}
+		} catch (e) {
+			// Storage may be unavailable; filtering must still work in this session.
+		}
+	}
+
 	reset_filter_group_if_doctype_changed() {
 		const doctype = this.queue_meta_value('doctype');
-		if (this.state.filter_doctype && this.state.filter_doctype !== doctype) {
-			this.state.queue_filters = [];
+		const source = this.queue_meta_value('source');
+		const scope = JSON.stringify([source, doctype]);
+		this.state.queue_source_filter = source;
+		try {
+			window.localStorage.setItem(this.queue_filter_storage_key(), JSON.stringify(source));
+		} catch (e) {}
+		if (this.state.saved_filter_scope === scope) return false;
+		let filters = [];
+		try {
+			const saved = JSON.parse(window.localStorage.getItem(this.queue_filter_storage_key(scope)));
+			if (Array.isArray(saved)) {
+				filters = saved.filter(f => Array.isArray(f) && f.length >= 4 &&
+					typeof f[0] === 'string' && typeof f[1] === 'string' &&
+					typeof f[2] === 'string');
+			}
+		} catch (e) {}
+		const changed = JSON.stringify(filters) !== JSON.stringify(this.state.queue_filters);
+		this.queue_filters_need_render = true;
+		this.restoring_queue_filters = true;
+		try {
 			const group = this.state.filter_group;
 			if (group) {
-				// Reuse one native popover so source changes cannot accumulate handlers.
-				group.clear_filters();
 				group.hide_popover();
+				group.clear_filters();
 				group.doctype = doctype;
 				group.parent_doctype = doctype;
-				group.update_filter_button();
 			}
+		} finally {
+			this.restoring_queue_filters = false;
 		}
 		this.state.filter_doctype = doctype;
+		this.state.saved_filter_scope = scope;
+		this.state.queue_filters = filters;
+		this.state.queue_page = 1;
+		this.queue_filters_need_render = true;
+		return changed;
 	}
 
 	apply_queue_filters(filters) {
+		if (this.restoring_queue_filters) return;
 		if (JSON.stringify(filters) === JSON.stringify(this.state.queue_filters || [])) return;
 		this.state.queue_filters = filters;
+		this.save_queue_filters();
 		this.state.queue_page = 1;
 		this.state.selected_queue_keys.clear();
 		this.render_filter_button();
@@ -3165,26 +3236,40 @@ class VobizAgentConsole {
 			frappe.msgprint(__('Filters are not available on this page.'));
 			return;
 		}
-		if (this.queue_filter_opening) return;
+		if (this.queue_filter_opening || this.restoring_queue_filters) return;
 		this.queue_filter_opening = true;
 		frappe.model.with_doctype(doctype, () => {
 			this.queue_filter_opening = false;
 			if (this.queue_meta_value('doctype') !== doctype) return;
-			this.reset_filter_group_if_doctype_changed();
 			if (!this.state.filter_group) {
 				const group = new frappe.ui.FilterGroup({
 					doctype,
 					parent_doctype: doctype,
 					filter_button: $button,
 					on_change: () => {
-						if (this.queue_meta_value('doctype') !== group.doctype) return;
+						if (this.queue_meta_value('doctype') !== group.doctype || this.queue_filters_need_render) return;
 						this.apply_queue_filters(group.get_filters());
 					}
 				});
 				this.state.filter_group = group;
-				// Our delegated click loads DocType metadata before opening. Remove
-				// the native direct toggle to avoid toggling twice for one click.
+				this.queue_filters_need_render = true;
 				$button.off('click');
+			}
+			if (this.queue_filters_need_render) {
+				// Native FilterGroup expects Filter objects, not saved filter tuples.
+				// Rebuild them only after its popover has created the controls.
+				this.restoring_queue_filters = true;
+				$button.one('shown.bs.popover', async () => {
+					const group = this.state.filter_group;
+					try {
+						group.clear_filters();
+						await group.add_filters(this.state.queue_filters);
+						this.queue_filters_need_render = false;
+					} finally {
+						this.restoring_queue_filters = false;
+						this.render_filter_button();
+					}
+				});
 			}
 			$button.popover('toggle');
 		});
@@ -3208,7 +3293,7 @@ class VobizAgentConsole {
 			this.page.main.find('[data-role="queue-source-wrapper"]').addClass('hidden');
 			return;
 		}
-		const current = $filter.val() || '';
+		const current = this.state.queue_source_filter || $filter.val() || '';
 		$filter.html(options.map(value => `<option value="${frappe.utils.escape_html(value)}">${frappe.utils.escape_html(value)}</option>`).join(''));
 		if (current && options.includes(current)) {
 			$filter.val(current);
@@ -4146,6 +4231,10 @@ class VobizAgentConsole {
 	}
 
 	open_detail_dialog(row, context, initial_tab) {
+		// Keep the workdesk selection separate from the queue's default number.
+		row = Object.assign({}, row);
+		row.call_phone_choices = context.phone_choices || [];
+		this.select_workdesk_phone(row, row.call_phone_choices.findIndex(choice => choice.fieldname === row.phone_field));
 		context.workdesk = context.workdesk || {};
 		context.loaded_workdesk_tabs = context.loaded_workdesk_tabs || { summary: true };
 		this.state.navigating_from_workdesk = false;
@@ -4233,6 +4322,12 @@ class VobizAgentConsole {
 			this.load_workdesk_tab(row, context, tab, $body, render);
 		});
 		$body.on('click', '[data-workdesk-action]', (e) => this.handle_workdesk_action($(e.currentTarget).data('workdesk-action'), row, context, $body, e));
+		$body.on('change', '[data-workdesk-phone]', (e) => {
+			const call = this.matching_active_call(row);
+			if (this.start_call_in_flight || (call && !this.is_terminal_status(call.status))) return;
+			this.select_workdesk_phone(row, Number($(e.currentTarget).val()));
+			$body.find('[data-workdesk-customer-number]').text(row.phone || __('No phone'));
+		});
 		$body.on('change', '[data-workdesk-status]', (e) => this.save_workdesk_status(row, context, $(e.currentTarget)));
 		// Scroll does not bubble; capture it for dynamically rendered chat lists.
 		$body.get(0).addEventListener('scroll', (e) => {
@@ -4327,7 +4422,27 @@ class VobizAgentConsole {
 			return this.cancel_call_log(call.name, row);
 		}
 		this.state.selected = row;
-		return this.start_call_for_row(row);
+		return this.start_call_for_row(row, row.selected_phone_choice || null);
+	}
+
+	select_workdesk_phone(row, index) {
+		const choices = row.call_phone_choices || [];
+		const choice = choices[index] || choices[0];
+		if (!choice) return;
+		row.selected_phone_choice = choice;
+		row.phone_field = choice.fieldname;
+		row.phone = choice.number;
+		row.phone_masked = Boolean(choice.number_masked);
+	}
+
+	workdesk_phone_selector_html(row) {
+		const choices = row.call_phone_choices || [];
+		if (!choices.length) return '';
+		return `<label class="vobiz-workdesk-phone-label">${__('Number to call')}
+			<select class="form-control input-sm" data-workdesk-phone>
+				${choices.map((choice, index) => `<option value="${index}" ${choice === row.selected_phone_choice ? 'selected' : ''}>${frappe.utils.escape_html(choice.label)}: ${frappe.utils.escape_html(choice.number)}</option>`).join('')}
+			</select>
+		</label>`;
 	}
 
 	update_workdesk_primary_action(row) {
@@ -4352,6 +4467,7 @@ class VobizAgentConsole {
 		const $body = this.state.active_workdesk_body;
 		if (!$body || !$body.length || !row) return;
 		const isActive = Boolean(call && call.name && !this.is_terminal_status(call.status));
+		$body.find('[data-workdesk-phone]').prop('disabled', isActive || Boolean(this.start_call_in_flight));
 		$body.find('[data-workdesk-action="call"]')
 			.toggleClass('btn-primary', !isActive)
 			.toggleClass('btn-success', !isActive)
@@ -4731,9 +4847,10 @@ class VobizAgentConsole {
 					<div class="vobiz-call-route">
 						<span class="vobiz-call-route-chip">${__('Agent')}: ${frappe.utils.escape_html(agent_number)}</span>
 						<i class="fa fa-link vobiz-call-route-icon" aria-hidden="true"></i>
-						<span class="vobiz-call-route-chip">${__('Customer')}: ${frappe.utils.escape_html(customer_number)}</span>
+						<span class="vobiz-call-route-chip">${__('Customer')}: <span data-workdesk-customer-number>${frappe.utils.escape_html(customer_number)}</span></span>
 					</div>
-					<div class="text-muted">${frappe.utils.escape_html(row.doctype || '')} • ${frappe.utils.escape_html(row.phone || __('No phone'))}</div>
+					<div class="text-muted">${frappe.utils.escape_html(row.doctype || '')} • <span data-workdesk-customer-number>${frappe.utils.escape_html(row.phone || __('No phone'))}</span></div>
+					${this.workdesk_phone_selector_html(row)}
 				</div>
 				<div class="vobiz-workdesk-actions">
 					<button class="btn btn-primary btn-sm" data-workdesk-action="call"><i class="fa fa-phone"></i> ${__('Start Call')}</button>
