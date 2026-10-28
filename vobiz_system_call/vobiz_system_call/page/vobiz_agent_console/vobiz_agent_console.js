@@ -617,6 +617,44 @@ class VobizAgentConsole {
 					.vobiz-wa-send { height: 38px; width: 38px; }
 					.vobiz-wa-menu { left: auto; right: 0; }
 				}
+
+                /* Responsive controls and independently scrollable data tables. */
+                .vobiz-console *, .vobiz-workdesk * { min-width: 0; }
+                .vobiz-table-wrap { max-width: 100%; overscroll-behavior-x: contain; }
+                .vobiz-table { min-width: 1600px; }
+                .vobiz-performance-table { min-width: 640px; }
+                @media (max-width: 1100px) {
+                    .vobiz-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+                    .vobiz-console-head, .vobiz-section-title, .vobiz-dialer-control { flex-wrap: wrap; gap: 12px; }
+                    .vobiz-queue-tools { flex-wrap: wrap; min-width: 0; max-width: 100%; }
+                }
+                @media (max-width: 700px) {
+                    .vobiz-console { padding: 10px; }
+                    .vobiz-console-head, .vobiz-section-title, .vobiz-dialer-control, .vobiz-pagination, .vobiz-performance-head { align-items: stretch; flex-direction: column; gap: 10px; }
+                    .vobiz-head-actions, .vobiz-actions, .vobiz-call-controls, .vobiz-page-controls { flex-wrap: wrap; justify-content: flex-start; }
+                    .vobiz-head-active-call { width: 100%; max-width: 100%; }
+                    .vobiz-head-call-copy { flex: 1; }
+                    .vobiz-stats, .vobiz-perf-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+                    .vobiz-stat, .vobiz-band { padding: 10px; }
+                    .vobiz-stat strong { font-size: 24px; }
+                    .vobiz-queue-tools { width: 100%; justify-content: flex-start; }
+                    .vobiz-queue-tools select, .vobiz-queue-tools input, .vobiz-queue-tools input.form-control { flex: 1 1 140px; width: 100%; min-width: 0; max-width: 100%; }
+                    .vobiz-console .btn, .vobiz-workdesk .btn, .vobiz-console select { min-height: 44px; }
+                    .vobiz-console input, .vobiz-console select, .vobiz-workdesk input, .vobiz-workdesk select, .vobiz-workdesk textarea { font-size: 16px; }
+                    .vobiz-history-row, .vobiz-missed-row-grid { grid-template-columns: minmax(0, 1fr); }
+                    .vobiz-detail-head, .vobiz-missed-row-head, .vobiz-softphone { flex-wrap: wrap; gap: 8px; }
+                    .vobiz-workdesk { min-height: 0; }
+                    .vobiz-workdesk-modal .modal-body { padding: 10px; }
+                    .vobiz-wa-message { max-width: 96%; }
+                    .vobiz-wa-composer { grid-template-columns: 44px 44px 44px minmax(0, 1fr); position: relative; }
+                    .vobiz-wa-composer textarea { grid-row: 1; grid-column: 1 / -1; font-size: 16px; }
+                    .vobiz-wa-icon-btn { height: 44px; width: 44px; }
+                    .vobiz-wa-send { justify-self: end; height: 44px; width: 44px; }
+                    .vobiz-wa-attach-wrap, .vobiz-wa-emoji-wrap { position: static; }
+                    .vobiz-wa-menu { left: 0; right: auto; min-width: 0; max-width: calc(100vw - 64px); }
+                    .vobiz-wa-emoji-menu { grid-template-columns: repeat(6, 30px); }
+                    .vobiz-wa-composer audio, .vobiz-workdesk audio { max-width: 100%; }
+                }
 			</style>
 		`);
 	}
