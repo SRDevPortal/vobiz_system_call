@@ -17,6 +17,10 @@ class PrivateRoutingTests(unittest.TestCase):
                 "source": "vobiz_system_call", "call_device": "Browser Softphone",
                 **private.prepare(self.caller_id, self.customer)}))
         self.patch(private.number_privacy, "restricted", lambda user=None: True)
+        self.patch(frappe, "session", frappe._dict(user=self.row.user))
+        # Unit tests must not read live site settings or require an active request.
+        self.patch(webrtc, "get_default_country_code", lambda *a, **k: "+91")
+        self.patch(frappe.utils, "now", lambda: "2026-11-02 13:00:00")
 
     def patch(self, obj, name, value):
         p = patch.object(obj, name, value); p.start(); self.addCleanup(p.stop)
@@ -103,6 +107,7 @@ class PrivateRoutingTests(unittest.TestCase):
 
     def test_prepare_call_response_masks_customer_and_persists_private_route(self):
         from vobiz_system_call.api import call
+        self.patch(call, "_", lambda value: value)
         self.patch(frappe, "db", MagicMock())
         self.patch(call, "get_profile_endpoint_uri", lambda *a: "sip:agent@registrar.vobiz.ai")
         self.patch(call, "get_profile_password", lambda *a: "test-password")

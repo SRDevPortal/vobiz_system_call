@@ -19,21 +19,8 @@ SYSTEM_DIALER_ALLOWED_SCHEMES = {"tel", "sip", "sips", "callto"}
 
 
 def callback_request_limit(endpoint):
-    """Per-site requests per endpoint/IP/minute; retain the existing default."""
-    names = {
-        "answer": "vobiz_answer_requests_per_minute",
-        "event": "vobiz_event_requests_per_minute",
-        "hangup": "vobiz_hangup_requests_per_minute",
-    }
-    value = frappe.conf.get(names[endpoint], 600)
-    # Bad configuration must not remove protection or disable valid callbacks.
-    try:
-        if isinstance(value, bool) or str(value).strip() != str(int(value)):
-            return 600
-        value = int(value)
-    except (ValueError, TypeError, OverflowError):
-        return 600
-    return value if 1 <= value <= 60000 else 600
+    from vobiz_click_to_call.services.callback_limits import callback_request_limit as get_limit
+    return get_limit(endpoint, default=600)
 
 
 def get_settings():

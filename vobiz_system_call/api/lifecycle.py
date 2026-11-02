@@ -334,8 +334,19 @@ def verified_browser_candidate(snapshot, evidence):
     source = re.sub(r"^sips?:", "", source).split("@", 1)[0]
     target = re.sub(r"\D", "", str(evidence.get("destination_number") or evidence.get("to") or ""))
     customer = re.sub(r"\D", "", str(snapshot.get("customer_number") or ""))
+    # This evidence describes the SDK/browser leg, which dials the private
+    # routing target, not the customer. Never loosen customer-leg matching.
+    private = context(snapshot).get("private_browser_route")
+    expected = customer
+    if private:
+        if not isinstance(private, dict):
+            return False
+        expected = re.sub(r"\D", "", str(private.get("target") or ""))
+        caller_id = re.sub(r"\D", "", str(snapshot.get("caller_id") or ""))
+        if not expected or expected != caller_id or expected == customer:
+            return False
     started = provider_datetime(evidence.get("start_time") or evidence.get("session_start"))
-    if not endpoint or source != endpoint or not customer or target != customer or not started:
+    if not endpoint or source != endpoint or not customer or target != expected or not started:
         return False
     created = frappe.utils.get_datetime(snapshot.get("creation"))
     return abs((started - created).total_seconds()) <= STARTUP_SECONDS

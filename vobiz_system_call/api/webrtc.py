@@ -14,6 +14,7 @@ from frappe import _
 from vobiz_click_to_call import number_privacy
 from vobiz_click_to_call.services.queue_sources import queue_includes, queue_source_options
 from frappe.rate_limiter import rate_limit
+from vobiz_click_to_call.services.callback_limits import callback_rate_limit
 from werkzeug.wrappers import Response
 
 from vobiz_click_to_call.services.numbers import normalize_phone_number, provider_phone_number
@@ -23,7 +24,7 @@ from vobiz_system_call.api.settings import (
     CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_MOBILE_BRIDGE, device_enabled, get_browser_softphone_registrar,
     get_browser_softphone_sdk_url, get_call_device, get_caller_id,
     get_inbound_callback_token, get_profile_endpoint_uri, get_profile_password,
-    get_settings, get_system_call_profile, get_webhook_base_url, is_enabled, callback_request_limit,
+    get_settings, get_system_call_profile, get_webhook_base_url, is_enabled,
 )
 
 ACTIVE_BROWSER_STATUSES = lifecycle.ACTIVE
@@ -282,7 +283,7 @@ def cancel_browser_call(call_log: str):
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
-@rate_limit(limit=lambda: callback_request_limit("answer"), seconds=60)
+@callback_rate_limit("answer", default=600)
 def answer(token=None):
     if not _valid_public_token(token) or not is_enabled(get_settings()):
         return _plain_response("Not permitted.", 403)
@@ -303,7 +304,7 @@ def answer(token=None):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
-@rate_limit(limit=lambda: callback_request_limit("hangup"), seconds=60)
+@callback_rate_limit("hangup", default=600)
 def hangup(token=None):
     """Application-level final callback; never route or dial from this endpoint."""
     if not _valid_public_token(token):
@@ -349,7 +350,7 @@ def hangup(token=None):
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET", "POST"])
-@rate_limit(limit=lambda: callback_request_limit("answer"), seconds=60)
+@callback_rate_limit("answer", default=600)
 def fallback(token=None):
     """Fail closed if answering fails; final hangup/CDR confirms termination."""
     if not _valid_public_token(token):
@@ -447,24 +448,37 @@ def _replace_dial_number_with_user(xml, call_log, endpoint):
     return '<?xml version="1.0" encoding="UTF-8"?>' + ElementTree.tostring(root, encoding="unicode")
 
 
+def _reject_browser_answer(reason, uuid="", call_log=""):
+    # Never log the SIP headers, private route token, callback URL or numbers.
+    # File logging survives routing rollbacks and avoids DB work on rejection.
+    try:
+        frappe.logger("vobiz_callbacks").warning({
+            "event": "browser_answer_rejected", "reason": reason,
+            "call_uuid": str(uuid or "")[:80], "call_log": str(call_log or "")[:140],
+        })
+    except Exception:
+        pass  # Diagnostics must not change the fail-closed routing response.
+    return _xml_response(_hangup_xml())
+
+
 def _answer_sdk_outbound(raw_from, raw_to, payload):
     from vobiz_system_call.api import conference
     destination = _number(raw_to)
     uuid = _provider_uuid(payload)
     if not destination or not uuid:
-        return _xml_response(_hangup_xml())
+        return _reject_browser_answer("missing_destination_or_uuid", uuid)
     profiles = frappe.get_all(
         "Vobiz User Mapping",
         filters={"browser_softphone_username": _sip_username(raw_from), "enabled": 1},
         fields=["name", "user"], limit_start=0, limit_page_length=2,
     )
     if len(profiles) != 1:
-        return _xml_response(_hangup_xml())
+        return _reject_browser_answer("agent_mapping_not_unique", uuid)
     mapping = lifecycle.lock_mapping(profiles[0].user)
     if (not mapping.browser_softphone_enabled or not mapping.current_call_log
             or get_profile_endpoint_uri(mapping.as_dict()) != raw_from):
         frappe.db.rollback()
-        return _xml_response(_hangup_xml())
+        return _reject_browser_answer("agent_registration_or_reservation_mismatch", uuid)
     mapping, row = lifecycle.lock_call(mapping.current_call_log)
     if conference.state(row):
         return conference.answer_agent(raw_from, raw_to, payload)
@@ -473,16 +487,16 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
     if private:
         if not private_routing.matches(row, raw_to, payload):
             frappe.db.rollback()
-            return _xml_response(_hangup_xml())
+            return _reject_browser_answer("private_route_validation_failed", uuid, row.name)
         # Resolve only from the locked, authorized call; never trust browser To.
         destination = _number(row.customer_number)
     elif private_routing.header(payload):
         frappe.db.rollback()
-        return _xml_response(_hangup_xml())
+        return _reject_browser_answer("unexpected_private_route_header", uuid, row.name)
     if conference.browser_route(payload):
         # A delayed conference invite must never enter the ordinary Dial path.
         frappe.db.commit()
-        return _xml_response(_hangup_xml())
+        return _reject_browser_answer("stale_conference_invite", uuid, row.name)
     if (not lifecycle.is_browser_call(row) or row.direction != "Outgoing" or destination != _number(row.customer_number)
             or row.status in lifecycle.TERMINAL
             or (row.call_uuid and row.call_uuid != uuid)
@@ -490,7 +504,7 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
             or lifecycle.context(row).get("agent_cancelled")
             or row.call_status in ("cancellation-requested", "browser-ended-pending-provider")):
         frappe.db.rollback()
-        return _xml_response(_hangup_xml())
+        return _reject_browser_answer("call_state_not_routable", uuid, row.name)
     # Only the provider-authenticated answer can claim a prepared call's UUID.
     frappe.db.set_value("Vobiz Call Log", row.name, {
         "call_uuid": uuid, "from_number": raw_from, "to_number": destination,
@@ -712,7 +726,7 @@ def _dial_callback_state(row, payload):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
-@rate_limit(limit=lambda: callback_request_limit("event"), seconds=60)
+@callback_rate_limit("event", default=600)
 def provider_event(call_log: str, token: str, final: str = "0"):
     # Per-call credential is sent only to the provider through Dial XML.
     auth_row = frappe.db.get_value("Vobiz Call Log", call_log, ["name", "call_uuid"], as_dict=True)
@@ -753,7 +767,7 @@ def provider_event(call_log: str, token: str, final: str = "0"):
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
-@rate_limit(limit=lambda: callback_request_limit("event"), seconds=60)
+@callback_rate_limit("event", default=600)
 def incoming_action(call_log: str, token: str):
     auth = frappe.db.get_value("Vobiz Call Log", call_log, ["name", "call_uuid"], as_dict=True)
     if not auth or not hmac.compare_digest(_provider_call_token(auth), str(token or "")) or not token:
