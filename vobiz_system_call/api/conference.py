@@ -441,12 +441,11 @@ def browser_event(mapping, row, event, reason, sdk_uuid, generation=0):
     return {"status": row.status, "conference_recovery": True}
 
 
-def cancel(mapping, row):
+def cancel(mapping, row, origin=None, diagnostics=None):
     value = state(row)
     value["closed"] = True
-    data = lifecycle.context(row)
-    data["agent_cancelled"] = True
-    data.setdefault("agent_cancel_requested_at", frappe.utils.now())
+    from vobiz_system_call.api.diagnostics import cancellation_context
+    data = cancellation_context(lifecycle.context(row), origin, diagnostics)
     row.request_json = json.dumps(data)
     save(row, value, call_status="cancellation-requested")
     frappe.db.commit()

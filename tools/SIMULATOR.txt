@@ -1,0 +1,45 @@
+Local Vobiz simulator
+=====================
+From Ubuntu/WSL:
+cd /home/mit/frappe-bench
+env/bin/python apps/vobiz_system_call/tools/vobiz_simulator.py --agents 20 --keep-open
+Open http://localhost:8766 for the live dashboard. Ctrl+C stops it.
+Omit --keep-open for a finite run returning nonzero if a check fails.
+
+Requires the bench Python, site1.local and its Redis cache. It binds loopback only.
+Reports are written to test-results/vobiz-simulator/<run>/report.json and requests.jsonl.
+No provider credentials, phone numbers, SIP registration or real calls are used by this script.
+It changes only per-request in-memory config and dedicated Redis keys prefixed
+vobiz_simulator.<run>.<phase>; it does not change production counters or site limits.
+
+The low-limit baseline is sequential to show deterministic double counting.
+Legacy: outer 20, inner 10; 30 requests yield 5 accepted and 25 rejected.
+Patched: the same limits yield 20 accepted and 10 rejected.
+The load phase sends 2100 requests with 20 concurrent clients at a 2000 limit;
+expected result is 2000 accepted, 100 HTTP 429 within one limiter window.
+Slow runs crossing a 60-second window may fail this expectation legitimately.
+
+The 20 virtual agents exercise a SYNTHETIC state model: duplicate start, cancel,
+late answer, tab close, overlapping calls, and duplicate final events.
+They do not log in as the fixture users and do not exercise the real browser SDK,
+production callback authentication, queue throughput, or live provider capacity.
+Use the repository lifecycle tests and separately bounded browser calls for those.
+
+Local fixtures created 2026-11-02:
+20 Sales User accounts: vobiz.sim.agent01@example.invalid through agent20.
+No SIP mappings; no welcome email. Pipeline Vobiz Simulator has assignment disabled.
+CRM-LEAD-2026-07373, CRM-LEAD-2026-07374, CRM-LEAD-2026-07375.
+Destination numbers are stored only in local CRM. Manifest: test-results/vobiz-simulator/fixtures.json.
+Fixture accounts are not automatically recreated or removed by this simulator.
+
+Real browser test evidence (three calls total) is saved separately in
+real-calls.json and callback-http-evidence.json under test-results/vobiz-simulator.
+Two calls exposed Dial URLs containing the public ngrok hostname plus local :8000;
+provider reported 7012 Error Reaching Action URL. Set the local Vobiz Settings
+Webhook Base URL explicitly to the public HTTPS ngrok origin, without :8000.
+After this change the third call delivered customer answer/hangup events with HTTP 200.
+ERP still recorded zero billsec; the callback contains DialBLegDuration=10.
+Provider parent/browser billsec is not the customer talk duration.
+The intended early-cancel browser tests were not completed: automation targeted
+buttons behind the Workdesk modal; calls ended through provider/customer events.
+Do not count those attempts as passed cancellation tests.

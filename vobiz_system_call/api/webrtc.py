@@ -39,7 +39,7 @@ def _browser_enabled():
 
 def _login():
     if frappe.session.user == "Guest":
-        frappe.throw(_("Login required."))
+        frappe.throw(_("Login required."), frappe.AuthenticationError)
 
 
 @frappe.whitelist()
@@ -189,7 +189,7 @@ def get_incoming_call(caller: str, tab_id: str):
 
 
 @frappe.whitelist(methods=["POST"])
-def update_browser_softphone_call(call_log: str, event: str, status=None, reason=None, call_uuid=None, conference_generation=0):
+def update_browser_softphone_call(call_log: str, event: str, status=None, reason=None, call_uuid=None, conference_generation=0, failure_evidence=None):
     _login()
     mapping, row = lifecycle.lock_call(call_log)
     if row.user != frappe.session.user and "System Manager" not in frappe.get_roles():
@@ -202,22 +202,32 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
     if row.status in lifecycle.TERMINAL:
         frappe.db.commit()
         return {"status": row.status}
+    if mapping.get("current_call_log") and mapping.current_call_log != row.name:
+        frappe.db.commit()
+        return {"status": row.status, "ignored": "superseded-attempt"}
     sdk_uuid = _provider_uuid({"CallUUID": call_uuid})
     from vobiz_system_call.api import conference
     if conference.state(row):
         return conference.browser_event(mapping, row, event, reason, sdk_uuid, conference_generation)
     # SDK IDs can identify a different leg; they must never overwrite the authenticated provider ID.
     if event in TERMINAL_EVENTS:
-        if (row.call_uuid or row.get("recording_call_uuid") or sdk_uuid
-                or row.call_status in lifecycle.LOCAL_BROWSER_ACTIVE_STATUSES):
+        from vobiz_system_call.api import startup_failure
+        details = startup_failure.evidence(failure_evidence)
+        if details.get("attempt_id") and details["attempt_id"] != row.name:
+            frappe.db.commit()
+            return {"status": row.status, "ignored": "different-attempt"}
+        if startup_failure.confirmed(mapping, row, event, details, sdk_uuid):
+            data = lifecycle.context(row)
+            data["startup_failure"] = details
+            frappe.db.set_value("Vobiz Call Log", call_log, "request_json", json.dumps(data))
+            result = lifecycle.finish_locked(mapping, row, "startup-failed", str(reason or ""), status="Failed")
+        else:
             values = lifecycle.provider_pending_values(row, event, reason)
             if sdk_uuid and not row.call_uuid and not row.get("recording_call_uuid"):
                 values["recording_call_uuid"] = sdk_uuid
             frappe.db.set_value("Vobiz Call Log", call_log, values)
             lifecycle.enqueue_reconcile(call_log)
             result = row.status
-        else:
-            result = lifecycle.finish_locked(mapping, row, event, str(reason or ""))
     else:
         values = {"event": event, "call_status": event}
         if sdk_uuid and not row.call_uuid and not row.get("recording_call_uuid"):
@@ -226,6 +236,9 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
             values["status"] = "Ringing"
         elif event == "onCallAnswered":
             values["call_status"] = "browser-audio-connected"
+            data = lifecycle.context(row)
+            data["browser_session_answered"] = True
+            values["request_json"] = json.dumps(data)
             from vobiz_click_to_call.services.recording import has_session_recording
             # Record answers the browser leg before Dial answers the customer.
             # Only the authenticated Dial event may confirm that customer answer.
@@ -241,28 +254,28 @@ def update_browser_softphone_call(call_log: str, event: str, status=None, reason
         "event": event,
         "reason": str(reason or "")[:500],
         "call_uuid": sdk_uuid,
+        "failure_evidence": startup_failure.evidence(failure_evidence) if event in TERMINAL_EVENTS else {},
     })
     frappe.db.commit()
-    return {"status": result}
+    return {"status": result, "pending_provider": event in TERMINAL_EVENTS and result not in lifecycle.TERMINAL}
 
 
 @frappe.whitelist(methods=["POST"])
-def cancel_browser_call(call_log: str):
+def cancel_browser_call(call_log: str, origin: str | None = None, diagnostics=None):
     _login()
     mapping, row = lifecycle.lock_call(call_log)
     if row.user != frappe.session.user and "System Manager" not in frappe.get_roles():
         frappe.throw(_("Not permitted."))
     from vobiz_system_call.api import conference
     if conference.state(row):
-        return conference.cancel(mapping, row)
+        return conference.cancel(mapping, row, origin=origin, diagnostics=diagnostics)
     if row.status in lifecycle.TERMINAL:
         lifecycle.release_locked(mapping, row)
         frappe.db.commit()
         return {"status": row.status}
     uuid = row.call_uuid
-    context = lifecycle.context(row)
-    context["agent_cancelled"] = True
-    context.setdefault("agent_cancel_requested_at", frappe.utils.now())
+    from vobiz_system_call.api.diagnostics import cancellation_context
+    context = cancellation_context(lifecycle.context(row), origin, diagnostics)
     frappe.db.set_value("Vobiz Call Log", call_log, "request_json", json.dumps(context))
     frappe.db.set_value("Vobiz Call Log", call_log, "call_status",
                         "browser-ended-pending-provider" if lifecycle.has_browser_terminal_event(row)
@@ -480,6 +493,16 @@ def _answer_sdk_outbound(raw_from, raw_to, payload):
         frappe.db.rollback()
         return _reject_browser_answer("agent_registration_or_reservation_mismatch", uuid)
     mapping, row = lifecycle.lock_call(mapping.current_call_log)
+    # A delayed old INVITE must never claim a freshly reset/retried reservation,
+    # even when the endpoint and customer number are identical.
+    expected_attempt = lifecycle.context(row).get("browser_attempt_id")
+    received_attempt = next((str(value) for key, value in payload.items()
+        if str(key).lower().replace("-", "").replace("_", "") in
+        ("xvhattemptid", "sipheaderxvhattemptid")), "")
+    if ((expected_attempt and received_attempt != expected_attempt)
+            or (received_attempt and received_attempt != row.name)):
+        frappe.db.rollback()
+        return _reject_browser_answer("stale_browser_attempt", uuid, row.name)
     if conference.state(row):
         return conference.answer_agent(raw_from, raw_to, payload)
     from vobiz_system_call.api import private_routing
@@ -737,6 +760,10 @@ def provider_event(call_log: str, token: str, final: str = "0"):
     payload = _request_params()
     # The Dial token is specific to this call and authorizes B-leg callbacks too.
     state = _dial_callback_state(row, payload)
+    from vobiz_system_call.api.customer_reporting import capture
+    if not capture(row, payload, state):
+        frappe.db.commit()
+        return _xml_response(_empty_xml())
     from vobiz_system_call.api.customer_outcome import apply as apply_customer_outcome
     outcome_applied = apply_customer_outcome(mapping, row, payload, state)
     terminal = state in ("completed", "hangup", "busy", "no-answer", "failed", "timeout", "cancel") or final == "1"

@@ -21,7 +21,7 @@ class BrowserOwnershipTests(unittest.TestCase):
         self.mock(frappe, "session", SimpleNamespace(user="agent"))
         self.mock(frappe, "db", MagicMock())
         self.mock(frappe, "cache", lambda: self.cache)
-        self.mock(frappe, "throw", lambda msg: (_ for _ in ()).throw(ValueError(msg)))
+        self.mock(frappe, "throw", lambda msg, *args: (_ for _ in ()).throw(ValueError(msg)))
         self.mock(frappe, "publish_realtime", MagicMock())
         self.mock(ownership, "_", lambda x: x)
         self.mock(webrtc, "_", lambda x: x)

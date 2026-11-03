@@ -164,7 +164,7 @@ test('overlapping Stop requests share one provider request', async () => {
 });
 
 test('permissions and ownership rejection still disconnect registration', async () => {
-    for (const status of [401, 403, 417]) {
+    for (const status of [401, 403]) {
         const t = setup();
         t.obj.send_browser_presence = registered => registered === false
             ? Promise.resolve({}) : Promise.reject({status});
@@ -172,6 +172,57 @@ test('permissions and ownership rejection still disconnect registration', async 
         assert.equal(t.logouts(), 1);
         assert.equal(t.obj.state.softphone.client, null);
     }
+});
+
+test('generic 417 preserves working audio while typed permission failures revoke registration', async () => {
+    for (const exception of [undefined, 'ValidationError', 'TimestampMismatchError', 'PermissionError', 'AuthenticationError']) {
+        const t = setup();
+        t.obj.send_browser_presence = registered => registered === false ? Promise.resolve({})
+            : Promise.reject({status: 417, responseJSON: {exc_type: exception}});
+        await t.obj.check_browser_network(t.client, true);
+        const revoked = ['PermissionError', 'AuthenticationError'].includes(exception);
+        assert.equal(t.logouts(), revoked ? 1 : 0);
+        if (!revoked) {
+            assert.equal(t.obj.state.softphone.current_call_log, 'C1');
+            t.obj.send_browser_presence = () => Promise.resolve({});
+            await t.obj.check_browser_network(t.client, true);
+            assert.equal(t.obj.browser_softphone_reconnecting(), false);
+        }
+    }
+});
+
+test('automatic cancellation keeps its origin across an offline retry', async () => {
+    const t = setup(), origins = [];
+    t.ctx.frappe.call = (method, args) => {
+        if (typeof method === 'string') {
+            origins.push(args.origin);
+            return origins.length === 1 ? Promise.reject({status: 0}) : Promise.resolve({});
+        }
+        return Promise.resolve({message: {name: 'C1', status: origins.length > 1 ? 'Completed' : 'Connected'}});
+    };
+    await assert.rejects(t.obj.cancel_call_log('C1', null, 'media_timeout'));
+    t.advance(10000); // Respect the existing retry backoff.
+    await t.obj.cancel_call_log('C1');
+    assert.deepEqual(origins, ['media_timeout', 'media_timeout']);
+});
+
+test('cancelled auto-dial number selection never cancels an unrelated live call', async () => {
+    const t = setup();
+    t.ctx.frappe.datetime = {now_datetime: () => '2026-11-03 12:00:00'};
+    for (const method of ['add_auto_event', 'update_selected_count', 'render_auto_toggle', 'hide_auto_call_dialog', 'show_auto_call_dialog']) {
+        t.obj[method] = () => {};
+    }
+    let stops = 0;
+    t.obj.cancel_call_log = () => {stops++; return Promise.resolve();};
+    t.obj.state.auto_dial = {running: true, current: null, cursor: 0, queue: [{name: 'NEXT'}]};
+    t.obj.start_call_for_row = () => Promise.resolve(null);
+    t.obj.run_next_auto_dial();
+    await flush();
+    assert.equal(stops, 0);
+    assert.equal(t.obj.state.softphone.current_call_log, 'C1');
+    assert.equal(t.obj.state.auto_dial.running, false);
+    t.obj.stop_auto_dial();
+    assert.equal(stops, 1, 'Explicit agent stop still works');
 });
 
 test('late presence rejection from an old client cannot disconnect the new client', async () => {

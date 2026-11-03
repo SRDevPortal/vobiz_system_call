@@ -43,11 +43,14 @@ def start_call(
     patient_phone_selected: int | str = 0,
     client_context: str | None = None,
     tab_id: str | None = None,
+    retry_of: str | None = None,
 ) -> dict[str, Any]:
     if frappe.session.user == "Guest":
         frappe.throw(_("Login required."))
 
     system_settings = get_settings()
+    if retry_of and not is_enabled(system_settings):
+        frappe.throw(_("Browser calling must be enabled to retry."))
     if not is_enabled(system_settings):
         return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)
 
@@ -58,6 +61,8 @@ def start_call(
     if number_privacy.restricted() and call_device == CALL_DEVICE_SYSTEM_DIALER:
         frappe.throw(_("System Dialer exposes customer numbers. Enable Browser Softphone or select Mobile Bridge."))
 
+    if retry_of and call_device != CALL_DEVICE_BROWSER_SOFTPHONE:
+        frappe.throw(_("Retry is only available for browser calls."))
     assert_device_enabled(call_device, system_settings)
     if call_device not in {CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
         return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)
@@ -122,6 +127,8 @@ def start_call(
         settings=core_settings,
     )
 
+    from vobiz_system_call.api import complete_retry
+    previous = complete_retry.lock_retry(retry_of, reference_doctype, reference_name, customer_number) if retry_of else None
     call_log = core_call.create_call_log(
         reference_doctype=reference_doctype,
         reference_name=reference_name,
@@ -131,6 +138,9 @@ def start_call(
         caller_id=caller_id,
         call_flow=call_flow,
     )
+
+    if previous:
+        complete_retry.link_retry(previous, call_log)
 
     if call_device == CALL_DEVICE_SYSTEM_DIALER:
         return start_system_dialer_call(
@@ -257,6 +267,8 @@ def start_browser_softphone_call(
         "to_number": customer_number,
         "request_json": json.dumps(
             {
+                **lifecycle.context(call_log),
+                "browser_attempt_id": call_log.name,
                 "call_device": CALL_DEVICE_BROWSER_SOFTPHONE,
                 "endpoint_username": endpoint_username,
                 "endpoint_uri": endpoint_uri,
@@ -309,35 +321,30 @@ def start_browser_softphone_call(
 
 @frappe.whitelist(methods=["POST"])
 def complete_call_log(call_log: str):
-    """Manually complete the agent's current log without a provider hangup request."""
-    if frappe.session.user == "Guest":
-        frappe.throw(_("Login required."))
-    # Lock in the same order as call start/cancellation, and bind the action to
-    # the requesting agent's exact current call. Never accept a status from JS.
-    mapping = lifecycle.lock_mapping(frappe.session.user)
-    doc = frappe.get_doc("Vobiz Call Log", call_log, for_update=True)
-    if doc.user != frappe.session.user:
-        frappe.throw(_("Not permitted."))
-    if doc.status in lifecycle.TERMINAL:
-        lifecycle.release_locked(mapping, doc)
-        frappe.db.commit()
-        return {"name": doc.name, "status": doc.status}
-    if mapping.current_call_log != doc.name:
-        frappe.throw(_("This is no longer your current call. Refresh and try again."))
-    # This is an explicit log-only action, distinct from End Call. Keep normal
-    # document hooks and do not fabricate provider IDs, end times or CDR data.
-    doc.status = "Completed"
-    doc.save(ignore_permissions=True)
-    lifecycle.release_locked(mapping, doc)
-    frappe.db.commit()
-    return {"name": doc.name, "status": doc.status}
+    """Reset the local attempt without waiting for provider termination."""
+    from vobiz_system_call.api.complete_retry import check_completion
+    return check_completion(call_log)
 
 
 @frappe.whitelist(methods=["POST"])
-def cancel_call(call_log: str):
+def retry_call_log(call_log: str, tab_id: str):
+    """Use the original server-side destination; start_call rechecks under lock."""
+    if frappe.session.user == "Guest":
+        frappe.throw(_("Login required."))
+    previous = frappe.get_doc("Vobiz Call Log", call_log)
+    if previous.user != frappe.session.user:
+        frappe.throw(_("Not permitted."))
+    return start_call(previous.reference_doctype, previous.reference_name,
+                      phone_field=None, phone_number=previous.customer_number,
+                      patient_phone_selected=1, client_context="agent_console", tab_id=tab_id,
+                      retry_of=call_log)
+
+
+@frappe.whitelist(methods=["POST"])
+def cancel_call(call_log: str, origin: str | None = None, diagnostics=None):
     # Protect browser calls even when cancellation comes from another core UI.
     row = frappe.db.get_value("Vobiz Call Log", call_log, ["request_json"], as_dict=True)
     if row and lifecycle.is_managed_call(row):
         from vobiz_system_call.api.webrtc import cancel_browser_call
-        return cancel_browser_call(call_log)
+        return cancel_browser_call(call_log, origin=origin, diagnostics=diagnostics)
     return core_call.cancel_call(call_log)

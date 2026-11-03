@@ -233,31 +233,39 @@ test('late SDK end-event failure cannot change a newer call', async () => {
     assert.equal(obj.state.softphone.in_call, true);
     assert.equal(obj.state.softphone.error, undefined);
 });
-test('a nonterminal completion response preserves the active call', async () => {
+test('an unacknowledged local reset preserves the active call', async () => {
     const {obj, ctx} = setup();
-    let watched = '';
+    let notice = '';
     obj.render_header_active_call = () => {};
     obj.browser_request_with_timeout = value => value;
-    obj.watch_browser_call_disposition = name => {watched = name;};
+    ctx.setTimeout = fn => {fn();};
+    ctx.frappe.msgprint = message => {notice = message;};
     ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Connected', pending_provider: true}});
     await obj.complete_header_active_call();
-    assert.equal(watched, 'C1');
+    assert.match(notice, /not acknowledged/);
     assert.equal(obj.state.softphone.current_call_log, 'C1');
     assert.equal(obj.state.softphone.in_call, true);
 });
 
-
-test('manual Completed response clears the matching console call immediately', async () => {
+test('local reset clears only the matching console session before retry', async () => {
     const {obj, ctx} = setup();
     let completed, refreshed = false;
     ctx.document = {};
     ctx.$ = () => ({trigger(name) {refreshed = name === 'vobiz_refresh_availability';}});
     obj.render_header_active_call = () => {};
     obj.browser_request_with_timeout = value => value;
+    obj.stop_browser_network_monitor = () => {};
+    obj.stop_browser_microphone_test = () => {};
+    obj.check_browser_microphone = async () => true;
+    obj.connect_browser_softphone = async () => {};
+    obj.browser_softphone_reconnecting = () => false;
     obj.handle_call_disconnected = value => {completed = value;};
-    ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Completed'}});
+    ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Cancelled', local_reset: true}});
     await obj.complete_header_active_call();
     assert.equal(completed.name, 'C1');
-    assert.equal(completed.status, 'Completed');
+    assert.equal(completed.status, 'Cancelled');
     assert.equal(refreshed, true);
+    assert.equal(obj.state.softphone.current_call_log, '');
+    assert.equal(obj.state.softphone.in_call, false);
+    await obj.softphone_reset_promise;
 });

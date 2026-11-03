@@ -10,6 +10,9 @@ required_apps = ["SRDevPortal/vobiz_click_to_call", "SRDevPortal/vobiz_ai"]
 after_install = "vobiz_system_call.install.after_install"
 after_migrate = "vobiz_system_call.install.after_migrate"
 
+before_request = ["vobiz_system_call.request_diagnostics.before_request"]
+after_request = ["vobiz_system_call.request_diagnostics.after_request"]
+
 override_whitelisted_methods = {
     "vobiz_click_to_call.api.call.cancel_call": "vobiz_system_call.api.call.cancel_call",
     "vobiz_click_to_call.api.call.start_call": "vobiz_system_call.api.call.start_call",
@@ -21,7 +24,7 @@ override_whitelisted_methods = {
 app_include_js = [
     # Keep the URL version in sync with the console cache version in this asset.
     # Otherwise browsers can retain the pre-identity script across page reloads.
-	"/assets/vobiz_system_call/js/vobiz_system_call.js?v=20260929.4",
+	"/assets/vobiz_system_call/js/vobiz_system_call.js?v=20261103.1",
 ]
 
 before_uninstall = "vobiz_system_call.install.before_uninstall"

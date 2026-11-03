@@ -24,6 +24,7 @@ CALL_FIELDS = [
     "start_time", "creation", "reference_doctype", "reference_name", "request_json",
     "callback_token", "caller_id", "did_number", "customer_number", "direction",
     "agent_number", "normalized_customer_number", "from_number", "to_number", "modified",
+    "b_leg_uuid", "cdr_sync_status",
 ]
 PROVIDER_PENDING_STATUSES = frozenset(("browser-ended-pending-provider", "cancellation-requested"))
 LOCAL_BROWSER_ACTIVE_STATUSES = frozenset((
@@ -56,7 +57,7 @@ def is_managed_call(row):
 def lock_mapping(user):
     mapping = core_call.get_user_mapping(user)
     if not mapping:
-        frappe.throw(_("No active Vobiz user mapping found."))
+        frappe.throw(_("No active Vobiz user mapping found."), frappe.PermissionError)
     core_call._lock_user_mapping(mapping["name"])
     # A locking read sees the latest committed state, including competing starts.
     return frappe.get_doc("Vobiz User Mapping", mapping["name"], for_update=True)
@@ -132,6 +133,7 @@ def finish_locked(mapping, row, event, reason="", status=None, confirmed_end=Fal
         # Local elapsed audio time; provider billsec remains authoritative.
         values["duration"] = max(0, (now - frappe.utils.get_datetime(row.answer_time)).total_seconds())
     frappe.db.set_value("Vobiz Call Log", row.name, values)
+    row.update(values)
     release_locked(mapping, row)
     from vobiz_click_to_call.services.reference_sync import request_reference_sync
     request_reference_sync(row.name)
@@ -144,18 +146,22 @@ def finish_locked(mapping, row, event, reason="", status=None, confirmed_end=Fal
 
 
 def release_locked(mapping, row):
+    if row.status not in TERMINAL:
+        return  # Neither age nor browser presence proves a live call has ended.
     now = frappe.utils.now_datetime()
     if mapping.current_call_log == row.name:
-        available = (mapping.availability_status == "Busy" and bool(mapping.auto_available_after_call)
-                     and (not is_browser_call(row) or bool(presence(mapping.user))))
-        next_status = mapping.availability_status if mapping.availability_status in ("Offline", "Away") else (
-            "Available" if available else "Away"
-        )
-        frappe.db.set_value("Vobiz User Mapping", mapping.name, {
-            "current_call_log": "", "accept_calls": int(available),
+        from vobiz_click_to_call.services.availability_recovery import after_call_state, record_transition
+        browser = is_browser_call(row)
+        next_status, reason = after_call_state(mapping, browser=browser,
+                                               present=bool(presence(mapping.user)) if browser else True)
+        updates = {
+            "current_call_log": "", "accept_calls": int(next_status == "Available"),
             "availability_status": next_status,
             "last_status_at": now,
-        })
+        }
+        frappe.db.set_value("Vobiz User Mapping", mapping.name, updates)
+        record_transition(mapping, next_status, now, reason, row.name)
+        mapping.update(updates)  # Duplicate terminal callbacks in this transaction are inert.
 
 def presence(user):
     return frappe.cache().get_value("vsc:presence:" + user, expires=True)
@@ -297,7 +303,7 @@ def find_recovery_cdr(client, snapshot):
     from vobiz_click_to_call.services.cdr import lookup_cdr
     # Keep the authenticated UUID distinct from a browser-reported candidate.
     target = frappe._dict(snapshot, recording_call_uuid=None, request_uuid=None,
-                          a_leg_uuid=None, b_leg_uuid=None)
+                          a_leg_uuid=None, b_leg_uuid=None, request_json=None)
     return lookup_cdr(client, target)
 
 
@@ -436,7 +442,8 @@ def _reconcile_call(call_log, recovery_lookup=False):
         frappe.db.commit()
         from vobiz_click_to_call.services.recovery_policy import clear
         clear(call_log)
-        return
+        from vobiz_system_call.api.customer_reporting import reconcile_ended
+        return reconcile_ended(row)
     if not recovery_lookup and healthy_browser_call(row):
         frappe.db.commit()
         from vobiz_click_to_call.services.recovery_policy import clear
@@ -502,6 +509,15 @@ def finish_reconciled_call(snapshot, cdr, missing_id=False):
     if ended and row.status not in TERMINAL:
         row.end_time = ended
     finish_locked(mapping, row, "provider-cdr", str(cdr.get("hangup_cause") or ""), status=status)
+    from vobiz_click_to_call.services.customer_reporting import direct_customer_call
+    if direct_customer_call(row):
+        # This is the parent/browser CDR, used only as termination evidence.
+        # Its billed connection time must never replace customer reporting.
+        frappe.db.commit()
+        from vobiz_click_to_call.services.recovery_policy import clear
+        clear(call_log)
+        from vobiz_system_call.api.customer_reporting import reconcile_ended
+        return reconcile_ended(row)
     # CDR can enrich a final call without changing an already final outcome.
     values = {"cdr_sync_status": "Synced", "cdr_synced_at": frappe.utils.now(),
               "cdr_json": json.dumps({"matched_cdr": cdr}, default=str)}

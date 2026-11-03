@@ -121,6 +121,7 @@ class VobizAgentConsole {
 		this.attendance_tab_id = this.get_attendance_tab_id();
 		this.render();
 		this.bind();
+        this.load_encounter_views();
 		this.bind_realtime();
 		$(document).trigger('vobiz_refresh_availability');
 		this.start_console_heartbeat();
@@ -177,10 +178,11 @@ class VobizAgentConsole {
                 <div class="vobiz-tabs">
                     <button class="active" data-console-view="queue">${__('Lead / Patient Queue')}</button>
                     <button data-console-view="encounters">${__('Patient Encounter List')}</button>
+                    <button class="hidden" data-console-view="ndr">${__('NDR')}</button>
                 </div>
                 <section class="vobiz-band hidden" data-role="encounter-panel">
                     <div class="vobiz-section-title">
-                        <h3>${__('Patient Encounter List')}</h3>
+                        <h3 data-role="encounter-title">${__('Patient Encounter List')}</h3>
                         <div class="vobiz-queue-tools">
                             <input class="form-control input-sm" data-role="encounter-search" placeholder="${__('Search encounter or patient')}">
                             <button class="btn btn-default btn-sm" data-action="refresh-encounters">${__('Refresh')}</button>
@@ -662,13 +664,15 @@ class VobizAgentConsole {
 	bind() {
 		const $main = this.page.main;
         $main.on('click', '[data-console-view]', (e) => {
-            this.state.console_view = $(e.currentTarget).attr('data-console-view');
-            const encounters = this.state.console_view === 'encounters';
-            $main.find('[data-console-view]').removeClass('active');
-            $(e.currentTarget).addClass('active');
-            $main.find('[data-role="encounter-panel"]').toggleClass('hidden', !encounters);
-            $main.find('.vobiz-layout, .vobiz-dialer-control').toggleClass('hidden', encounters);
-            if (encounters) this.load_encounters();
+            this.switch_console_view($(e.currentTarget).attr('data-console-view'));
+        });
+        $main.on('click', '[data-encounter-sort]', (e) => {
+            if (this.state.console_view !== 'ndr') return;
+            const field = $(e.currentTarget).attr('data-encounter-sort');
+            this.state.encounter_sort_order = this.state.encounter_sort_by === field && this.state.encounter_sort_order === 'asc' ? 'desc' : 'asc';
+            this.state.encounter_sort_by = field;
+            this.state.encounter_page = 1;
+            this.load_encounters();
         });
         $main.on('click', '[data-action="encounter-settings"]', () => frappe.set_route('Form', 'Vobiz Settings'));
         $main.on('click', '[data-action="refresh-encounters"]', () => this.load_encounters());
@@ -1590,8 +1594,15 @@ class VobizAgentConsole {
 		this.watch_browser_call_disposition(callLog);
 		this.browser_request_with_timeout(Promise.resolve().then(() =>
 			this.sync_browser_softphone_event(event, callInfo, callLog)
-		)).then(() => {
+		)).then((response) => {
 			if (softphone.current_call_log !== callLog) return;
+			if (((response || {}).message || {}).pending_provider) {
+				softphone.in_call = false;
+				softphone.status = __('Checking call status');
+				this.render_browser_softphone();
+				this.load();
+				return;
+			}
 			this.reset_browser_softphone_call_state(
 				softphone.registered ? __('Registered') : __('Disconnected'), callLog, ''
 			);
@@ -1607,11 +1618,21 @@ class VobizAgentConsole {
 	matches_browser_call_event(callInfo) {
 		const softphone = this.state.softphone;
 		if (!softphone.current_call_log) return false;
+		const attempt = this.browser_event_attempt_id(callInfo);
+		if (attempt && attempt !== softphone.current_call_log) return false;
 		const uuid = this.extract_call_uuid(this.normalize_browser_softphone_event(callInfo));
+		if (uuid && (softphone.retired_call_uuids || []).includes(uuid)) return false;
 		if (uuid && softphone.sdk_call_uuid && uuid !== softphone.sdk_call_uuid) return false;
 		if (uuid && (softphone.conference_retired_uuids || []).includes(uuid)) return false;
 		if (uuid) softphone.sdk_call_uuid = uuid;
 		return true;
+	}
+
+	browser_event_attempt_id(callInfo) {
+		const info = this.normalize_browser_softphone_event(callInfo);
+		const headers = info.extraHeaders || {};
+		const key = Object.keys(headers).find(key => key.toLowerCase() === 'x-vh-attempt-id');
+		return key ? String(headers[key]) : '';
 	}
 
 	disconnect_browser_softphone() {
@@ -1939,7 +1960,8 @@ class VobizAgentConsole {
 			&& !softphone.pending_end_call) {
 			// A server-only failure must never end healthy audio. Only sustained
 			// browser/media loss exhausts this grace period.
-			this.cancel_call_log(softphone.current_call_log).catch(() => {});
+			this.report_browser_diagnostic('media_timeout', {media_lost_ms: Date.now() - mediaLostAt});
+			this.cancel_call_log(softphone.current_call_log, null, 'media_timeout').catch(() => {});
 		}
 		if (offline) return;
 		if (softphone.pending_end_call && !this.browser_end_retry) {
@@ -1947,7 +1969,7 @@ class VobizAgentConsole {
 			if (callLog === softphone.current_call_log) {
 				const retry = {};
 				this.browser_end_retry = retry;
-				this.cancel_call_log(callLog).catch(() => {}).finally(() => {
+				this.cancel_call_log(callLog, null, softphone.pending_end_origin || 'legacy_unspecified').catch(() => {}).finally(() => {
 					if (this.browser_end_retry === retry) this.browser_end_retry = null;
 				});
 			}
@@ -1966,7 +1988,12 @@ class VobizAgentConsole {
 			if (softphone.client !== vobiz || this.browser_presence_check !== check) return;
 			if (err && err.softphone_ownership) return;
 			const status = Number(err && err.status);
-			if ([401, 403, 417].includes(status)) {
+			const exception = err && err.responseJSON && err.responseJSON.exc_type;
+			const revoked = [401, 403].includes(status) ||
+				(status === 417 && ['AuthenticationError', 'PermissionError', 'SessionExpired'].includes(exception));
+			this.report_browser_diagnostic(revoked ? 'heartbeat_rejected' : 'heartbeat_failed',
+				{http_status: status || 0, exception});
+			if (revoked) {
 				// Authentication, permissions and tab-ownership rejection are not
 				// temporary network failures. Keep the existing enforcement.
 				softphone.error = __('Browser registration was rejected. Please sign in again or close the other calling tab.');
@@ -1980,6 +2007,31 @@ class VobizAgentConsole {
 				this.browser_presence_checked_at = Date.now();
 			}
 		});
+	}
+
+	browser_connection_evidence(extra = {}) {
+		const s = this.state.softphone;
+		return {online: !(window.navigator && window.navigator.onLine === false),
+			registered: Boolean(s.registered), in_call: Boolean(s.in_call),
+			media_connected: Boolean(s.recovery_media_connected), ...extra};
+	}
+
+	report_browser_diagnostic(event, extra = {}) {
+		const callLog = this.state.softphone.current_call_log;
+		if (!callLog) return;
+		const stamps = this.browser_diagnostic_at || (this.browser_diagnostic_at = new Map());
+		const key = `${callLog}:${event}`;
+		if (stamps.has(key) && Date.now() - stamps.get(key) < 30000) return;
+		stamps.set(key, Date.now());
+		if (stamps.size > 30) stamps.delete(stamps.keys().next().value);
+		const details = this.browser_connection_evidence(extra);
+		// A rejected session may be unable to upload; retain the same bounded
+		// diagnostic in the browser console without logging credentials or numbers.
+		console.warn('Vobiz call diagnostic', {call_log: callLog, event, details});
+		try {
+			Promise.resolve(frappe.call({method: 'vobiz_system_call.api.diagnostics.record_browser_diagnostic',
+				args: {call_log: callLog, event, details: JSON.stringify(details)}, silent: true})).catch(() => {});
+		} catch (_) {}
 	}
 
 	recover_conference_call(vobiz) {
@@ -2237,7 +2289,11 @@ class VobizAgentConsole {
 		if (callLog && this.state.softphone.current_call_log !== callLog) return;
 		this.stop_browser_softphone_audio();
 		const softphone = this.state.softphone;
+		if (softphone.sdk_call_uuid) {
+			softphone.retired_call_uuids = [...new Set([...(softphone.retired_call_uuids || []), softphone.sdk_call_uuid])].slice(-50);
+		}
 		softphone.pending_end_call = '';
+		softphone.pending_end_origin = '';
         softphone.customer_ringback_pending = false;
         softphone.ringback_provider_audio = false;
         softphone.ringback_energy = {};
@@ -2552,14 +2608,24 @@ class VobizAgentConsole {
 		if (!callLog) return Promise.resolve();
 		if (!callLogOverride && !this.matches_browser_call_event(callInfo)) return Promise.resolve();
 		const info = this.normalize_browser_softphone_event(callInfo);
+		// The SDK echoes our original headers even when no provider UUID exists.
+		// Never label an unidentified failure as belonging to the current attempt.
+		const failureEvidence = event === 'onCallFailed' ? {
+			attempt_id: this.browser_event_attempt_id(info) || (info.failure_phase ? callLogOverride : ''),
+			phase: info.failure_phase || 'sdk-failure',
+			originator: info.originator || '', protocol: info.protocol || '',
+			sdk_cause: info.arg0 || '',
+			code: info.code, state: info.state || '', direction: info.direction || ''
+		} : {};
 		return frappe.call({
 			method: 'vobiz_click_to_call.api.webrtc.update_browser_softphone_call',
 			args: {
 				call_log: callLog,
 				event,
 				status: info.status || '',
-				reason: info.reason || '',
+				reason: info.reason && info.reason !== 'none' ? info.reason : (info.arg0 || ''),
 				call_uuid: this.extract_call_uuid(info),
+				failure_evidence: JSON.stringify(failureEvidence),
 				conference_generation: this.state.softphone.conference_generation || 0
 			}
 		});
@@ -2567,6 +2633,9 @@ class VobizAgentConsole {
 
 
 	start_browser_softphone_call(message, row) {
+		if ((this.state.softphone.retired_call_logs || []).includes(message.call_log)) {
+			return Promise.reject(new Error(__('This call attempt was reset. Start a new call.')));
+		}
         this.stop_browser_ringback();
         this.prepare_browser_ringback_audio();
 		this.stop_browser_microphone_test();
@@ -2583,7 +2652,9 @@ class VobizAgentConsole {
 		softphone.conference_session_ended = false;
 		softphone.conference_join_started_at = Date.now();
 		let dialAttempted = false;
+		let failurePhase = 'pre-dial';
 		return this.connect_browser_softphone().then(() => {
+			if (softphone.current_call_log !== message.call_log) throw new Error(__('Call attempt was superseded.'));
 			softphone.current_destination = (message.private_browser_call || message.conference_recovery) ? message.customer_number : (message.destination || message.customer_number);
 			softphone.current_customer = row.title || row.name || __('Customer');
 			softphone.direction = __('Outgoing');
@@ -2595,16 +2666,23 @@ class VobizAgentConsole {
 			this.render_browser_softphone();
 			this.disable_browser_outgoing_tones();
 			dialAttempted = true;
-			softphone.client.client.call(message.destination || softphone.current_destination, message.conference_headers || {});
+			const accepted = softphone.client.client.call(message.destination || softphone.current_destination, {
+				...(message.conference_headers || {}), 'X-VH-Attempt-ID': message.call_log
+			});
+			if (accepted === false) {
+				dialAttempted = false;
+				failurePhase = 'sdk-declined';
+				throw new Error(__('Softphone did not start the call. Reconnect and try again.'));
+			}
 			return this.sync_browser_softphone_event('browserCallStarted', {}, message.call_log);
 		}).then(() => message).catch((err) => {
 			if (!dialAttempted && message.conference_recovery) {
-				return this.cancel_call_log(message.call_log, row).then(() => { throw err; });
+				return this.cancel_call_log(message.call_log, row, 'startup_failure').then(() => { throw err; });
 			}
 			if (!dialAttempted) {
 				// Registration failed before invoking the SDK: no voice call was issued.
 				return Promise.resolve(this.sync_browser_softphone_event(
-					'onCallFailed', {reason: err.message || __('Softphone registration failed.')}, message.call_log
+					'onCallFailed', {reason: err.message || __('Softphone registration failed.'), failure_phase: failurePhase}, message.call_log
 				)).then(() => {
 					if (softphone.current_call_log === message.call_log) {
 						this.reset_browser_softphone_call_state(__('Disconnected'), message.call_log, 'Failed');
@@ -2613,7 +2691,7 @@ class VobizAgentConsole {
 					throw err;
 				});
 			}
-			return this.cancel_call_log(message.call_log, row).then(() => { throw err; });
+			return this.cancel_call_log(message.call_log, row, 'startup_failure').then(() => { throw err; });
 		});
 	}
 
@@ -2701,6 +2779,7 @@ class VobizAgentConsole {
 	}
 
 	on_page_show() {
+        this.load_encounter_views();
 		this.schedule_whatsapp_sync(0);
 		$(document).trigger('vobiz_refresh_availability');
 		this.state.restore_checked = false;
@@ -3994,6 +4073,55 @@ class VobizAgentConsole {
 		`);
 	}
 
+    async load_encounter_views() {
+        const requestId = this.encounter_views_request_id = (this.encounter_views_request_id || 0) + 1;
+        try {
+            const response = await frappe.call({method: 'vobiz_click_to_call.api.encounter_queue.get_available_views'});
+            if (this.encounter_views_request_id !== requestId) return;
+            const enabled = Boolean((response.message || {}).ndr);
+            this.page.main.find('[data-console-view="ndr"]').toggleClass('hidden', !enabled);
+            if (!enabled && this.state.console_view === 'ndr') this.switch_console_view('queue');
+        } catch (error) {
+            if (this.encounter_views_request_id !== requestId) return;
+            this.page.main.find('[data-console-view="ndr"]').addClass('hidden');
+            if (this.state.console_view === 'ndr') this.switch_console_view('queue');
+        }
+    }
+
+    switch_console_view(view) {
+        if (!['queue', 'encounters', 'ndr'].includes(view)) return;
+        const main = this.page.main;
+        const previous = this.state.console_view;
+        this.encounter_view_state = this.encounter_view_state || {};
+        if (previous === 'encounters' || previous === 'ndr') {
+            this.encounter_view_state[previous] = {
+                page: this.state.encounter_page,
+                search: main.find('[data-role="encounter-search"]').val() || '',
+                sort_by: this.state.encounter_sort_by || '',
+                sort_order: this.state.encounter_sort_order || 'asc'
+            };
+        }
+        clearTimeout(this.encounter_search_timer);
+        this.encounter_request_id = (this.encounter_request_id || 0) + 1;
+        this.state.console_view = view;
+        const list = view !== 'queue';
+        main.find('[data-console-view]').removeClass('active');
+        main.find('[data-console-view="' + view + '"]').addClass('active');
+        main.find('[data-role="encounter-panel"]').toggleClass('hidden', !list);
+        main.find('.vobiz-layout, .vobiz-dialer-control').toggleClass('hidden', list);
+        if (!list) return;
+        const saved = this.encounter_view_state[view] || {};
+        this.state.encounter_page = saved.page || 1;
+        this.state.encounter_sort_by = saved.sort_by || '';
+        this.state.encounter_sort_order = saved.sort_order || 'asc';
+        this.state.encounters = [];
+        this.state.encounter_columns = [];
+        this.state.encounter_has_more = false;
+        main.find('[data-role="encounter-search"]').val(saved.search || '');
+        main.find('[data-role="encounter-title"]').text(view === 'ndr' ? __('NDR') : __('Patient Encounter List'));
+        return this.load_encounters();
+    }
+
     async load_encounters() {
         const requestId = this.encounter_request_id = (this.encounter_request_id || 0) + 1;
         const table = this.page.main.find('[data-role="encounter-table"]');
@@ -4005,7 +4133,10 @@ class VobizAgentConsole {
                 method: 'vobiz_click_to_call.api.encounter_queue.get_queue',
                 args: {
                     limit: 25, limit_start: (this.state.encounter_page - 1) * 25,
-                    search: this.page.main.find('[data-role="encounter-search"]').val() || ''
+                    search: this.page.main.find('[data-role="encounter-search"]').val() || '',
+                    view: this.state.console_view === 'ndr' ? 'ndr' : 'encounters',
+                    sort_by: this.state.encounter_sort_by || '',
+                    sort_order: this.state.encounter_sort_order || 'asc'
                 }
             });
             if (this.encounter_request_id !== requestId) return;
@@ -4026,9 +4157,16 @@ class VobizAgentConsole {
         const escape = frappe.utils.escape_html;
         const columns = this.state.encounter_columns;
         const table = this.page.main.find('[data-role="encounter-table"]');
-        table.find('thead').html('<tr>' + columns.map(c => '<th>' + escape(__(c.label)) + '</th>').join('') + '<th>' + __('Action') + '</th></tr>');
+        table.find('thead').html('<tr>' + columns.map(c => {
+            const sortable = this.state.console_view === 'ndr' && ['pe_shipkia_stage', 'pe_shipkia_status'].includes(c.fieldname);
+            const active = sortable && this.state.encounter_sort_by === c.fieldname;
+            const direction = this.state.encounter_sort_order === 'desc' ? 'descending' : 'ascending';
+            const label = escape(__(c.label));
+            if (!sortable) return '<th>' + label + '</th>';
+            return '<th aria-sort="' + (active ? direction : 'none') + '"><button type="button" class="btn btn-link btn-xs" data-encounter-sort="' + c.fieldname + '">' + label + (active ? (direction === 'ascending' ? ' &uarr;' : ' &darr;') : ' &#8597;') + '</button></th>';
+        }).join('') + '<th>' + __('Action') + '</th></tr>');
         table.find('tbody').html(this.state.encounters.map((row, index) => {
-            const loading = this.state.encounter_detail_loading === row.name;
+            const loading = this.state.encounter_detail_loading === row.name && this.state.encounter_detail_request_id === this.encounter_request_id;
             return '<tr data-index="' + index + '">' + columns.map(c =>
                 '<td>' + escape(String(row[c.fieldname] == null ? '' : row[c.fieldname])) + '</td>'
             ).join('') + '<td><button class="btn btn-xs btn-primary" data-action="call-row" ' +
@@ -4043,21 +4181,25 @@ class VobizAgentConsole {
     async call_encounter_row(index) {
         const encounter = this.state.encounters[index];
         if (!encounter || this.state.encounter_detail_loading || this.state.detail_loading_key) return;
+        const view = this.state.console_view === 'ndr' ? 'ndr' : 'encounters';
+        const requestId = this.encounter_request_id;
+        this.state.encounter_detail_request_id = requestId;
         this.state.encounter_detail_loading = encounter.name;
         this.render_encounters();
         try {
             const result = await frappe.call({
                 method: 'vobiz_click_to_call.api.encounter_queue.get_encounter_context',
-                args: { encounter: encounter.name }
+                args: { encounter: encounter.name, view }
             });
             const context = result.message || {};
+            if (this.encounter_request_id !== requestId) return;
             const row = Object.assign({}, context.reference, {doctype: 'Patient', encounter_name: encounter.name});
             this.state.context = context;
             this.apply_context_dispositions(context);
             this.open_detail_dialog(row, context);
         } finally {
             this.state.encounter_detail_loading = null;
-            this.render_encounters();
+            if (this.encounter_request_id === requestId) this.render_encounters();
         }
     }
 
@@ -4104,7 +4246,9 @@ class VobizAgentConsole {
 	}
 
 	render_header_active_call(active = {}) {
-		const isActive = Boolean(active.name && !this.is_terminal_status(active.status));
+		if (!active.name && this.state.completion_retry_candidate) active = this.state.completion_retry_candidate;
+		const canRetry = this.state.completion_retry_candidate?.name === active.name;
+		const isActive = Boolean(active.name && (!this.is_terminal_status(active.status) || canRetry));
 		const $control = this.page.main.find('[data-role="head-active-call"]');
 		$control.toggleClass('hidden', !isActive);
 		if (!isActive) return;
@@ -4113,38 +4257,102 @@ class VobizAgentConsole {
 		const status = active.status || __('Active Call');
 		$control.find('[data-role="head-call-status"]').text(status);
 		$control.find('[data-role="head-call-customer"]').text(customer).attr('title', customer);
-		$control.find('[data-action="end-active-call"]').prop('disabled', Boolean(this.state.ending_active_call));
+		$control.find('[data-action="end-active-call"]').prop('disabled', Boolean(this.state.ending_active_call) || this.is_terminal_status(active.status));
 		$control.find('[data-action="complete-active-call"]')
 			.prop('disabled', Boolean(this.state.completing_call_log))
-			.text(this.state.completing_call_log === active.name ? __('Completing…') : __('Complete Call'));
+			.text(this.state.completing_call_log === active.name ? __('Resetting…') : (canRetry ? __('Retry Call') : __('Complete Call')));
 	}
 
-	complete_header_active_call() {
-		const active = this.state.active_call || {};
-		if (!active.name || this.is_terminal_status(active.status) || this.state.completing_call_log) return;
+	async complete_header_active_call() {
+		const active = this.state.active_call?.name ? this.state.active_call : (this.state.completion_retry_candidate || {});
+		if (!active.name || this.state.completing_call_log) return;
+		if (active.local_reset && active.retry_allowed) {
+			return this.start_call_for_row({doctype: active.reference_doctype, name: active.reference_name,
+				title: active.reference_title || active.reference_name, retry_of: active.name})
+				.catch(error => frappe.msgprint(error.message || __('Could not retry the call.')));
+		}
 		const callLog = active.name;
+		const owner = this.state.softphone.client;
 		this.state.completing_call_log = callLog;
 		this.render_header_active_call(active);
-		return this.browser_request_with_timeout(Promise.resolve().then(() => frappe.call({
-			method: 'vobiz_system_call.api.call.complete_call_log',
-			args: {call_log: callLog}
-		}))).then(r => {
+		try {
+			const r = await this.browser_request_with_timeout(frappe.call({
+				method: 'vobiz_system_call.api.call.complete_call_log', type: 'POST',
+				args: {call_log: callLog}
+			}));
 			const call = r.message || {};
-			if (call.name !== callLog) throw new Error(__('Call confirmation did not match. Please refresh.'));
-			if (!this.is_terminal_status(call.status)) {
-				this.watch_browser_call_disposition(callLog);
-				frappe.show_alert({message: __('End Call requested. Waiting for provider confirmation.'), indicator: 'orange'});
-				this.load();
-				return;
-			}
+			if (call.name !== callLog || !call.local_reset) throw new Error(__('Local reset was not acknowledged. Please refresh.'));
+			this.reset_completed_browser_session(call, owner);
+			this.state.completion_retry_candidate = call.retry_allowed ? Object.assign({}, active, call) : null;
 			this.handle_call_disconnected(Object.assign({}, active, call));
 			$(document).trigger('vobiz_refresh_availability');
 			this.load();
-		}).catch(error => {
-			frappe.msgprint(error.message || __('Could not complete the call log. Please retry.'));
-		}).finally(() => {
+			frappe.show_alert({message: __('Local call reset. The previous customer call may still be active. You can start another call once the softphone reconnects.'), indicator: 'orange'});
+		} catch (error) {
+			frappe.msgprint(error.message || __('Could not reset the local call. Please try again.'));
+		} finally {
 			if (this.state.completing_call_log === callLog) this.state.completing_call_log = '';
 			this.render_header_active_call(this.state.active_call || {});
+		}
+	}
+
+	reset_completed_browser_session(call, owner) {
+		if (!call.local_reset || !this.is_terminal_status(call.status)) throw new Error(__('Local reset was not acknowledged.'));
+		const s = this.state.softphone;
+		const assertSame = () => {
+			if ((s.current_call_log && s.current_call_log !== call.name) ||
+				(this.state.active_call?.name && this.state.active_call.name !== call.name)) {
+				throw new Error(__('A different call is active. Its browser session was not reset.'));
+			}
+		};
+		assertSame();
+		s.retired_call_logs = [...new Set([...(s.retired_call_logs || []), call.name])].slice(-50);
+		this.start_call_in_flight = null;
+		const sdk = owner?.client;
+		const previousRegistration = s.register_promise;
+		// Invalidate the client first: synchronous and delayed events from it are
+		// ignored by bind_browser_softphone_events, including failed logout/hangup.
+		if (s.client === owner) {
+			s.client = null;
+			s.registered = false;
+			s.registering = false;
+			if (s.reject_register) s.reject_register(new Error(__('Call session reset.')));
+		}
+		this.stop_browser_network_monitor();
+		this.stop_browser_microphone_test();
+		this.stop_browser_softphone_audio();
+		// Best effort only. Neither signaling promises nor provider responses gate reset.
+		try { Promise.resolve(sdk?.hangup?.()).catch(() => {}); } catch (_) {}
+		try {
+			const result = sdk?.getPeerConnection?.();
+			const pc = result && (result.pc || result);
+			for (const sender of pc?.getSenders?.() || []) sender.track?.stop();
+			pc?.close?.();
+		} catch (_) {}
+		try { Promise.resolve(sdk?.logout?.()).catch(() => {}); } catch (_) {}
+		// A realtime terminal event may already have cleared the matching call.
+		if (s.current_call_log === call.name) this.reset_browser_softphone_call_state(__('Disconnected'), call.name, call.status);
+		else if (!s.current_call_log) this.reset_browser_softphone_call_state(__('Disconnected'));
+		if (this.state.active_call?.name === call.name) this.state.active_call = {last_call: call};
+		this.clear_tracked_live_call(call.name);
+		s.error = '';
+		s.network_issues = {};
+		s.auto_connect_attempted = false;
+		// Registration is needed for the NEXT call, not to acknowledge this reset.
+		const reconnect = Promise.resolve(previousRegistration).catch(() => {}).then(async () => {
+			assertSame();
+			if (!await this.check_browser_microphone(false)) throw new Error(__('Connect a microphone and allow access before calling.'));
+			assertSame();
+			await this.connect_browser_softphone();
+		});
+		this.softphone_reset_promise = reconnect;
+		reconnect.catch(error => {
+			if (this.softphone_reset_promise === reconnect && !s.current_call_log) {
+				s.error = error.message || __('Reconnect the softphone before calling.');
+				this.render_browser_softphone();
+			}
+		}).finally(() => {
+			if (this.softphone_reset_promise === reconnect) this.softphone_reset_promise = null;
 		});
 	}
 
@@ -6539,11 +6747,12 @@ class VobizAgentConsole {
 		// Only the first caller owns the result (especially manual versus auto-dial).
 		if (this.start_call_in_flight) return Promise.resolve(null);
 		// Own the entire operation, including microphone checks and number selection.
-		const request = Promise.resolve().then(() => this.perform_start_call_for_row(row, patientPhone, browserReady));
-		this.start_call_in_flight = request.finally(() => {
-			this.start_call_in_flight = null;
+		const request = Promise.resolve(this.softphone_reset_promise).then(() => this.perform_start_call_for_row(row, patientPhone, browserReady));
+		const tracked = request.finally(() => {
+			if (this.start_call_in_flight === tracked) this.start_call_in_flight = null;
 			this.update_workdesk_primary_action(this.state.active_workdesk_row);
 		});
+		this.start_call_in_flight = tracked;
 		this.update_workdesk_primary_action(this.state.active_workdesk_row);
 		return this.start_call_in_flight;
 	}
@@ -6566,7 +6775,7 @@ class VobizAgentConsole {
 				return this.perform_start_call_for_row(row, patientPhone, true);
 			});
 		}
-		if (row.doctype === 'Patient' && !patientPhone) {
+		if (row.doctype === 'Patient' && !patientPhone && !row.retry_of) {
 			return frappe.call({
 				method: 'vobiz_click_to_call.api.call.get_patient_phone_choices',
 				args: { patient: row.name },
@@ -6584,8 +6793,9 @@ class VobizAgentConsole {
 			});
 		}
 		return frappe.call({
-			method: 'vobiz_click_to_call.api.call.start_call',
-			args: {
+			method: row.retry_of ? 'vobiz_system_call.api.call.retry_call_log' : 'vobiz_click_to_call.api.call.start_call',
+			type: 'POST',
+			args: row.retry_of ? {call_log: row.retry_of, tab_id: this.get_softphone_tab_id()} : {
 				reference_doctype: row.doctype,
 				reference_name: row.name,
 				phone_field: patientPhone ? patientPhone.fieldname : row.phone_field,
@@ -6599,6 +6809,10 @@ class VobizAgentConsole {
 			freeze_message: __('Starting call...')
 		}).then((r) => {
 			const message = r.message || {};
+			if (message.call_log && (softphone.retired_call_logs || []).includes(message.call_log)) {
+				throw new Error(__('This call attempt was reset. Start a new call.'));
+			}
+			if (message.call_log) this.state.completion_retry_candidate = null;
 			if (message.browser_softphone) {
 				if (message.call_log) {
 					this.state.disposition_prompted_call_log = null;
@@ -6731,9 +6945,9 @@ class VobizAgentConsole {
 		this.run_next_auto_dial();
 	}
 
-	stop_auto_dial() {
+	stop_auto_dial({cancel_active = true} = {}) {
 		const session = this.state.auto_dial || {};
-		const callLog = ((session.current || {}).call_log) || ((this.state.active_call || {}).name);
+		const callLog = cancel_active ? (((session.current || {}).call_log) || ((this.state.active_call || {}).name)) : '';
 		session.running = false;
 		session.in_flight = false;
 		session.awaiting_disposition = false;
@@ -6748,7 +6962,7 @@ class VobizAgentConsole {
 		this.render_auto_toggle();
 		this.hide_auto_call_dialog();
 		if (callLog) {
-			this.cancel_call_log(callLog).then(() => {
+			this.cancel_call_log(callLog, null, 'manual_autodial_stop').then(() => {
 				frappe.show_alert({ message: __('Auto dial stopped and active call cleared.'), indicator: 'orange' });
 			}).catch(() => {
 				this.load();
@@ -6808,7 +7022,8 @@ class VobizAgentConsole {
 				session.in_flight = false;
 				session.current = null;
 				this.state.auto_dial = session;
-				this.stop_auto_dial();
+				// A cancelled number picker stops the queue, not another live call.
+				this.stop_auto_dial({cancel_active: false});
 				return;
 			}
 			if (message.system_dialer) {
@@ -7145,7 +7360,7 @@ class VobizAgentConsole {
 		setTimeout(check, 500);
 	}
 
-	cancel_call_log(call_log, row) {
+	cancel_call_log(call_log, row, origin = 'manual_button') {
 		if (!call_log) return Promise.resolve();
 		// Online events and the retry timer can arrive during a slow Stop request.
 		const requests = this.browser_cancel_requests || (this.browser_cancel_requests = new Map());
@@ -7153,14 +7368,19 @@ class VobizAgentConsole {
         const cooldowns = this.cancel_retry_at || (this.cancel_retry_at = new Map());
         if ((cooldowns.get(call_log) || 0) > Date.now()) return Promise.resolve({pending_provider: true});
 
-		const request = this.cancel_call_log_request(call_log, row).finally(() => requests.delete(call_log));
+		const origins = this.browser_cancel_origins || (this.browser_cancel_origins = new Map());
+		if (!origins.has(call_log)) origins.set(call_log, origin);
+		if (origins.size > 100) origins.delete(origins.keys().next().value);
+		const request = this.cancel_call_log_request(call_log, row, origins.get(call_log)).finally(() => requests.delete(call_log));
 		requests.set(call_log, request);
 		return request;
 	}
 
-	cancel_call_log_request(call_log, row) {
+	cancel_call_log_request(call_log, row, origin = 'legacy_unspecified') {
 		const softphone = this.state.softphone;
+		const diagnostics = JSON.stringify(this.browser_connection_evidence());
 		const isBrowser = softphone.current_call_log === call_log;
+		if (isBrowser) softphone.pending_end_origin = origin;
 		if (isBrowser) {
             softphone.customer_ringback_pending = false;
             this.stop_browser_ringback();
@@ -7183,7 +7403,7 @@ class VobizAgentConsole {
 			this.render_browser_softphone();
 		}
 		const endpoint = isBrowser ? 'vobiz_system_call.api.webrtc.cancel_browser_call' : 'vobiz_click_to_call.api.call.cancel_call';
-		const request = frappe.call(endpoint, { call_log });
+		const request = frappe.call(endpoint, { call_log, origin, diagnostics });
 		// Ending a server-tracked call works even when this window has no SDK session.
 		return this.browser_request_with_timeout(request, 30000).then((response) => {
             const retry = Number((response.message || {}).retry_after);

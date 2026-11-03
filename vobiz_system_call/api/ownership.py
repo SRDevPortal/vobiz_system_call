@@ -23,13 +23,13 @@ def locked_browser(tab_id):
     from vobiz_system_call.api.webrtc import _login, _browser_enabled
     _login()
     if not _browser_enabled():
-        frappe.throw(_("Browser calling is disabled."))
+        frappe.throw(_("Browser calling is disabled."), frappe.PermissionError)
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", tab_id or ""):
         frappe.throw(_("Invalid browser window ID."))
     user = frappe.session.user
     mapping = lifecycle.lock_mapping(user)
-    if not mapping.get("browser_softphone_enabled"):
-        frappe.throw(_("Browser calling is disabled."))
+    if mapping.get("enabled") == 0 or not mapping.get("browser_softphone_enabled"):
+        frappe.throw(_("Browser calling is disabled."), frappe.PermissionError)
     cache = frappe.cache()
     with cache.lock("vsc:presence-lock:" + user, timeout=5, blocking_timeout=2):
         yield user, mapping, cache
@@ -90,6 +90,9 @@ def presence_heartbeat(tab_id, registered=1, claim_idle=0, call_log=None):
             return {"registered": False, "ownership": "active_call"}
         cache.set_value(owner_key(user), tab_id)
         lifecycle.set_presence(user, tab_id)
+        if not frappe.utils.cint(claim_idle):
+            from vobiz_click_to_call.services.availability_recovery import restore_browser_availability
+            restore_browser_availability(mapping)
         if mapping.current_call_log:
             key = "vsc:active-call:" + mapping.current_call_log
             if call_log and call_log == mapping.current_call_log:
