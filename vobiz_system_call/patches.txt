@@ -1,3 +1,4 @@
+[pre_model_sync]
 
 [post_model_sync]
 vobiz_system_call.patches.v1_0.repair_browser_verification_counter_expiry
