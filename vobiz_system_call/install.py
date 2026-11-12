@@ -38,6 +38,15 @@ def ensure_patch_fields():
     )
     create_custom_fields(
         {
+            "Vobiz Call Log": [
+                {"fieldname": "completion_provider_status", "label": "Complete Call Provider Confirmation",
+                 "fieldtype": "Select", "options": "\nPending\nConfirmed\nNeeds Review",
+                 "read_only": 1, "no_copy": 1, "insert_after": "call_status",
+                 "description": "Provider cleanup requested by the Complete Call button; independent of agent availability."},
+                {"fieldname": "completion_provider_due", "label": "Complete Call Next Check",
+                 "fieldtype": "Datetime", "read_only": 1, "no_copy": 1,
+                 "insert_after": "completion_provider_status"},
+            ],
             "Vobiz Settings": [
                 {"fieldname": "enable_browser_softphone", "label": "Enable Browser Softphone",
                  "fieldtype": "Check", "default": "1", "insert_after": "enable_mobile_bridge"},
@@ -149,6 +158,7 @@ def ensure_patch_fields():
     )
     frappe.clear_cache(doctype="Vobiz Settings")
     frappe.clear_cache(doctype="Vobiz User Mapping")
+    frappe.clear_cache(doctype="Vobiz Call Log")
     if not recovery_field_exists:
         migrate_conference_pilot_users()
 
@@ -215,6 +225,7 @@ def ensure_indexes():
     indexes = [
         ("Vobiz User Mapping", "vsc_endpoint", ("browser_softphone_username", "enabled")),
         ("Vobiz User Mapping", "vsc_did", ("caller_id", "enabled", "browser_softphone_enabled")),
+        ("Vobiz Call Log", "vsc_completion_due", ("completion_provider_status", "completion_provider_due")),
     ]
     for doctype, index, fields in indexes:
         if not frappe.db.sql(

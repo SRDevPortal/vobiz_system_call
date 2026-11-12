@@ -31,10 +31,10 @@ class IndexInstallTest(unittest.TestCase):
         namespace = {"frappe": SimpleNamespace(db=db)}
         exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
         namespace["ensure_indexes"]()
-        self.assertEqual(db.indexes, {"vsc_endpoint", "vsc_did"})
-        self.assertEqual(len(db.ddl), 2)
+        self.assertEqual(db.indexes, {"vsc_endpoint", "vsc_did", "vsc_completion_due"})
+        self.assertEqual(len(db.ddl), 3)
         self.assertTrue(all("ALGORITHM=INPLACE, LOCK=NONE" in query for query in db.ddl))
         db.pending_writes = True
         namespace["ensure_indexes"]()
-        self.assertEqual(len(db.ddl), 2)
+        self.assertEqual(len(db.ddl), 3)
         self.assertTrue(db.pending_writes)

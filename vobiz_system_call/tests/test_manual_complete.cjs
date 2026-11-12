@@ -1,8 +1,8 @@
 const test=require('node:test'), assert=require('node:assert/strict'), fs=require('fs'),path=require('path'),vm=require('node:vm');
 function setup(){
- const requests=[],errors=[];const ctx={frappe:{pages:{'vobiz-agent-console':{}},call:args=>{
+ const requests=[],errors=[],alerts=[];const ctx={frappe:{pages:{'vobiz-agent-console':{}},call:args=>{
   requests.push(args);return Promise.resolve({message:{name:'C1',status:'Cancelled',local_reset:true,retry_allowed:true,reference_doctype:'CRM Lead',reference_name:'LEAD'}});
- },msgprint:m=>errors.push(m),show_alert(){}},__:s=>s,console,document:{},window:{},$:()=>({trigger(){}})};
+ },msgprint:m=>errors.push(m),show_alert:a=>alerts.push(a)},__:s=>s,console,document:{},window:{},$:()=>({trigger(){}})};
  vm.createContext(ctx);vm.runInContext(fs.readFileSync(path.join(__dirname,'../vobiz_system_call/page/vobiz_agent_console/vobiz_agent_console.js'),'utf8')+';this.Console=VobizAgentConsole;',ctx);
  const c=Object.create(ctx.Console.prototype);let hung=0,loggedOut=0,closed=0,tracksStopped=0;
  const sdk={getCallUUID:()=> 'uuid',hangup(){assert.equal(c.state.softphone.client,null);hung++;return new Promise(()=>{});},
@@ -12,12 +12,16 @@ function setup(){
  for(const n of ['stop_browser_network_monitor','stop_browser_microphone_test','stop_browser_softphone_audio','render_browser_softphone','clear_tracked_live_call','update_workdesk_primary_action'])c[n]=()=>{};
  c.reset_browser_softphone_call_state=()=>{c.state.softphone.current_call_log='';c.state.softphone.in_call=false;c.cleaned=(c.cleaned||0)+1;};
  c.handle_call_disconnected=()=>{};c.check_browser_microphone=async()=>true;c.connect_browser_softphone=async()=>{c.state.softphone.registered=true;};c.browser_softphone_reconnecting=()=>false;
- return {c,ctx,requests,errors,counts:()=>({hung,loggedOut,closed,tracksStopped})};
+ return {c,ctx,requests,errors,alerts,counts:()=>({hung,loggedOut,closed,tracksStopped})};
 }
 test('local reset completes despite hanging SDK hangup/logout; next click explicitly retries',async()=>{
  const t=setup();let starts=0,row;t.c.start_call_for_row=async r=>{starts++;row=r;};
  const p=t.c.complete_header_active_call();await t.c.complete_header_active_call();await p;
  assert.equal(t.requests.length,1);assert.equal(starts,0);assert.equal(t.c.state.softphone.current_call_log,'');
+ assert.equal(t.requests[0].method,'vobiz_system_call.api.call.complete_call_from_button');
+ assert.equal(t.requests[0].type,'POST');
+ assert.equal(t.alerts[0].indicator,'orange');
+ assert.match(t.alerts[0].message,/end has not been confirmed/);
  assert.deepEqual(t.counts(),{hung:1,loggedOut:1,closed:1,tracksStopped:1});
  await t.c.softphone_reset_promise;await t.c.complete_header_active_call();
  assert.equal(starts,1);assert.equal(row.retry_of,'C1');assert.equal(t.errors.length,0);

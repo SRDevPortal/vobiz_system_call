@@ -4277,7 +4277,7 @@ class VobizAgentConsole {
 		this.render_header_active_call(active);
 		try {
 			const r = await this.browser_request_with_timeout(frappe.call({
-				method: 'vobiz_system_call.api.call.complete_call_log', type: 'POST',
+				method: 'vobiz_system_call.api.call.complete_call_from_button', type: 'POST',
 				args: {call_log: callLog}
 			}));
 			const call = r.message || {};
@@ -4287,7 +4287,10 @@ class VobizAgentConsole {
 			this.handle_call_disconnected(Object.assign({}, active, call));
 			$(document).trigger('vobiz_refresh_availability');
 			this.load();
-			frappe.show_alert({message: __('Local call reset. The previous customer call may still be active. You can start another call once the softphone reconnects.'), indicator: 'orange'});
+			const message = call.verified_end
+				? __('Call end confirmed. You can start another call once the softphone reconnects.')
+				: __('Agent released. The previous call may still be active; its end has not been confirmed. You can continue once the softphone reconnects.');
+			frappe.show_alert({message, indicator: call.verified_end ? 'green' : 'orange'});
 		} catch (error) {
 			frappe.msgprint(error.message || __('Could not reset the local call. Please try again.'));
 		} finally {

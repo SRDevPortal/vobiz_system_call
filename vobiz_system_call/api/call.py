@@ -321,7 +321,14 @@ def start_browser_softphone_call(
 
 @frappe.whitelist(methods=["POST"])
 def complete_call_log(call_log: str):
-    """Reset the local attempt without waiting for provider termination."""
+    """Compatibility endpoint for Complete Call."""
+    from vobiz_system_call.api.complete_retry import check_completion
+    return check_completion(call_log)
+
+
+@frappe.whitelist(methods=["POST"])
+def complete_call_from_button(call_log: str):
+    """Dedicated button API, not shadowed by the legacy local-reset Server Script."""
     from vobiz_system_call.api.complete_retry import check_completion
     return check_completion(call_log)
 
