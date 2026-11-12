@@ -15,6 +15,7 @@ from vobiz_click_to_call import number_privacy
 from vobiz_click_to_call.services.queue_sources import queue_includes, queue_source_options
 from frappe.rate_limiter import rate_limit
 from vobiz_click_to_call.services.callback_limits import callback_rate_limit
+from vobiz_system_call.browser_call_limits import browser_verification_rate_limit
 from werkzeug.wrappers import Response
 
 from vobiz_click_to_call.services.numbers import normalize_phone_number, provider_phone_number
@@ -106,7 +107,7 @@ def browser_presence(tab_id: str, registered: int = 1, claim_idle: int = 0, call
 
 
 @frappe.whitelist(methods=["POST"])
-@rate_limit(key="call_log", limit=12, seconds=60)
+@browser_verification_rate_limit
 def verify_browser_call(call_log: str):
     """Recheck provider state after a browser/network interruption."""
     _login()
