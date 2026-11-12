@@ -184,6 +184,27 @@ class VobizAgentConsole {
                     <div class="vobiz-section-title">
                         <h3 data-role="encounter-title">${__('Patient Encounter List')}</h3>
                         <div class="vobiz-queue-tools">
+                            <div class="frappe-control form-group control-input-wrapper hidden" data-fieldtype="Select" data-role="ndr-sort-wrapper"><div class="control-input flex align-center">
+                                <select class="form-control input-sm" data-role="ndr-sort" aria-label="${__('Sort queue')}" title="${__('Sort queue')}">
+                                    <option value="modified_desc">${__('Recently Updated')}</option>
+                                    <option value="modified_asc">${__('Oldest Updated')}</option>
+                                    <option value="creation_desc">${__('Newest Created')}</option>
+                                    <option value="creation_asc">${__('Oldest Created')}</option>
+                                    <option value="patient_name_asc">${__('Name A-Z')}</option>
+                                    <option value="patient_name_desc">${__('Name Z-A')}</option>
+                                    <option value="encounter_date_desc">${__('Newest Encounter')}</option>
+                                    <option value="encounter_date_asc">${__('Oldest Encounter')}</option>
+                                </select><div class="select-icon">${frappe.utils.icon('select', 'sm')}</div>
+                            </div></div>
+                            <div class="filter-selector hidden" data-role="ndr-filter-selector"><div class="btn-group">
+                                <button class="btn btn-default btn-sm filter-button" data-action="ndr-filters">
+                                    <span class="filter-icon">${frappe.utils.icon('es-line-filter')}</span>
+                                    <span class="button-label">${__('Filter')}</span>
+                                </button>
+                                <button class="btn btn-default btn-sm filter-x-button" data-action="clear-ndr-filters" title="${__('Clear all filters')}" aria-label="${__('Clear all filters')}">
+                                    <span class="filter-icon">${frappe.utils.icon('es-small-close')}</span>
+                                </button>
+                            </div></div>
                             <input class="form-control input-sm" data-role="encounter-search" placeholder="${__('Search encounter or patient')}">
                             <button class="btn btn-default btn-sm" data-action="refresh-encounters">${__('Refresh')}</button>
                             ${frappe.user.has_role('System Manager') ? '<button class="btn btn-default btn-sm" data-action="encounter-settings">' + __('Settings') + '</button>' : ''}
@@ -666,11 +687,28 @@ class VobizAgentConsole {
         $main.on('click', '[data-console-view]', (e) => {
             this.switch_console_view($(e.currentTarget).attr('data-console-view'));
         });
-        $main.on('click', '[data-encounter-sort]', (e) => {
+        $main.on('click', '[data-action="ndr-filters"]', () => this.open_ndr_filters());
+        $main.on('click', '[data-ndr-value-filter]', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.apply_ndr_value_filter($(e.currentTarget).attr('data-ndr-value-filter'),
+                Number($(e.currentTarget).attr('data-row-index')));
+        });
+        $main.on('click', '[data-action="clear-ndr-filters"]', () => {
+            const group = this.ndr_filter_group;
+            if (!group) return;
+            group.clear_filters();
+            group.toggle_empty_filters(true);
+            group.update_filter_button();
+            group.on_change();
+            group.hide_popover();
+        });
+        $main.on('change', '[data-role="ndr-sort"]', e => {
             if (this.state.console_view !== 'ndr') return;
-            const field = $(e.currentTarget).attr('data-encounter-sort');
-            this.state.encounter_sort_order = this.state.encounter_sort_by === field && this.state.encounter_sort_order === 'asc' ? 'desc' : 'asc';
-            this.state.encounter_sort_by = field;
+            const value = $(e.currentTarget).val();
+            const split = value.lastIndexOf('_');
+            this.state.encounter_sort_by = value.slice(0, split);
+            this.state.encounter_sort_order = value.slice(split + 1);
             this.state.encounter_page = 1;
             this.load_encounters();
         });
@@ -4088,9 +4126,52 @@ class VobizAgentConsole {
         }
     }
 
+
+
+    open_ndr_filters() {
+        if (this.state.console_view !== 'ndr' || this.ndr_filter_opening) return;
+        if (!frappe.ui.FilterGroup) return;
+        const $button = this.page.main.find('[data-action="ndr-filters"]');
+        this.ndr_filter_opening = true;
+        frappe.model.with_doctype('Patient Encounter', () => {
+            this.ndr_filter_opening = false;
+            if (this.state.console_view !== 'ndr') return;
+            if (!this.ndr_filter_group) {
+                const group = new frappe.ui.FilterGroup({
+                    doctype: 'Patient Encounter',
+                    parent_doctype: 'Patient Encounter',
+                    filter_button: $button,
+                    on_change: () => {
+                        if (this.ndr_quick_filter_busy) return;
+                        const filters = group.get_filters();
+                        if (JSON.stringify(filters) === JSON.stringify(this.state.ndr_filters || [])) return;
+                        this.state.ndr_filters = filters;
+                        group.update_filter_button();
+                        this.state.encounter_page = 1;
+                        if (this.state.console_view === 'ndr') this.load_encounters();
+                    }
+                });
+                this.ndr_filter_group = group;
+                // Match Patient Queue's empty state instead of an automatic ID condition.
+                $button.on('shown.bs.popover', () => {
+                    if (!(this.state.ndr_filters || []).length) {
+                        group.clear_filters();
+                        group.toggle_empty_filters(true);
+                        group.update_filter_button();
+                    }
+                });
+                // The delegated console handler owns toggling, as in Patient Queue.
+                $button.off('click');
+            }
+            $button.popover('toggle');
+        });
+    }
+
     switch_console_view(view) {
         if (!['queue', 'encounters', 'ndr'].includes(view)) return;
         const main = this.page.main;
+        if (view !== 'ndr' && this.ndr_filter_group) this.ndr_filter_group.hide_popover();
+        if (view === 'ndr' && this.state.filter_group) this.state.filter_group.hide_popover();
         const previous = this.state.console_view;
         this.encounter_view_state = this.encounter_view_state || {};
         if (previous === 'encounters' || previous === 'ndr') {
@@ -4104,7 +4185,12 @@ class VobizAgentConsole {
         clearTimeout(this.encounter_search_timer);
         this.encounter_request_id = (this.encounter_request_id || 0) + 1;
         this.state.console_view = view;
+        const softphone = main.find('[data-role="softphone-panel"]');
+        if (!this.softphone_home && softphone.length) this.softphone_home = $('<span class="hidden"></span>').insertBefore(softphone);
+        if (view === 'ndr' || view === 'encounters') softphone.insertBefore(main.find('[data-role="encounter-panel"]'));
+        else if (this.softphone_home) softphone.insertAfter(this.softphone_home);
         const list = view !== 'queue';
+        main.find('[data-role="ndr-filter-selector"], [data-role="ndr-sort-wrapper"]').toggleClass('hidden', view !== 'ndr');
         main.find('[data-console-view]').removeClass('active');
         main.find('[data-console-view="' + view + '"]').addClass('active');
         main.find('[data-role="encounter-panel"]').toggleClass('hidden', !list);
@@ -4114,6 +4200,11 @@ class VobizAgentConsole {
         this.state.encounter_page = saved.page || 1;
         this.state.encounter_sort_by = saved.sort_by || '';
         this.state.encounter_sort_order = saved.sort_order || 'asc';
+        if (view === 'ndr') {
+            this.state.encounter_sort_by = saved.sort_by || 'creation';
+            this.state.encounter_sort_order = saved.sort_by ? (saved.sort_order || 'asc') : 'desc';
+            main.find('[data-role="ndr-sort"]').val(this.state.encounter_sort_by + '_' + this.state.encounter_sort_order);
+        }
         this.state.encounters = [];
         this.state.encounter_columns = [];
         this.state.encounter_has_more = false;
@@ -4135,6 +4226,7 @@ class VobizAgentConsole {
                     limit: 25, limit_start: (this.state.encounter_page - 1) * 25,
                     search: this.page.main.find('[data-role="encounter-search"]').val() || '',
                     view: this.state.console_view === 'ndr' ? 'ndr' : 'encounters',
+                    user_filters: JSON.stringify(this.state.console_view === 'ndr' ? (this.state.ndr_filters || []) : []),
                     sort_by: this.state.encounter_sort_by || '',
                     sort_order: this.state.encounter_sort_order || 'asc'
                 }
@@ -4153,22 +4245,70 @@ class VobizAgentConsole {
         }
     }
 
+
+    render_encounter_cell(row, column, index) {
+        const escape = frappe.utils.escape_html;
+        const value = String(row[column.fieldname] == null ? '' : row[column.fieldname]);
+        if (this.state.console_view !== 'ndr') return escape(value);
+        if (!value.trim()) return '—';
+        if (column.fieldname === 'pe_shipkia_awb_number') {
+            const url = 'https://shipkia.com/tracking_result.html?tracking_id=' + encodeURIComponent(value.trim());
+            return '<a href="' + escape(url) + '" target="_blank" rel="noopener noreferrer" title="' +
+                escape(__('Track shipment in new tab')) + '">' + escape(value) +
+                ' <i class="fa fa-external-link" aria-hidden="true"></i></a>';
+        }
+        if (['pe_shipkia_stage', 'pe_shipkia_status'].includes(column.fieldname)) {
+            return '<button class="btn btn-link btn-xs" data-ndr-value-filter="' + column.fieldname +
+                '" data-row-index="' + index + '" title="' + escape(__('Filter by this value')) + '">' +
+                escape(value) + '</button>';
+        }
+        return escape(value);
+    }
+
+    async apply_ndr_value_filter(field, index) {
+        if (this.state.console_view !== 'ndr' || this.ndr_quick_filter_busy ||
+            !['pe_shipkia_stage', 'pe_shipkia_status'].includes(field)) return;
+        const row = this.state.encounters[index];
+        if (!row || !String(row[field] || '').trim()) return;
+        const value = String(row[field]);
+        const apply = async () => {
+            const group = this.ndr_filter_group;
+            this.ndr_quick_filter_busy = true;
+            try {
+                const filters = (this.state.ndr_filters || []).filter(f => !(f[0] === 'Patient Encounter' && f[1] === field));
+                filters.push(['Patient Encounter', field, '=', value]);
+                group.clear_filters();
+                await group.add_filters(filters);
+                this.state.ndr_filters = group.get_filters();
+                group.update_filter_button();
+                group.hide_popover();
+                this.state.encounter_page = 1;
+                if (this.state.console_view === 'ndr') this.load_encounters();
+            } finally {
+                this.ndr_quick_filter_busy = false;
+            }
+        };
+        if (this.ndr_filter_group && this.ndr_filter_group.wrapper) {
+            await apply();
+        } else {
+            // Initialize native controls before adding filter tuples.
+            const button = this.page.main.find('[data-action="ndr-filters"]');
+            button.one('shown.bs.popover', () => setTimeout(() => apply(), 0));
+            this.open_ndr_filters();
+        }
+    }
+
     render_encounters() {
         const escape = frappe.utils.escape_html;
         const columns = this.state.encounter_columns;
         const table = this.page.main.find('[data-role="encounter-table"]');
-        table.find('thead').html('<tr>' + columns.map(c => {
-            const sortable = this.state.console_view === 'ndr' && ['pe_shipkia_stage', 'pe_shipkia_status'].includes(c.fieldname);
-            const active = sortable && this.state.encounter_sort_by === c.fieldname;
-            const direction = this.state.encounter_sort_order === 'desc' ? 'descending' : 'ascending';
-            const label = escape(__(c.label));
-            if (!sortable) return '<th>' + label + '</th>';
-            return '<th aria-sort="' + (active ? direction : 'none') + '"><button type="button" class="btn btn-link btn-xs" data-encounter-sort="' + c.fieldname + '">' + label + (active ? (direction === 'ascending' ? ' &uarr;' : ' &darr;') : ' &#8597;') + '</button></th>';
-        }).join('') + '<th>' + __('Action') + '</th></tr>');
+        table.find('thead').html('<tr>' + columns.map(c =>
+            '<th>' + escape(__(c.label)) + '</th>'
+        ).join('') + '<th>' + __('Action') + '</th></tr>');
         table.find('tbody').html(this.state.encounters.map((row, index) => {
             const loading = this.state.encounter_detail_loading === row.name && this.state.encounter_detail_request_id === this.encounter_request_id;
             return '<tr data-index="' + index + '">' + columns.map(c =>
-                '<td>' + escape(String(row[c.fieldname] == null ? '' : row[c.fieldname])) + '</td>'
+                '<td>' + this.render_encounter_cell(row, c, index) + '</td>'
             ).join('') + '<td><button class="btn btn-xs btn-primary" data-action="call-row" ' +
                 (loading ? 'disabled' : '') + '><i class="fa fa-phone"></i> ' +
                 (loading ? __('Loading') : __('Details')) + '</button></td></tr>';
@@ -4189,7 +4329,7 @@ class VobizAgentConsole {
         try {
             const result = await frappe.call({
                 method: 'vobiz_click_to_call.api.encounter_queue.get_encounter_context',
-                args: { encounter: encounter.name, view }
+                args: { encounter: encounter.name, view, user_filters: JSON.stringify(view === 'ndr' ? (this.state.ndr_filters || []) : []) }
             });
             const context = result.message || {};
             if (this.encounter_request_id !== requestId) return;
