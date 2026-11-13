@@ -176,10 +176,11 @@ class VobizAgentConsole {
 				</div>
 
                 <div class="vobiz-tabs">
-                    <button class="active" data-console-view="queue">${__('Lead / Patient Queue')}</button>
-                    <button data-console-view="encounters">${__('Patient Encounter List')}</button>
+                    <button class="hidden" data-console-view="queue">${__('Lead / Patient Queue')}</button>
+                    <button class="hidden" data-console-view="encounters">${__('Patient Encounter List')}</button>
                     <button class="hidden" data-console-view="ndr">${__('NDR')}</button>
                 </div>
+                <section class="vobiz-band hidden" data-role="no-queues"></section>
                 <section class="vobiz-band hidden" data-role="encounter-panel">
                     <div class="vobiz-section-title">
                         <h3 data-role="encounter-title">${__('Patient Encounter List')}</h3>
@@ -223,7 +224,7 @@ class VobizAgentConsole {
                         </div>
                     </div>
                 </section>
-				<section class="vobiz-band vobiz-dialer-control">
+				<section class="vobiz-band vobiz-dialer-control hidden">
 					<div>
 						<strong>${__('Auto-Dial Controls')}</strong>
 						<div class="text-muted" data-role="selected-count">${__('0 leads selected')}</div>
@@ -287,7 +288,7 @@ class VobizAgentConsole {
 					</div>
 				</section>
 
-				<div class="vobiz-layout">
+				<div class="vobiz-layout hidden">
 					<section class="vobiz-band vobiz-queue">
 						<div class="vobiz-section-title">
 							<h3 data-role="queue-title">${__('Lead Queue')}</h3>
@@ -2749,6 +2750,7 @@ class VobizAgentConsole {
 		this.state.queue_sort_by = sort_by;
 		const requested_filters = JSON.stringify(this.state.queue_filters || []);
 		const request = frappe.call('vobiz_click_to_call.api.console.get_agent_console_data', {
+            include_queue: this.available_views?.queue && this.state.console_view === 'queue' ? 1 : 0,
 			limit: this.state.queue_page_size || 25,
 			limit_start: Math.max(0, ((this.state.queue_page || 1) - 1) * (this.state.queue_page_size || 25)),
 			search,
@@ -2768,7 +2770,7 @@ class VobizAgentConsole {
 				// would restore Connected/Busy and silently block Save Disposition.
 				return;
 			}
-			this.state.queue = data.queue || [];
+			this.state.queue = this.available_views?.queue && this.state.console_view === 'queue' ? (data.queue || []) : [];
 			this.state.queue_has_more = Boolean((data.queue_pagination || {}).has_more);
 			this.state.queue_meta = Object.assign(this.default_queue_meta(), data.queue_meta || {});
 			this.prune_selected_queue_keys();
@@ -4111,22 +4113,39 @@ class VobizAgentConsole {
 		`);
 	}
 
+
     async load_encounter_views() {
         const requestId = this.encounter_views_request_id = (this.encounter_views_request_id || 0) + 1;
         try {
             const response = await frappe.call({method: 'vobiz_click_to_call.api.encounter_queue.get_available_views'});
             if (this.encounter_views_request_id !== requestId) return;
-            const enabled = Boolean((response.message || {}).ndr);
-            this.page.main.find('[data-console-view="ndr"]').toggleClass('hidden', !enabled);
-            if (!enabled && this.state.console_view === 'ndr') this.switch_console_view('queue');
+            this.apply_available_views(response.message || {});
         } catch (error) {
             if (this.encounter_views_request_id !== requestId) return;
-            this.page.main.find('[data-console-view="ndr"]').addClass('hidden');
-            if (this.state.console_view === 'ndr') this.switch_console_view('queue');
+            this.apply_available_views({});
+            this.page.main.find('[data-role="no-queues"]').text(__('Unable to check queue access. Refresh to retry.'));
         }
     }
 
-
+    apply_available_views(views) {
+        this.available_views = views;
+        const main = this.page.main;
+        const allowed = ['queue', 'encounters', 'ndr'].filter(view => Boolean(views[view]));
+        for (const view of ['queue', 'encounters', 'ndr']) {
+            main.find('[data-console-view="' + view + '"]').toggleClass('hidden', !views[view]);
+        }
+        main.find('[data-role="no-queues"]').toggleClass('hidden', allowed.length > 0)
+            .text(__('No queues assigned. Contact your administrator.'));
+        if (!allowed.length) {
+            this.encounter_request_id = (this.encounter_request_id || 0) + 1;
+            this.state.console_view = null;
+            this.state.queue = [];
+            this.state.encounters = [];
+            main.find('.vobiz-layout, .vobiz-dialer-control, [data-role="encounter-panel"]').addClass('hidden');
+            return;
+        }
+        this.switch_console_view(views[this.state.console_view] ? this.state.console_view : allowed[0]);
+    }
 
     open_ndr_filters() {
         if (this.state.console_view !== 'ndr' || this.ndr_filter_opening) return;
@@ -4168,7 +4187,7 @@ class VobizAgentConsole {
     }
 
     switch_console_view(view) {
-        if (!['queue', 'encounters', 'ndr'].includes(view)) return;
+        if (!['queue', 'encounters', 'ndr'].includes(view) || !this.available_views?.[view]) return;
         const main = this.page.main;
         if (view !== 'ndr' && this.ndr_filter_group) this.ndr_filter_group.hide_popover();
         if (view === 'ndr' && this.state.filter_group) this.state.filter_group.hide_popover();
@@ -4195,7 +4214,7 @@ class VobizAgentConsole {
         main.find('[data-console-view="' + view + '"]').addClass('active');
         main.find('[data-role="encounter-panel"]').toggleClass('hidden', !list);
         main.find('.vobiz-layout, .vobiz-dialer-control').toggleClass('hidden', list);
-        if (!list) return;
+        if (!list) { this.load(); return; }
         const saved = this.encounter_view_state[view] || {};
         this.state.encounter_page = saved.page || 1;
         this.state.encounter_sort_by = saved.sort_by || '';
