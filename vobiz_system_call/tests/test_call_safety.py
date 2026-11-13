@@ -598,10 +598,11 @@ class BrowserSafetyTests(unittest.TestCase):
 
     def test_manual_complete_explicitly_resets_active_call_locally(self):
         from vobiz_click_to_call.services import realtime
+        from vobiz_system_call.tests.call_log_document import call_log_document
         self.replace(realtime, "publish_call_disconnected", MagicMock())
         for provider_id in ("", "provider-id"):
             with self.subTest(provider_id=provider_id):
-                current = row(status="Initiated", call_uuid=provider_id, end_time=None)
+                current = call_log_document(**row(status="Initiated", call_uuid=provider_id, end_time=None))
                 current.save = MagicMock()
                 mapping = row(name="MAP", current_call_log=current.name)
                 self.replace(lifecycle, "lock_mapping", MagicMock(return_value=mapping))

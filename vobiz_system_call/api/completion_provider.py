@@ -174,7 +174,7 @@ def verify(call_log):
         return
     value.update(attempts=attempt, lease_until=str(now + timedelta(seconds=150)))
     save(row, value, delay=150)
-    snapshot = dict(row)
+    snapshot = row.as_dict()
     frappe.db.commit()  # No row/mapping lock across provider requests.
     ids = targets(snapshot)
     candidate = lifecycle.browser_recovery_uuid(snapshot) if not ids else None

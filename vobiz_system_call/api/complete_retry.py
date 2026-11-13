@@ -34,7 +34,7 @@ def check_completion(name):
     from vobiz_system_call.api import completion_provider as provider
     mapping, row = own_call(name)
     if provider.prepare(row):
-        snapshot = dict(row)
+        snapshot = row.as_dict()
         frappe.db.commit()  # Keep the reservation, but no locks over network I/O.
         outcome = provider.attempt_inline(snapshot)
         # Callbacks or another tab may have changed the mapping while we waited.

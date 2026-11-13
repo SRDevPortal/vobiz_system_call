@@ -5,13 +5,14 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 import frappe
 from vobiz_system_call.api import complete_retry as cr, lifecycle, completion_provider as cp
+from vobiz_system_call.tests.call_log_document import call_log_document
 
 
 def row(**kw):
-    return frappe._dict(dict(name="OLD", user="agent", status="Initiated", direction="Outgoing",
+    return call_log_document(**(dict(name="OLD", user="agent", status="Initiated", direction="Outgoing",
         request_json=json.dumps({"source":"vobiz_system_call", "call_device":"Browser Softphone"}),
         call_uuid="11111111-1111-1111-1111-111111111111", recording_call_uuid=None, b_leg_uuid=None, end_time=None, answer_time=None,
-        reference_doctype="CRM Lead", reference_name="LEAD", customer_number="+919999999999") | kw)
+        reference_doctype="CRM Lead", reference_name="LEAD", customer_number="+919999999999") | kw))
 
 
 class CompleteRetryTests(unittest.TestCase):

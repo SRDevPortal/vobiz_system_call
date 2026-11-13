@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 from vobiz_system_call.api import completion_provider as cp
+from vobiz_system_call.tests.call_log_document import call_log_document
 
 
 A = "11111111-1111-1111-1111-111111111111"
@@ -18,7 +19,7 @@ class CompletionProviderTests(unittest.TestCase):
         self.db = self.mock(frappe, "db", MagicMock())
         self.mock(frappe.utils, "now_datetime", lambda: self.now)
         self.mock(frappe.utils, "now", lambda: str(self.now))
-        self.row = frappe._dict(name="OLD", user="agent", status="Cancelled", direction="Outgoing",
+        self.row = call_log_document(name="OLD", user="agent", status="Cancelled", direction="Outgoing",
             call_uuid=A, b_leg_uuid=None, recording_call_uuid=None, completion_provider_status="Pending",
             request_json=json.dumps({"source": "vobiz_system_call", "call_device": "Browser Softphone",
                 "manual_local_reset": {"user": "agent"}, cp.KEY: {"version": 1, "requested_at": "now",
