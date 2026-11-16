@@ -7650,10 +7650,29 @@ class VobizAgentConsole {
 			(active.name && !this.is_terminal_status(active.status)));
 	}
 
+	has_saved_call_disposition(call) {
+		// CRM status-only saves legitimately have an empty optional disposition.
+		return Boolean(call && (call.disposition_at || this.saved_disposition_calls?.has(call.name)));
+	}
+
+	remember_saved_call_disposition(callLog) {
+		const saved = this.saved_disposition_calls || (this.saved_disposition_calls = new Set());
+		saved.add(callLog);
+		if (saved.size > 500) saved.delete(saved.values().next().value);
+		this.pending_post_call_dispositions?.delete(callLog);
+		this.completed_call_contexts?.delete(callLog);
+		if (this.disposition_opening_call === callLog) this.disposition_opening_call = null;
+	}
+
 	queue_post_call_disposition(call, row, on_done, options) {
+		if (this.has_saved_call_disposition(call)) {
+			this.remember_saved_call_disposition(call.name);
+			if (on_done) on_done();
+			return;
+		}
 		const queue = this.pending_post_call_dispositions || (this.pending_post_call_dispositions = new Map());
 		if (!queue.has(call.name)) queue.set(call.name, [call, row, on_done,
-			Object.assign({}, options, {disposition_context_refreshed: false})]);
+			Object.assign({}, options, {disposition_context_refreshed: false, disposition_status_checked: false})]);
 	}
 
 	sync_post_call_disposition() {
@@ -7717,6 +7736,10 @@ class VobizAgentConsole {
 				.then(r => this.maybe_prompt_workdesk_disposition(Object.assign({}, call, r.message || {}, {incoming_reference_checked: true})))
 				.catch(() => this.maybe_prompt_workdesk_disposition(Object.assign({}, call, {incoming_reference_checked: true})))
 				.finally(() => this.incoming_disposition_pending.delete(call.name));
+			return;
+		}
+		if (this.has_saved_call_disposition(call)) {
+			this.remember_saved_call_disposition(call.name);
 			return;
 		}
 		if (this.should_skip_post_call_disposition(call, { doctype: call.reference_doctype })
@@ -7816,6 +7839,12 @@ class VobizAgentConsole {
 
 	open_post_call_disposition_dialog(call, row, on_done, options = {}) {
         if (!call || !call.name) return;
+		if (this.has_saved_call_disposition(call)) {
+			this.remember_saved_call_disposition(call.name);
+			if (on_done) on_done();
+			this.sync_post_call_disposition();
+			return;
+		}
         if (!options.ndr_checked) {
             if (this.ndr_context_loading === call.name) return;
             this.ndr_context_loading = call.name;
@@ -7844,6 +7873,27 @@ class VobizAgentConsole {
 			|| this.disposition_call_in_progress()) {
 			if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
 			this.queue_post_call_disposition(call, row, on_done, options);
+			return;
+		}
+		if (!options.disposition_status_checked) {
+			const loading = this.disposition_status_loading || (this.disposition_status_loading = new Set());
+			if (loading.has(call.name)) return;
+			loading.add(call.name);
+			this.disposition_opening_call = call.name;
+			// Recheck this exact call after refresh, another tab's save, or time in the queue.
+			Promise.resolve(frappe.call({method: 'vobiz_click_to_call.api.call.get_call_status',
+				args: {call_log: call.name, sync_provider: 0}})).then(r => {
+				if (!r.message || r.message.name !== call.name) throw new Error('Call status unavailable');
+				loading.delete(call.name);
+				this.open_post_call_disposition_dialog(Object.assign({}, call, r.message), row, on_done,
+					Object.assign({}, options, {disposition_status_checked: true}));
+			}).catch(() => {
+				loading.delete(call.name);
+				if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
+				if (this.state.disposition_prompted_call_log === call.name) this.state.disposition_prompted_call_log = null;
+				// Keep the unsaved call for the next normal refresh; do not open on stale evidence.
+				this.queue_post_call_disposition(call, row, on_done, options);
+			});
 			return;
 		}
 		if (!call.reference_doctype && !call.reference_name && !options.generic_dispositions) {
@@ -7980,6 +8030,7 @@ class VobizAgentConsole {
 				sr_followup_status: isPatientDisposition ? values.sr_followup_status : '',
 				notes: values.notes
 			}).then(() => {
+				this.remember_saved_call_disposition(call.name);
 				const savedStatus = isPatientDisposition ? values.sr_followup_status : values.lead_status;
 				frappe.show_alert({
 					message: isAutoSave
@@ -8208,6 +8259,7 @@ class VobizAgentConsole {
 			disposition,
 			notes
 		}).then(() => {
+			this.remember_saved_call_disposition(active.name);
 			frappe.show_alert({ message: __('Disposition saved'), indicator: 'green' });
 			this.page.main.find('[data-role="notes"]').val('');
 			this.load();

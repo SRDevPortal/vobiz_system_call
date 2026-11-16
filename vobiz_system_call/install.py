@@ -29,13 +29,11 @@ def ensure_dependencies():
         frappe.throw(_("Install Vobiz Click To Call before installing Vobiz System Call."))
 
 
-def ensure_patch_fields():
-    if not frappe.db.exists("DocType", "Vobiz Settings") or not frappe.db.exists("DocType", "Vobiz User Mapping"):
-        return
-
-    recovery_field_exists = frappe.db.exists(
-        "Custom Field", {"dt": "Vobiz User Mapping", "fieldname": "browser_call_recovery_enabled"}
-    )
+def ensure_completion_fields():
+    """Repair completion metadata and physical columns during setup/migration."""
+    doctype = "Vobiz Call Log"
+    if not frappe.db.exists("DocType", doctype):
+        frappe.throw(_("Vobiz Call Log is missing. Install Vobiz Click To Call first."))
     create_custom_fields(
         {
             "Vobiz Call Log": [
@@ -47,6 +45,41 @@ def ensure_patch_fields():
                  "fieldtype": "Datetime", "read_only": 1, "no_copy": 1,
                  "insert_after": "completion_provider_status"},
             ],
+        },
+        update=True,
+    )
+    required = {"completion_provider_status", "completion_provider_due"}
+    def missing_columns():
+        # Query the physical schema directly: metadata/table-column caches may
+        # describe fields whose DDL failed during an earlier deployment.
+        rows = frappe.db.sql(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s",
+            ("tabVobiz Call Log",),
+        )
+        return required - {row[0] for row in rows}
+
+    frappe.clear_cache(doctype=doctype)
+    if missing_columns():
+        # create_custom_fields skips unchanged metadata. Explicitly sync it when
+        # the Custom Field exists but its MariaDB column does not.
+        frappe.db.updatedb(doctype)
+        frappe.clear_cache(doctype=doctype)
+    missing = missing_columns()
+    if missing:
+        frappe.throw(_("Vobiz completion schema repair failed; missing columns: {0}").format(", ".join(sorted(missing))))
+
+
+def ensure_patch_fields():
+    ensure_completion_fields()
+    if not frappe.db.exists("DocType", "Vobiz Settings") or not frappe.db.exists("DocType", "Vobiz User Mapping"):
+        return
+
+    recovery_field_exists = frappe.db.exists(
+        "Custom Field", {"dt": "Vobiz User Mapping", "fieldname": "browser_call_recovery_enabled"}
+    )
+    create_custom_fields(
+        {
             "Vobiz Settings": [
                 {"fieldname": "enable_browser_softphone", "label": "Enable Browser Softphone",
                  "fieldtype": "Check", "default": "1", "insert_after": "enable_mobile_bridge"},

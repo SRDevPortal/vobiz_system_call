@@ -438,6 +438,7 @@ class MappingRecoveryMigrationTests(unittest.TestCase):
         db = MagicMock()
         db.exists.side_effect = lambda dt, name: field_exists if dt == "Custom Field" else True
         db.get_value.return_value = "pilot-mapping"
+        db.sql.return_value = [("completion_provider_status",), ("completion_provider_due",)]
         with patch.object(frappe, "db", db), patch.object(frappe, "conf", frappe._dict(config)), \
                 patch.object(frappe, "clear_cache"), patch.object(install, "create_custom_fields"):
             install.ensure_patch_fields()
