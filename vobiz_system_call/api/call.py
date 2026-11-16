@@ -44,7 +44,10 @@ def start_call(
     client_context: str | None = None,
     tab_id: str | None = None,
     retry_of: str | None = None,
+    ndr_encounter: str | None = None,
 ) -> dict[str, Any]:
+    from vobiz_click_to_call.api import ndr_outcomes
+    ndr_encounter = ndr_outcomes.validate_start(ndr_encounter, reference_doctype, reference_name, retry_of)
     if frappe.session.user == "Guest":
         frappe.throw(_("Login required."))
 
@@ -52,7 +55,7 @@ def start_call(
     if retry_of and not is_enabled(system_settings):
         frappe.throw(_("Browser calling must be enabled to retry."))
     if not is_enabled(system_settings):
-        return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)
+        return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected, ndr_encounter=ndr_encounter)
 
     profile = lifecycle.lock_mapping(frappe.session.user)
     lifecycle.assert_available(profile)
@@ -65,7 +68,7 @@ def start_call(
         frappe.throw(_("Retry is only available for browser calls."))
     assert_device_enabled(call_device, system_settings)
     if call_device not in {CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
-        return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected)
+        return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected, ndr_encounter=ndr_encounter)
     if client_context != "agent_console":
         frappe.throw(_("Open the Vobiz Agent Console to use your selected call device."))
 
@@ -138,6 +141,7 @@ def start_call(
         caller_id=caller_id,
         call_flow=call_flow,
     )
+    ndr_outcomes.attach(call_log, ndr_encounter)
 
     if previous:
         complete_retry.link_retry(previous, call_log)
@@ -344,7 +348,7 @@ def retry_call_log(call_log: str, tab_id: str):
     return start_call(previous.reference_doctype, previous.reference_name,
                       phone_field=None, phone_number=previous.customer_number,
                       patient_phone_selected=1, client_context="agent_console", tab_id=tab_id,
-                      retry_of=call_log)
+                      retry_of=call_log, ndr_encounter=previous.get("ndr_encounter"))
 
 
 @frappe.whitelist(methods=["POST"])

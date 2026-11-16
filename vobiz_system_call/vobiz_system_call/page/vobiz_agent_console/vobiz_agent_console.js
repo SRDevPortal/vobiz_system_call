@@ -547,8 +547,8 @@ class VobizAgentConsole {
 				.vobiz-workdesk-modal { overflow-x: hidden; }
 				.vobiz-workdesk-modal .modal-dialog { margin-left: auto; margin-right: auto; max-width: min(1180px, calc(100vw - 64px)) !important; width: auto !important; }
 				.vobiz-workdesk-modal .modal-content, .vobiz-workdesk-modal .modal-body, .vobiz-workdesk-modal .form-layout, .vobiz-workdesk-modal .form-page, .vobiz-workdesk-modal .form-section, .vobiz-workdesk-modal .section-body { max-width: 100%; min-width: 0; overflow-x: hidden; }
-				.modal-body { overflow-x: hidden; }
-				.modal-body .form-column, .modal-body .frappe-control, .modal-body [data-fieldname="details"] { max-width: 100%; min-width: 0; overflow-x: hidden; }
+				.vobiz-workdesk-modal .modal-body { overflow-x: hidden; }
+				.vobiz-workdesk-modal .modal-body .form-column, .vobiz-workdesk-modal .modal-body .frappe-control, .vobiz-workdesk-modal .modal-body [data-fieldname="details"] { max-width: 100%; min-width: 0; overflow-x: hidden; }
 				.vobiz-detail-dialog, .vobiz-detail-dialog * { box-sizing: border-box; max-width: 100%; }
 				.vobiz-detail-dialog { overflow-x: hidden; width: 100%; }
 				.vobiz-workdesk { max-width: 100%; min-height: 520px; min-width: 0; overflow-x: hidden; }
@@ -689,6 +689,20 @@ class VobizAgentConsole {
             this.switch_console_view($(e.currentTarget).attr('data-console-view'));
         });
         $main.on('click', '[data-action="ndr-filters"]', () => this.open_ndr_filters());
+        $main.on('click', '[data-action="ndr-history"]', e => {
+            e.stopPropagation();
+            const row = this.state.encounters[Number($(e.currentTarget).attr('data-row-index'))];
+            if (!row) return;
+            frappe.call({method: 'vobiz_click_to_call.api.ndr_outcomes.history', args: {encounter: row.name}})
+                .then(r => {
+                    const escape = frappe.utils.escape_html;
+                    const content = (r.message || []).map(h =>
+                        '<div><strong>' + escape(h.tag) + '</strong> — ' + escape(h.agent) +
+                        ' — ' + escape(String(h.creation)) + '<p>' + escape(h.notes || '') +
+                        '</p><p>' + __('Follow-up At') + ': ' + escape(String(h.follow_up_at || '—')) + '</p></div>').join('<hr>');
+                    frappe.msgprint({title: __('NDR Interaction History'), message: content || __('No previous outcomes')});
+                });
+        });
         $main.on('click', '[data-ndr-value-filter]', e => {
             e.preventDefault();
             e.stopPropagation();
@@ -2782,6 +2796,7 @@ class VobizAgentConsole {
 			this.state.active_call = data.active_call || null;
 			this.refresh_browser_softphone_call(data.active_call || {});
 			this.state.dispositions = data.dispositions || [];
+            this.check_pending_ndr_outcomes();
 			this.state.patient_followup_status_options = data.patient_followup_status_options || [];
 			this.state.ai_disposition_enabled = Boolean(data.ai_disposition_enabled);
 			if (!this.state.lead_disposition_context || !this.state.lead_disposition_context.name) {
@@ -4276,7 +4291,7 @@ class VobizAgentConsole {
                 escape(__('Track shipment in new tab')) + '">' + escape(value) +
                 ' <i class="fa fa-external-link" aria-hidden="true"></i></a>';
         }
-        if (['pe_shipkia_stage', 'pe_shipkia_status'].includes(column.fieldname)) {
+        if (['pe_shipkia_stage', 'pe_shipkia_status', 'ndr_tag'].includes(column.fieldname)) {
             return '<button class="btn btn-link btn-xs" data-ndr-value-filter="' + column.fieldname +
                 '" data-row-index="' + index + '" title="' + escape(__('Filter by this value')) + '">' +
                 escape(value) + '</button>';
@@ -4286,7 +4301,7 @@ class VobizAgentConsole {
 
     async apply_ndr_value_filter(field, index) {
         if (this.state.console_view !== 'ndr' || this.ndr_quick_filter_busy ||
-            !['pe_shipkia_stage', 'pe_shipkia_status'].includes(field)) return;
+            !['pe_shipkia_stage', 'pe_shipkia_status', 'ndr_tag'].includes(field)) return;
         const row = this.state.encounters[index];
         if (!row || !String(row[field] || '').trim()) return;
         const value = String(row[field]);
@@ -4330,7 +4345,10 @@ class VobizAgentConsole {
                 '<td>' + this.render_encounter_cell(row, c, index) + '</td>'
             ).join('') + '<td><button class="btn btn-xs btn-primary" data-action="call-row" ' +
                 (loading ? 'disabled' : '') + '><i class="fa fa-phone"></i> ' +
-                (loading ? __('Loading') : __('Details')) + '</button></td></tr>';
+                (loading ? __('Loading') : __('Details')) + '</button>' +
+                (this.state.console_view === 'ndr' && columns.some(c => c.fieldname === 'ndr_tag')
+                    ? ' <button class="btn btn-xs btn-default" data-action="ndr-history" data-row-index="' + index + '">' + __('History') + '</button>' : '') +
+                '</td></tr>';
         }).join('') || '<tr><td colspan="' + (columns.length + 1) + '">' + __('No matching patient encounters') + '</td></tr>');
         this.page.main.find('[data-role="encounter-page-label"]').text(__('Page {0}', [this.state.encounter_page]));
         this.page.main.find('[data-action="encounter-prev"]').prop('disabled', this.state.encounter_page <= 1);
@@ -4352,7 +4370,7 @@ class VobizAgentConsole {
             });
             const context = result.message || {};
             if (this.encounter_request_id !== requestId) return;
-            const row = Object.assign({}, context.reference, {doctype: 'Patient', encounter_name: encounter.name});
+            const row = Object.assign({}, context.reference, {doctype: 'Patient', encounter_name: encounter.name, ndr_encounter: view === 'ndr' ? encounter.name : null});
             this.state.context = context;
             this.apply_context_dispositions(context);
             this.open_detail_dialog(row, context);
@@ -6965,6 +6983,7 @@ class VobizAgentConsole {
 					? null : (patientPhone ? patientPhone.number : row.phone),
 				patient_phone_selected: patientPhone ? 1 : 0,
 				client_context: 'agent_console',
+                ndr_encounter: row.ndr_encounter || null,
 				tab_id: this.get_softphone_tab_id()
 			},
 			freeze: true,
@@ -7743,7 +7762,71 @@ class VobizAgentConsole {
 		}, 150);
 	}
 
+
+    async check_pending_ndr_outcomes() {
+        if (this.ndr_pending_check || this.ndr_outcome_dialog || this.disposition_call_in_progress?.()) return;
+        this.ndr_pending_check = true;
+        try {
+            const r = await frappe.call({method: 'vobiz_click_to_call.api.ndr_outcomes.pending'});
+            const pending = r.message || [];
+            if (pending.length && !this.ndr_outcome_dialog && !this.disposition_call_in_progress?.()) {
+                this.open_post_call_disposition_dialog({name: pending[0].name}, {}, null, {});
+            }
+        } finally { this.ndr_pending_check = false; }
+    }
+
+    show_ndr_outcome(call, context, on_done) {
+        if (context.saved) { if (on_done) on_done(); return; }
+        if (!context.terminal || this.ndr_outcome_dialog || this.disposition_call_in_progress?.()) return;
+        const escape = frappe.utils.escape_html;
+        const history = (context.history || []).map(h => '<div><strong>' + escape(h.tag) +
+            '</strong> — ' + escape(h.agent) + ' — ' + escape(String(h.creation)) +
+            '<p>' + escape(h.notes || '') + '</p></div>').join('');
+        const dialog = new frappe.ui.Dialog({
+            title: __('Save NDR Outcome'),
+            fields: [
+                {fieldtype: 'HTML', options: '<p><strong>' + escape(context.encounter) + '</strong><br>' +
+                    __('Order ID') + ': ' + escape(context.order_id || '—') + ' · AWB: ' +
+                    escape(context.awb || '—') + '</p>'},
+                {fieldname: 'tag', label: __('NDR Tag'), fieldtype: 'Link', options: 'NDR Tag', get_query: () => ({filters: {enabled: 1}}), reqd: 1},
+                {fieldname: 'notes', label: __('Note'), fieldtype: 'Small Text'},
+                {fieldname: 'callback_at', label: __('Callback Scheduled At'), fieldtype: 'Datetime', depends_on: "eval:doc.tag === 'Callback'", description: __('Optional scheduled callback; separate from call end time')},
+
+                {fieldname: 'follow_up_at', label: __('Follow-up At'), fieldtype: 'Datetime', default: context.follow_up_at, read_only: 1, description: __('Automatically recorded from call hangup')},
+                {fieldtype: 'HTML', options: '<details><summary>' + __('Previous NDR interactions') + '</summary>' +
+                    (history || __('No previous outcomes')) + '</details>'}
+            ],
+            primary_action_label: __('Save NDR Outcome'),
+            primary_action: values => {
+                dialog.get_primary_btn().prop('disabled', true);
+                frappe.call({method: 'vobiz_click_to_call.api.ndr_outcomes.save', type: 'POST',
+                    args: Object.assign({call_log: call.name}, values, {callback_at: values.tag === 'Callback' ? values.callback_at : null})})
+                .then(() => {
+                    dialog.hide();
+                    frappe.show_alert({message: __('NDR outcome saved'), indicator: 'green'});
+                    if (this.state.console_view === 'ndr') this.load_encounters();
+                    if (on_done) on_done();
+                }).always(() => dialog.get_primary_btn().prop('disabled', false));
+            }
+        });
+        this.ndr_outcome_dialog = dialog;
+        dialog.onhide = () => { this.ndr_outcome_dialog = null; };
+        dialog.show();
+    }
+
 	open_post_call_disposition_dialog(call, row, on_done, options = {}) {
+        if (!call || !call.name) return;
+        if (!options.ndr_checked) {
+            if (this.ndr_context_loading === call.name) return;
+            this.ndr_context_loading = call.name;
+            frappe.call({method: 'vobiz_click_to_call.api.ndr_outcomes.get_context', args: {call_log: call.name}})
+                .then(r => {
+                    const context = r.message || {};
+                    if (context.ndr) this.show_ndr_outcome(call, context, on_done);
+                    else this.open_post_call_disposition_dialog(call, row, on_done, Object.assign({}, options, {ndr_checked: true}));
+                }).always(() => { this.ndr_context_loading = null; });
+            return;
+        }
 		if (options.check_current_call && !this.is_disposition_call_current(call.name)) {
 			this.completed_call_context(call);
 			if (this.disposition_opening_call === call.name) this.disposition_opening_call = null;
