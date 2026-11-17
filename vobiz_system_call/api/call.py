@@ -46,7 +46,35 @@ def start_call(
     retry_of: str | None = None,
     ndr_encounter: str | None = None,
 ) -> dict[str, Any]:
+    return _start_call(
+        reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected,
+        client_context, tab_id, retry_of, ndr_encounter,
+    )
+
+
+@frappe.whitelist(methods=["POST"])
+def start_direct_call(phone_number: str, client_context: str | None = None, tab_id: str | None = None):
+    from vobiz_click_to_call.services import direct_dial
+    return direct_dial.result(_start_call("", "", phone_number=phone_number,
+        client_context=client_context, tab_id=tab_id, direct_dial=True))
+
+
+def _start_call(
+    reference_doctype: str,
+    reference_name: str,
+    phone_field: str | None = None,
+    phone_number: str | None = None,
+    patient_phone_selected: int | str = 0,
+    client_context: str | None = None,
+    tab_id: str | None = None,
+    retry_of: str | None = None,
+    ndr_encounter: str | None = None,
+    *,
+    direct_dial: bool = False,
+) -> dict[str, Any]:
     from vobiz_click_to_call.api import ndr_outcomes
+    if direct_dial:
+        ndr_encounter = None
     ndr_encounter = ndr_outcomes.validate_start(ndr_encounter, reference_doctype, reference_name, retry_of)
     if frappe.session.user == "Guest":
         frappe.throw(_("Login required."))
@@ -55,7 +83,8 @@ def start_call(
     if retry_of and not is_enabled(system_settings):
         frappe.throw(_("Browser calling must be enabled to retry."))
     if not is_enabled(system_settings):
-        return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected, ndr_encounter=ndr_encounter)
+        return (core_call.start_direct_call(phone_number) if direct_dial else
+                core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected, ndr_encounter=ndr_encounter))
 
     profile = lifecycle.lock_mapping(frappe.session.user)
     lifecycle.assert_available(profile)
@@ -68,7 +97,8 @@ def start_call(
         frappe.throw(_("Retry is only available for browser calls."))
     assert_device_enabled(call_device, system_settings)
     if call_device not in {CALL_DEVICE_BROWSER_SOFTPHONE, CALL_DEVICE_SYSTEM_DIALER}:
-        return core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected, ndr_encounter=ndr_encounter)
+        return (core_call.start_direct_call(phone_number) if direct_dial else
+                core_call.start_call(reference_doctype, reference_name, phone_field, phone_number, patient_phone_selected, ndr_encounter=ndr_encounter))
     if client_context != "agent_console":
         frappe.throw(_("Open the Vobiz Agent Console to use your selected call device."))
 
@@ -76,19 +106,26 @@ def start_call(
     if not core_settings.enabled:
         frappe.throw(_("Vobiz Click To Call is disabled."))
 
-    allowed_doctypes = get_allowed_doctypes(core_settings)
-    if reference_doctype not in allowed_doctypes:
-        frappe.throw(_("Calling is not enabled for {0}.").format(reference_doctype))
-    if not frappe.db.exists(reference_doctype, reference_name):
-        frappe.throw(_("{0} {1} was not found.").format(reference_doctype, reference_name))
+    from vobiz_click_to_call.services import direct_dial as direct
+    if direct_dial:
+        target = (direct.resolve_retry_target(retry_of, profile, core_settings) if retry_of else
+                  direct.resolve_target(phone_number, profile, core_settings))
+        customer_number, reference_doctype, reference_name, resolved_phone_field = target
+        raw_customer_number = customer_number
+    else:
+        allowed_doctypes = get_allowed_doctypes(core_settings)
+        if reference_doctype not in allowed_doctypes:
+            frappe.throw(_("Calling is not enabled for {0}.").format(reference_doctype))
+        if not frappe.db.exists(reference_doctype, reference_name):
+            frappe.throw(_("{0} {1} was not found.").format(reference_doctype, reference_name))
 
-    doc = frappe.get_doc(reference_doctype, reference_name)
-    if not doc.has_permission("read") and not core_call.has_mapped_patient_access(reference_doctype, reference_name):
-        frappe.throw(_("You do not have permission to call from this document."))
-    if reference_doctype == "Patient":
-        choices = core_call._patient_primary_phone_candidates(doc, get_default_country_code(core_settings))
-        if len(choices) > 1 and not frappe.utils.cint(patient_phone_selected):
-            frappe.throw(_("Select the Patient number to call."))
+        doc = frappe.get_doc(reference_doctype, reference_name)
+        if not doc.has_permission("read") and not core_call.has_mapped_patient_access(reference_doctype, reference_name):
+            frappe.throw(_("You do not have permission to call from this document."))
+        if reference_doctype == "Patient":
+            choices = core_call._patient_primary_phone_candidates(doc, get_default_country_code(core_settings))
+            if len(choices) > 1 and not frappe.utils.cint(patient_phone_selected):
+                frappe.throw(_("Select the Patient number to call."))
 
     mapping = core_call.get_user_mapping(frappe.session.user)
     if not mapping:
@@ -106,9 +143,12 @@ def start_call(
     locked_mapping = lifecycle.lock_mapping(frappe.session.user)
     lifecycle.assert_available(locked_mapping)
     mapping = locked_mapping.as_dict()
+    if direct_dial:
+        direct.assert_allowed(mapping)
 
     default_country_code = get_default_country_code(core_settings)
-    raw_customer_number, resolved_phone_field = core_call.resolve_target_number(doc, phone_field, phone_number)
+    if not direct_dial:
+        raw_customer_number, resolved_phone_field = core_call.resolve_target_number(doc, phone_field, phone_number)
     customer_number = normalize_phone_number(raw_customer_number, default_country_code=default_country_code)
     user_mobile = normalize_phone_number(mapping.get("agent_mobile"), default_country_code=default_country_code)
     call_flow = core_settings.default_call_flow or "Customer First"
@@ -136,6 +176,7 @@ def start_call(
         reference_doctype=reference_doctype,
         reference_name=reference_name,
         phone_field=resolved_phone_field,
+        **({"direct_dial": True} if direct_dial else {}),
         customer_number=customer_number,
         user_mobile=user_mobile,
         caller_id=caller_id,
@@ -197,6 +238,7 @@ def start_system_dialer_call(
     call_log.start_time = call_log.start_time or frappe.utils.now()
     call_log.request_json = json.dumps(
         {
+            **lifecycle.context(call_log),
             "call_device": CALL_DEVICE_SYSTEM_DIALER,
             "dial_url": dial_url,
             "customer_number": customer_number,
@@ -345,6 +387,11 @@ def retry_call_log(call_log: str, tab_id: str):
     previous = frappe.get_doc("Vobiz Call Log", call_log)
     if previous.user != frappe.session.user:
         frappe.throw(_("Not permitted."))
+    from vobiz_click_to_call.services.direct_dial import is_direct_call, result
+    if is_direct_call(previous):
+        return result(_start_call(previous.reference_doctype, previous.reference_name,
+                          phone_number=previous.customer_number, client_context="agent_console", tab_id=tab_id,
+                          retry_of=call_log, direct_dial=True))
     return start_call(previous.reference_doctype, previous.reference_name,
                       phone_field=None, phone_number=previous.customer_number,
                       patient_phone_selected=1, client_context="agent_console", tab_id=tab_id,

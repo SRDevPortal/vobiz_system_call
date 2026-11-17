@@ -32,7 +32,7 @@ function setup() {
     obj.set_browser_network_issue = () => {};
     for (const name of ['stop_browser_softphone_audio', 'stop_timer', 'render_browser_softphone', 'render_queue',
         'render_workdesk_live_call', 'update_workdesk_primary_action', 'render_header_active_call', 'render_call_assets',
-        'prune_selected_queue_keys', 'reset_filter_group_if_doctype_changed', 'render_availability', 'render_filter_button',
+        'render_direct_dial_access', 'prune_selected_queue_keys', 'reset_filter_group_if_doctype_changed', 'render_availability', 'render_filter_button',
         'render_dispositions', 'render_manual_disposition_visibility', 'refresh_workdesk_live_call', 'render_auto_toggle',
         'refresh_auto_dial_current', 'render_auto_live', 'maybe_continue_auto_dial', 'restore_workdesk_dialog']) obj[name] = () => {};
     obj.open_post_call_disposition_dialog = (...args) => opened.push(args);

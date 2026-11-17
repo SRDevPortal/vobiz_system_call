@@ -89,7 +89,7 @@ def lock_retry(name, doctype, reference, number):
         frappe.throw(_("Reset the previous call before retrying."))
     if data.get("retry_of") or data.get("retry_call_log"):
         frappe.throw(_("The single retry for this call has already been used."))
-    if (row.reference_doctype != doctype or row.reference_name != reference
+    if ((row.reference_doctype or "") != (doctype or "") or (row.reference_name or "") != (reference or "")
             or row.customer_number != number):
         frappe.throw(_("Retry must use the original customer and number."))
     return row

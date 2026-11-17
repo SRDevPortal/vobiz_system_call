@@ -152,3 +152,9 @@ class CompleteRetryTests(unittest.TestCase):
         self.assertTrue(result["local_reset"])
         self.assertEqual(result["provider_hangup"], "missing_verified_id")
         self.provider.assert_not_called()
+
+    def test_standalone_retry_treats_empty_database_references_consistently(self):
+        self.current = self.reset_row(direct_dial=True)
+        self.current.reference_doctype = None
+        self.current.reference_name = None
+        self.assertIs(cr.lock_retry('OLD', '', '', self.current.customer_number), self.current)

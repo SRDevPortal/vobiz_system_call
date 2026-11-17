@@ -16,6 +16,7 @@ after_request = ["vobiz_system_call.request_diagnostics.after_request"]
 override_whitelisted_methods = {
     "vobiz_click_to_call.api.call.cancel_call": "vobiz_system_call.api.call.cancel_call",
     "vobiz_click_to_call.api.call.start_call": "vobiz_system_call.api.call.start_call",
+    "vobiz_click_to_call.api.call.start_direct_call": "vobiz_system_call.api.call.start_direct_call",
     "vobiz_click_to_call.api.webrtc.get_browser_softphone_config": "vobiz_system_call.api.webrtc.get_browser_softphone_config",
     "vobiz_click_to_call.api.webrtc.update_browser_softphone_call": "vobiz_system_call.api.webrtc.update_browser_softphone_call",
     "vobiz_click_to_call.api.webrtc.answer": "vobiz_system_call.api.webrtc.answer",

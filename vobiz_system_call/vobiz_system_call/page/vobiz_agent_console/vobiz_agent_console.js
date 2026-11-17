@@ -165,6 +165,7 @@ class VobizAgentConsole {
 								${__('Complete Call')}
 							</button>
 						</div>
+						<button type="button" class="btn btn-primary btn-sm hidden" data-action="open-direct-dial"><i class="fa fa-th"></i> ${__('Dialpad')}</button>
 						<button class="btn btn-default btn-sm" data-action="open-analytics">
 							<i class="fa fa-line-chart"></i> ${__('Analytics')}
 						</button>
@@ -685,6 +686,7 @@ class VobizAgentConsole {
 
 	bind() {
 		const $main = this.page.main;
+		$main.on('click', '[data-action="open-direct-dial"]', () => this.open_direct_dialpad());
         $main.on('click', '[data-console-view]', (e) => {
             this.switch_console_view($(e.currentTarget).attr('data-console-view'));
         });
@@ -2834,7 +2836,9 @@ class VobizAgentConsole {
 				this.queue_reload_pending = true;
 				return;
 			}
+			this.state.direct_dial_allowed = Boolean(data.direct_dial_allowed);
 			this.state.active_call = data.active_call || null;
+			this.render_direct_dial_access();
 			this.refresh_browser_softphone_call(data.active_call || {});
 			this.state.dispositions = data.dispositions || [];
             this.check_pending_ndr_outcomes();
@@ -4464,6 +4468,7 @@ class VobizAgentConsole {
 	}
 
 	render_header_active_call(active = {}) {
+		this.render_direct_dial_access();
 		if (!active.name && this.state.completion_retry_candidate) active = this.state.completion_retry_candidate;
 		const canRetry = this.state.completion_retry_candidate?.name === active.name;
 		const isActive = Boolean(active.name && (!this.is_terminal_status(active.status) || canRetry));
@@ -6963,6 +6968,67 @@ class VobizAgentConsole {
 		this.start_call_for_row(row);
 	}
 
+	direct_dial_busy() {
+		const active = this.state.active_call || {};
+		const live = this.state.workdesk_live_call || {};
+		return Boolean(this.start_call_in_flight || this.state.completing_call_log
+			|| this.state.auto_dial?.running || this.state.softphone?.current_call_log
+			|| (active.name && !this.is_terminal_status(active.status))
+			|| (live.name && !this.is_terminal_status(live.status)));
+	}
+
+	render_direct_dial_access() {
+		const allowed = Boolean(this.state.direct_dial_allowed);
+		this.page?.main?.find('[data-action="open-direct-dial"]')
+			.toggleClass('hidden', !allowed).prop('disabled', this.direct_dial_busy());
+		if (this.direct_dial_dialog) {
+			this.direct_dial_dialog.get_primary_btn().prop('disabled', !allowed || this.direct_dial_busy());
+			if (!allowed) this.direct_dial_dialog.hide();
+		}
+	}
+
+	open_direct_dialpad() {
+		if (!this.state.direct_dial_allowed || this.direct_dial_busy()) return;
+		if (!this.direct_dial_dialog) {
+			const dialog = new frappe.ui.Dialog({
+				title: __('Dial a number'),
+				fields: [
+					{fieldname: 'phone_number', fieldtype: 'Data', label: __('Phone number'), reqd: 1,
+						description: __('Use the country code for international calls, for example +91.')},
+					{fieldname: 'keypad', fieldtype: 'HTML'}
+				],
+				primary_action_label: __('Call'),
+				primary_action: values => {
+					if (!this.state.direct_dial_allowed || this.direct_dial_busy()) return;
+					const phone = String(values.phone_number || '').trim();
+					if (!phone) return;
+					this.start_call_for_row({direct_dial: true, phone, title: __('Direct call'), doctype: '', name: ''})
+						.then(message => {
+							if (!message?.call_log) return;
+							dialog.set_value('phone_number', '');
+							dialog.hide();
+						})
+						.catch(error => frappe.msgprint(error.message || __('Could not start the call. Please try again.')));
+				}
+			});
+			this.direct_dial_dialog = dialog;
+			dialog.fields_dict.phone_number.$input.attr({type: 'tel', inputmode: 'tel', autocomplete: 'off', maxlength: 32, 'aria-label': __('Phone number')});
+			const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '0', 'backspace'];
+			const keypad = dialog.fields_dict.keypad.$wrapper;
+			keypad.html(`<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:300px;margin:0 auto 12px;">
+				${keys.map(key => `<button type="button" class="btn btn-default" style="min-height:48px;font-size:20px;" data-dial-key="${key}"
+					aria-label="${key === 'backspace' ? frappe.utils.escape_html(__('Delete last digit')) : key}">${key === 'backspace' ? '⌫' : key}</button>`).join('')}</div>`);
+			keypad.on('click', '[data-dial-key]', event => {
+				const key = $(event.currentTarget).attr('data-dial-key');
+				const value = String(dialog.get_value('phone_number') || '');
+				dialog.set_value('phone_number', key === 'backspace' ? value.slice(0, -1) : (value + key).slice(0, 32));
+			});
+		}
+		this.direct_dial_dialog.show();
+		this.render_direct_dial_access();
+		this.direct_dial_dialog.fields_dict.phone_number.$input.trigger('focus');
+	}
+
 	start_call_for_row(row, patientPhone = null, browserReady = false) {
 		if (!row) return Promise.resolve();
 		// Only the first caller owns the result (especially manual versus auto-dial).
@@ -6971,9 +7037,11 @@ class VobizAgentConsole {
 		const request = Promise.resolve(this.softphone_reset_promise).then(() => this.perform_start_call_for_row(row, patientPhone, browserReady));
 		const tracked = request.finally(() => {
 			if (this.start_call_in_flight === tracked) this.start_call_in_flight = null;
+			this.render_direct_dial_access();
 			this.update_workdesk_primary_action(this.state.active_workdesk_row);
 		});
 		this.start_call_in_flight = tracked;
+		this.render_direct_dial_access();
 		this.update_workdesk_primary_action(this.state.active_workdesk_row);
 		return this.start_call_in_flight;
 	}
@@ -7014,9 +7082,12 @@ class VobizAgentConsole {
 			});
 		}
 		return frappe.call({
-			method: row.retry_of ? 'vobiz_system_call.api.call.retry_call_log' : 'vobiz_click_to_call.api.call.start_call',
+			method: row.retry_of ? 'vobiz_system_call.api.call.retry_call_log' : (row.direct_dial
+				? 'vobiz_click_to_call.api.call.start_direct_call' : 'vobiz_click_to_call.api.call.start_call'),
 			type: 'POST',
-			args: row.retry_of ? {call_log: row.retry_of, tab_id: this.get_softphone_tab_id()} : {
+			args: row.retry_of ? {call_log: row.retry_of, tab_id: this.get_softphone_tab_id()} : row.direct_dial ? {
+				phone_number: row.phone, client_context: 'agent_console', tab_id: this.get_softphone_tab_id()
+			} : {
 				reference_doctype: row.doctype,
 				reference_name: row.name,
 				phone_field: patientPhone ? patientPhone.fieldname : row.phone_field,
@@ -7031,6 +7102,9 @@ class VobizAgentConsole {
 			freeze_message: __('Starting call...')
 		}).then((r) => {
 			const message = r.message || {};
+			if (message.direct_dial) {
+				row = Object.assign({}, row, {direct_dial: true, doctype: message.reference_doctype || '', name: message.reference_name || ''});
+			}
 			if (message.call_log && (softphone.retired_call_logs || []).includes(message.call_log)) {
 				throw new Error(__('This call attempt was reset. Start a new call.'));
 			}
@@ -7041,6 +7115,8 @@ class VobizAgentConsole {
 					this.state.workdesk_live_call_log = message.call_log;
 					this.state.workdesk_live_call = {
 						name: message.call_log,
+						direct_dial: Boolean(row.direct_dial),
+						direction: 'Outgoing',
 						status: message.status || __('Initiated'),
 						call_flow: message.call_flow || '',
 						reference_doctype: row.doctype,
@@ -7071,6 +7147,8 @@ class VobizAgentConsole {
 				this.state.workdesk_live_call_log = message.call_log;
 				this.state.workdesk_live_call = {
 					name: message.call_log,
+						direct_dial: Boolean(row.direct_dial),
+						direction: 'Outgoing',
 					status: message.status || __('Queued'),
 					call_flow: message.call_flow || '',
 					reference_doctype: row.doctype,
@@ -7763,7 +7841,7 @@ class VobizAgentConsole {
 			this.finish_auto_dial_call(call);
 			return;
 		}
-		if ((!call.reference_doctype || !call.reference_name) && call.direction !== 'Incoming') {
+		if ((!call.reference_doctype || !call.reference_name) && call.direction !== 'Incoming' && !call.direct_dial) {
 			// Compatibility with old workers sending only name/status during deployment.
 			if (!call.disposition_reference_checked) this.watch_browser_call_disposition(call.name);
 			else this.completed_call_contexts.delete(call.name);
@@ -7807,7 +7885,7 @@ class VobizAgentConsole {
 			title: call.reference_title || call.reference_name,
 			phone: call.customer_number_display || ''
 		};
-		if ((!row.doctype || !row.name) && call.direction !== 'Incoming') return;
+		if ((!row.doctype || !row.name) && call.direction !== 'Incoming' && !call.direct_dial) return;
 
 		this.state.disposition_prompted_call_log = call.name;
 		this.completed_call_contexts.delete(call.name);
