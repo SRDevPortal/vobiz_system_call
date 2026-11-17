@@ -1704,6 +1704,31 @@ class VobizAgentConsole {
 	}
 
 	send_browser_window_presence(registered, claimIdle = false) {
+		const pending = this.browser_presence_request;
+		if (pending) {
+			if (pending.registered === registered && pending.claimIdle === claimIdle) return pending.promise;
+			// A logout or fresh claim must retain its own meaning and run after
+			// the current heartbeat, rather than overlap it or reuse its result.
+			return pending.promise.catch(() => {}).then(() => this.send_browser_window_presence(registered, claimIdle));
+		}
+		if (registered && Date.now() < (this.browser_presence_retry_at || 0)) {
+			return Promise.reject(this.browser_presence_busy_error());
+		}
+		const flight = {registered, claimIdle};
+		this.browser_presence_request = flight;
+		flight.promise = Promise.resolve().then(() => this.request_browser_window_presence(registered, claimIdle)).finally(() => {
+			if (this.browser_presence_request === flight) this.browser_presence_request = null;
+		});
+		return flight.promise;
+	}
+
+	browser_presence_busy_error() {
+		const err = new Error(__('Agent state is being updated. Please try again shortly.'));
+		err.presence_busy = true;
+		return err;
+	}
+
+	request_browser_window_presence(registered, claimIdle) {
 		const s = this.state.softphone;
 		const healthyCall = registered && s.registered && s.in_call && s.recovery_media_connected
 			&& !s.pending_end_call && !s.recovery_verification && !Object.keys(s.network_issues || {}).length;
@@ -1713,8 +1738,22 @@ class VobizAgentConsole {
 				claim_idle: registered && claimIdle ? 1 : 0, call_log: healthyCall ? s.current_call_log : '' },
 			silent: true
 		});
-		return this.browser_request_with_timeout(request).then(r => {
+		return this.browser_request_with_timeout(request).catch(err => {
+			const payload = err && err.responseJSON;
+			if (Number(err && err.status) === 503 && payload && payload.message && payload.message.ownership === 'retry') {
+				return payload;
+			}
+			throw err;
+		}).then(r => {
 			const data = (r || {}).message || {};
+			if (data.ownership === 'retry') {
+				const delay = Math.max(1000, Math.min(5000, Number(data.retry_after_ms) || 2000));
+				this.browser_presence_retry_at = Date.now() + delay + Math.floor(Math.random() * 1000);
+				// Busy is neither a grant nor an ownership rejection. In particular,
+				// never log out a healthy SDK or start a new SDK from this response.
+				throw this.browser_presence_busy_error();
+			}
+			this.browser_presence_retry_at = 0;
 			if (registered && data.registered === false) {
 				if (data.ownership === 'release_requested') this.release_softphone_for_switch(data).catch(() => {});
 				else this.mark_softphone_other_window();
@@ -2027,7 +2066,8 @@ class VobizAgentConsole {
 				});
 			}
 		}
-		if (this.browser_presence_check || (!force && !softphone.conference_recovery && !this.browser_softphone_reconnecting()
+		if (this.browser_presence_check || Date.now() < (this.browser_presence_retry_at || 0)
+			|| (!this.browser_presence_retry_at && !force && !softphone.conference_recovery && !this.browser_softphone_reconnecting()
 			&& Date.now() - this.browser_presence_checked_at < 25000)) return;
 		const check = {};
 		this.browser_presence_check = check;
@@ -2039,6 +2079,7 @@ class VobizAgentConsole {
 			return this.refresh_browser_softphone_call(this.state.active_call || {});
 		}).catch(err => {
 			if (softphone.client !== vobiz || this.browser_presence_check !== check) return;
+			if (err && err.presence_busy) return; // Retry on the next eligible monitor tick, without diagnostic jobs.
 			if (err && err.softphone_ownership) return;
 			const status = Number(err && err.status);
 			const exception = err && err.responseJSON && err.responseJSON.exc_type;

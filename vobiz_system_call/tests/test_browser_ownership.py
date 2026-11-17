@@ -259,6 +259,87 @@ class BrowserOwnershipTests(unittest.TestCase):
         lifecycle.lock_mapping.assert_called_once_with("agent")
         frappe.db.commit.assert_called_once()
 
+    def test_busy_mapping_returns_retry_without_renewing_or_clearing_ownership(self):
+        ownership.presence_heartbeat("owner-window", call_log="CALL")
+        self.mapping.current_call_log = "CALL"
+        before = dict(self.values)
+        frappe.db.reset_mock()
+        lifecycle.lock_mapping.side_effect = lifecycle.MappingLockBusy
+        for registered, claim in [(1, 0), (1, 1), (0, 0)]:
+            result = ownership.presence_heartbeat("owner-window", registered, claim, "CALL")
+            self.assertEqual(result, {"registered": False, "ownership": "retry", "retry_after_ms": 2000})
+            self.assertEqual(self.values, before)
+            self.assertEqual(self.mapping.current_call_log, "CALL")
+        self.assertEqual(frappe.db.rollback.call_count, 3)
+        frappe.db.commit.assert_not_called()
+        lifecycle.lock_mapping.assert_called_with("agent", nowait=True)
+
+    def test_busy_presence_mutex_releases_mapping_lock_before_retry(self):
+        from redis.exceptions import LockError
+        self.cache.lock.side_effect = LockError("held by another request")
+        result = ownership.presence_heartbeat("owner-window")
+        self.assertEqual(result["ownership"], "retry")
+        frappe.db.rollback.assert_called_once()
+        frappe.db.commit.assert_not_called()
+        self.cache.set_value.assert_not_called()
+        self.cache.lock.assert_called_once_with("vsc:presence-lock:agent", timeout=5, blocking_timeout=0)
+
+    def test_lost_mutex_after_changes_is_not_reported_as_safe_retry(self):
+        from redis.exceptions import LockNotOwnedError
+        lock = MagicMock()
+        lock.__exit__.side_effect = LockNotOwnedError("lease expired")
+        self.cache.lock.side_effect = lambda *a, **kw: lock
+        with self.assertRaises(LockNotOwnedError):
+            ownership.presence_heartbeat("owner-window")
+        frappe.db.commit.assert_not_called()
+
+    def test_heartbeat_validation_and_unexpected_errors_are_not_swallowed(self):
+        with self.assertRaises(ValueError):
+            ownership.presence_heartbeat("bad")
+        lifecycle.lock_mapping.side_effect = RuntimeError("database unavailable")
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            ownership.presence_heartbeat("owner-window")
+        frappe.db.rollback.assert_not_called()
+
+    def test_busy_endpoint_returns_503_for_cached_browser_compatibility(self):
+        frappe.local.response = frappe._dict()
+        lifecycle.lock_mapping.side_effect = lifecycle.MappingLockBusy
+        result = webrtc.browser_presence("owner-window")
+        self.assertEqual(result["ownership"], "retry")
+        self.assertEqual(frappe.local.response["http_status_code"], 503)
+
+
+class MappingHeartbeatLockTests(unittest.TestCase):
+    def test_nowait_contention_never_loads_or_mutates_mapping(self):
+        for error in (frappe.QueryTimeoutError("1205"), frappe.QueryDeadlockError("1213")):
+            with self.subTest(error=type(error)), patch.object(frappe, "db", MagicMock()) as db, \
+                    patch.object(lifecycle.core_call, "get_user_mapping", return_value={"name": "agent"}), \
+                    patch.object(frappe, "get_doc") as get_doc:
+                db.sql.side_effect = error
+                with self.assertRaises(lifecycle.MappingLockBusy):
+                    lifecycle.lock_mapping("agent", nowait=True)
+                self.assertIn("FOR UPDATE NOWAIT", db.sql.call_args.args[0])
+                get_doc.assert_not_called()
+
+    def test_default_call_lock_and_locked_reread_are_preserved(self):
+        with patch.object(frappe, "db", MagicMock()) as db, \
+                patch.object(lifecycle.core_call, "get_user_mapping", return_value={"name": "agent"}), \
+                patch.object(lifecycle.core_call, "_lock_user_mapping") as lock, \
+                patch.object(frappe, "get_doc", return_value="locked mapping") as get_doc:
+            self.assertEqual(lifecycle.lock_mapping("agent"), "locked mapping")
+            lock.assert_called_once_with("agent")
+            db.sql.assert_not_called()
+            get_doc.assert_called_once_with("Vobiz User Mapping", "agent", for_update=True)
+
+    def test_nowait_success_still_reads_current_state_under_the_lock(self):
+        with patch.object(frappe, "db", MagicMock()), \
+                patch.object(lifecycle.core_call, "get_user_mapping", return_value={"name": "agent"}), \
+                patch.object(lifecycle.core_call, "_lock_user_mapping") as lock, \
+                patch.object(frappe, "get_doc", return_value="locked mapping") as get_doc:
+            self.assertEqual(lifecycle.lock_mapping("agent", nowait=True), "locked mapping")
+            lock.assert_not_called()
+            get_doc.assert_called_once_with("Vobiz User Mapping", "agent", for_update=True)
+
 
 if __name__ == "__main__":
     unittest.main()

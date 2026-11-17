@@ -54,11 +54,24 @@ def is_managed_call(row):
         and data.get("call_device") == "Mobile Bridge" and data.get("incoming_mobile_bridge") is True)
 
 
-def lock_mapping(user):
+class MappingLockBusy(Exception):
+    """Ownership could not be checked; no permission or call outcome is implied."""
+
+
+def lock_mapping(user, *, nowait=False):
     mapping = core_call.get_user_mapping(user)
     if not mapping:
         frappe.throw(_("No active Vobiz user mapping found."), frappe.PermissionError)
-    core_call._lock_user_mapping(mapping["name"])
+    if nowait:
+        try:
+            frappe.db.sql(
+                "SELECT `name` FROM `tabVobiz User Mapping` WHERE `name` = %s FOR UPDATE NOWAIT",
+                mapping["name"],
+            )
+        except (frappe.QueryTimeoutError, frappe.QueryDeadlockError) as error:
+            raise MappingLockBusy from error
+    else:
+        core_call._lock_user_mapping(mapping["name"])
     # A locking read sees the latest committed state, including competing starts.
     return frappe.get_doc("Vobiz User Mapping", mapping["name"], for_update=True)
 

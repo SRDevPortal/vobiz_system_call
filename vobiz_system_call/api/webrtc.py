@@ -102,7 +102,12 @@ def get_provider_answer_url():
 @frappe.whitelist(methods=["POST"])
 def browser_presence(tab_id: str, registered: int = 1, claim_idle: int = 0, call_log: str | None = None):
     from vobiz_system_call.api.ownership import presence_heartbeat
-    return presence_heartbeat(tab_id, registered, claim_idle=claim_idle, call_log=call_log)
+    result = presence_heartbeat(tab_id, registered, claim_idle=claim_idle, call_log=call_log)
+    if result.get("ownership") == "retry":
+        # Older cached clients must see a temporary request failure, not mistake
+        # a busy reply for an ownership denial (or a grant during SDK login).
+        frappe.local.response["http_status_code"] = 503
+    return result
 
 
 

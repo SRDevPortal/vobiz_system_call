@@ -1,8 +1,10 @@
 """User-scoped, idle-only browser handoff. Mapping locks serialize with call starts."""
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import re
 import secrets
 import time
+
+from redis.exceptions import LockError
 
 import frappe
 from frappe import _
@@ -19,7 +21,7 @@ def transfer_key(user):
 
 
 @contextmanager
-def locked_browser(tab_id):
+def locked_browser(tab_id, *, nowait=False):
     from vobiz_system_call.api.webrtc import _login, _browser_enabled
     _login()
     if not _browser_enabled():
@@ -27,11 +29,21 @@ def locked_browser(tab_id):
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", tab_id or ""):
         frappe.throw(_("Invalid browser window ID."))
     user = frappe.session.user
-    mapping = lifecycle.lock_mapping(user)
+    mapping = lifecycle.lock_mapping(user, nowait=True) if nowait else lifecycle.lock_mapping(user)
     if mapping.get("enabled") == 0 or not mapping.get("browser_softphone_enabled"):
         frappe.throw(_("Browser calling is disabled."), frappe.PermissionError)
     cache = frappe.cache()
-    with cache.lock("vsc:presence-lock:" + user, timeout=5, blocking_timeout=2):
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(cache.lock(
+                "vsc:presence-lock:" + user, timeout=5, blocking_timeout=0 if nowait else 2,
+            ))
+        except LockError as error:
+            # Only acquisition failures are retryable here. Do not swallow a
+            # lost lock on exit after ownership/cache changes have been made.
+            if nowait:
+                raise lifecycle.MappingLockBusy from error
+            raise
         yield user, mapping, cache
     frappe.db.commit()
 
@@ -54,7 +66,17 @@ def grant(user, tab_id, cache):
 
 
 def presence_heartbeat(tab_id, registered=1, claim_idle=0, call_log=None):
-    with locked_browser(tab_id) as (user, mapping, cache):
+    try:
+        return _presence_heartbeat(tab_id, registered, claim_idle, call_log)
+    except lifecycle.MappingLockBusy:
+        # Release any DB lock acquired before Redis contention. Never grant,
+        # refresh, clear, or transfer a lease without checking both locks.
+        frappe.db.rollback()
+        return {"registered": False, "ownership": "retry", "retry_after_ms": 2000}
+
+
+def _presence_heartbeat(tab_id, registered, claim_idle, call_log):
+    with locked_browser(tab_id, nowait=True) as (user, mapping, cache):
         owner = current_owner(user, cache)
         if not frappe.utils.cint(registered):
             if lifecycle.presence(user) == tab_id:
