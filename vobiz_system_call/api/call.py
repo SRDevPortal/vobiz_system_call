@@ -334,7 +334,8 @@ def start_browser_softphone_call(
             default=str,
         ),
     }
-    frappe.db.set_value("Vobiz Call Log", call_log.name, updates, update_modified=True)
+    from vobiz_ai.history import set_call_values
+    set_call_values(call_log.name, updates, update_modified=True)
     call_log.reload()
     from vobiz_system_call.api import conference
     recovery = conference.prepare(call_log, settings) if conference.enabled(frappe.session.user) else {}
