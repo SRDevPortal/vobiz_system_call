@@ -44,6 +44,119 @@ function setup() {
 }
 const flush = async () => {for (let i = 0; i < 20; i++) await Promise.resolve();};
 
+test('a stalled status lookup cannot stop heartbeats or create overlapping status requests', async () => {
+    const t = setup();
+    t.obj.state.active_call = {};
+    let heartbeats = 0, requests = 0, resolveStatus;
+    t.obj.send_browser_presence = () => {heartbeats++; return Promise.resolve({});};
+    t.ctx.frappe.call = () => {requests++; return new Promise(resolve => {resolveStatus = resolve;});};
+    const first = t.obj.check_browser_network(t.client);
+    await flush();
+    t.advance(25000);
+    const second = t.obj.check_browser_network(t.client);
+    await flush();
+    assert.equal(heartbeats, 2);
+    assert.equal(requests, 1);
+    assert.equal(t.obj.browser_presence_check, null);
+    assert.equal(t.logouts() + t.hangups(), 0);
+    resolveStatus({message: {name: 'C1', status: 'Connected'}});
+    await Promise.all([first, second]);
+});
+
+test('status timeout leaves healthy audio intact, ignores late results and permits another lookup', async () => {
+    const t = setup();
+    let aborts = 0, resolveStatus;
+    const request = new Promise(resolve => {resolveStatus = resolve;});
+    request.abort = () => {aborts++;};
+    t.ctx.frappe.call = () => request;
+    const lookup = t.obj.refresh_browser_softphone_call({});
+    assert.equal(t.obj.refresh_browser_softphone_call({}), lookup);
+    assert.equal(t.timeouts.size, 1);
+    [...t.timeouts.values()][0]();
+    await lookup;
+    assert.equal(aborts, 1);
+    assert.equal(t.obj.browser_status_in_flight, null);
+    assert.equal(t.obj.state.softphone.current_call_log, 'C1');
+    assert.equal(t.logouts() + t.hangups(), 0);
+    resolveStatus({message: {name: 'C1', status: 'Completed'}});
+    await flush();
+    assert.equal(t.obj.state.softphone.current_call_log, 'C1');
+    t.ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Completed'}});
+    await t.obj.refresh_browser_softphone_call({});
+    assert.equal(t.obj.state.softphone.current_call_log, '');
+});
+
+test('a pending heartbeat is deduplicated and retains the normal cadence after success', async () => {
+    const t = setup();
+    let heartbeats = 0, resolveHeartbeat;
+    t.obj.send_browser_presence = () => {heartbeats++; return new Promise(resolve => {resolveHeartbeat = resolve;});};
+    const first = t.obj.check_browser_network(t.client, true);
+    t.obj.check_browser_network(t.client, true);
+    assert.equal(heartbeats, 1);
+    resolveHeartbeat({});
+    await first;
+    await t.obj.check_browser_network(t.client);
+    assert.equal(heartbeats, 1);
+    t.advance(25000);
+    const next = t.obj.check_browser_network(t.client);
+    assert.equal(heartbeats, 2);
+    resolveHeartbeat({});
+    await next;
+});
+
+test('an earlier status completion cannot clear a newer heartbeat guard', async () => {
+    const t = setup();
+    t.obj.state.active_call = {};
+    let resolveStatus, resolveHeartbeat;
+    t.ctx.frappe.call = () => new Promise(resolve => {resolveStatus = resolve;});
+    const first = t.obj.check_browser_network(t.client, true);
+    await flush();
+    t.obj.send_browser_presence = () => new Promise(resolve => {resolveHeartbeat = resolve;});
+    t.advance(25000);
+    const second = t.obj.check_browser_network(t.client);
+    const guard = t.obj.browser_presence_check;
+    assert.ok(guard);
+    resolveStatus({message: {name: 'C1', status: 'Connected'}});
+    await first;
+    assert.equal(t.obj.browser_presence_check, guard);
+    t.ctx.frappe.call = () => Promise.resolve({message: {name: 'C1', status: 'Connected'}});
+    resolveHeartbeat({});
+    await second;
+});
+
+test('status responses from a replaced softphone client cannot reset its call', async () => {
+    const t = setup();
+    let resolveStatus;
+    t.ctx.frappe.call = () => new Promise(resolve => {resolveStatus = resolve;});
+    const lookup = t.obj.refresh_browser_softphone_call({});
+    const next = {client: {}};
+    t.obj.state.softphone.client = next;
+    resolveStatus({message: {name: 'C1', status: 'Completed'}});
+    await lookup;
+    assert.equal(t.obj.state.softphone.client, next);
+    assert.equal(t.obj.state.softphone.current_call_log, 'C1');
+});
+
+for (const recovery of ['conference_recovery', 'recovery_verification']) {
+    test(`pending ${recovery} work does not hold the heartbeat guard`, async () => {
+        const t = setup();
+        let heartbeats = 0, resolveRecovery;
+        const pending = new Promise(resolve => {resolveRecovery = resolve;});
+        t.obj.state.softphone[recovery] = {call_log: 'C1'};
+        t.obj.recover_conference_call = t.obj.verify_recovered_browser_call = () => pending;
+        t.obj.send_browser_presence = () => {heartbeats++; return Promise.resolve({});};
+        const first = t.obj.check_browser_network(t.client, true);
+        await flush();
+        t.advance(25000);
+        const second = t.obj.check_browser_network(t.client);
+        await flush();
+        assert.equal(heartbeats, 2);
+        assert.equal(t.logouts() + t.hangups(), 0);
+        resolveRecovery();
+        await Promise.all([first, second]);
+    });
+}
+
 test('failed presence checks never log out a healthy call, even beyond the grace period', async () => {
     const t = setup();
     t.obj.send_browser_presence = () => Promise.reject({status: 503});

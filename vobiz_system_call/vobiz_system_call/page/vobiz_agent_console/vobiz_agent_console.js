@@ -2076,6 +2076,10 @@ class VobizAgentConsole {
 		return this.send_browser_presence().then(() => {
 			if (softphone.client !== vobiz || this.browser_presence_check !== check) return;
 			this.set_browser_network_issue('server', false);
+			// Only the heartbeat owns this guard. Status and recovery requests have
+			// their own guards and must not prevent the next presence refresh.
+			this.browser_presence_check = null;
+			this.browser_presence_checked_at = Date.now();
 			if (softphone.conference_recovery) return this.recover_conference_call(vobiz);
 			if (softphone.recovery_verification) return this.verify_recovered_browser_call(vobiz);
 			return this.refresh_browser_softphone_call(this.state.active_call || {});
@@ -2363,6 +2367,7 @@ class VobizAgentConsole {
 
 	refresh_browser_softphone_call(active = {}) {
 		const callLog = this.state.softphone.current_call_log;
+		const client = this.state.softphone.client;
 		if (!callLog) return Promise.resolve();
 		const call = active.name === callLog ? active : active.last_call;
 		if (call && call.name === callLog) {
@@ -2371,10 +2376,11 @@ class VobizAgentConsole {
 		}
 		// The console may omit a finished call; absence alone is not termination evidence.
 		if (this.browser_status_in_flight) return this.browser_status_in_flight;
-		this.browser_status_in_flight = Promise.resolve(frappe.call({
+		this.browser_status_in_flight = this.browser_request_with_timeout(frappe.call({
 			method: 'vobiz_click_to_call.api.call.get_call_status',
 			args: { call_log: callLog, sync_provider: 0 }
-		})).then(r => {
+		}), 10000).then(r => {
+			if (this.state.softphone.client !== client || this.state.softphone.current_call_log !== callLog) return;
 			const current = r.message || {};
 			if (current.name === callLog) this.reconcile_browser_softphone_call(current);
 		}).catch(() => {}).finally(() => { this.browser_status_in_flight = null; });

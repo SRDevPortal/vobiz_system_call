@@ -6,7 +6,7 @@ function setup(){
  const timers=[],intervals=[],dialogs=[],requests=[],handlers={},hidden={};
  const ctx={console,window:{},__:x=>x,setTimeout(fn){timers.push(fn);return fn;},clearTimeout(){},setInterval(fn){intervals.push(fn);return fn;},clearInterval(){},
  frappe:{pages:{'vobiz-agent-console':{}},utils:{escape_html:x=>x},msgprint(){},show_alert(){},
- call(method,args){requests.push({method:typeof method==='string'?method:method.method,args:args||method.args});return Request.resolve({message:{}});},
+ call(method,args){const request={method:typeof method==='string'?method:method.method,args:args||method.args};requests.push(request);return Request.resolve({message:request.method==='vobiz_click_to_call.api.call.get_call_status'?{name:request.args.call_log,status:'Completed'}:{}});},
  ui:{Dialog:function(config){
   const d=this;d.config=config;d.values={};d.fields_dict={};d.visible=false;d.shows=0;d.hides=0;d.events={};
   const button={prop(){return button;},text(){return button;}};
@@ -27,7 +27,8 @@ function setup(){
  const ring=(id='C1')=>Object.assign(c.state.softphone,{current_call_log:id,incoming_call_uuid:'SDK-'+id,sdk_call_uuid:'SDK-'+id,incoming_caller:'caller',incoming_pending:true,incoming_answering:false,incoming_answered:false,in_call:true,status:'Incoming Call'});
  const ended=()=>{Object.assign(c.state.softphone,{current_call_log:'',in_call:false,incoming_pending:false,incoming_call_uuid:'',incoming_caller:''});c.state.active_call=null;};
  const call=(name='OLD')=>({name,status:'Completed',direction:'Outgoing',reference_doctype:'CRM Lead',reference_name:'LEAD-'+name});
- const open=(name='OLD',done)=>c.open_post_call_disposition_dialog(call(name),{doctype:'CRM Lead',name:'LEAD-'+name},done,{disposition_context_refreshed:true,force_timer:true});
+ // These UI tests start after the asynchronous NDR/status/context checks.
+ const open=(name='OLD',done)=>c.open_post_call_disposition_dialog(call(name),{doctype:'CRM Lead',name:'LEAD-'+name},done,{ndr_checked:true,disposition_status_checked:true,disposition_context_refreshed:true,force_timer:true});
  return {c,ctx,sdk,handlers,hidden,ring,ended,call,open,timers,intervals,dialogs,requests};
 }
 test('Pickup waits for the incoming invite to be linked to its server call',()=>{
